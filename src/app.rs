@@ -1253,7 +1253,7 @@ impl eframe::App for TranscriberApp {
 
             ui.add_space(8.0);
             let available_w = ui.available_width();
-            let media_width = available_w.min(980.0);
+            let media_width = available_w;
             let remaining_h = ui.available_height();
             let media_height = 96.0;
             let top_pad = ((remaining_h - media_height) * 0.5).max(0.0);
