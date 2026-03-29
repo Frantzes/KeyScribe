@@ -6,9 +6,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use eframe::egui;
-use egui_phosphor::regular::{
-    DOWNLOAD_SIMPLE, GEAR, PAUSE, PLAY, REPEAT, SKIP_BACK, SKIP_FORWARD, SPEAKER_HIGH, SPEAKER_NONE,
-};
+use egui_phosphor::regular::{DOWNLOAD_SIMPLE, GEAR};
 use egui_plot::{Line, Plot, PlotBounds, PlotPoints, Polygon, VLine};
 use rfd::FileDialog;
 use serde::{Deserialize, Serialize};
@@ -21,13 +19,22 @@ use crate::audio_io::{load_audio_file, AudioData};
 use crate::dsp::apply_speed_and_pitch;
 use crate::playback::AudioEngine;
 use crate::theme::{apply_brand_theme, ACCENT_ORANGE, ERROR_RED};
+use crate::ui::keyboard::{
+    draw_piano_view, draw_probability_pane, keyboard_white_key_width, MIN_PIANO_KEY_HEIGHT,
+    MIN_PROBABILITY_STRIP_HEIGHT, PIANO_ZOOM_MAX, PIANO_ZOOM_MIN, WHITE_KEY_LENGTH_TO_WIDTH,
+};
+use crate::ui::utils::{accent_soft, color_to_hex, parse_hex_color, push_recent_color};
+use crate::ui::widgets::{icon_button, icon_font_id};
+
+mod media_controls;
+use media_controls::{draw_media_controls, setting_toggle_row};
 
 const STATE_FILE_NAME: &str = ".transcriber_state.json";
-const PIANO_ZOOM_MIN: f32 = 0.35;
-const PIANO_ZOOM_MAX: f32 = 1.0;
-const WHITE_KEY_LENGTH_TO_WIDTH: f32 = 6.3;
-const MIN_PIANO_KEY_HEIGHT: f32 = 16.0;
-const MIN_PROBABILITY_STRIP_HEIGHT: f32 = 20.0;
+const PROBABILITY_UPDATE_INTERVAL: Duration = Duration::from_millis(80);
+const FFT_TIMELINE_STEP_SEC: f32 = 0.05;
+const FFT_WINDOW_SIZE: usize = 4096;
+const LOOP_MIN_DURATION_SEC: f32 = 0.01;
+const SEEK_STEP_SEC: f32 = 5.0;
 const PRESET_HIGHLIGHT_COLORS: [(&str, egui::Color32); 8] = [
     ("Orange", egui::Color32::from_rgb(255, 140, 45)),
     ("Sky", egui::Color32::from_rgb(72, 162, 255)),
@@ -261,6 +268,66 @@ impl TranscriberApp {
         app
     }
 
+    fn is_playing(&self) -> bool {
+        self.engine
+            .as_ref()
+            .map(|e| e.is_playing())
+            .unwrap_or(false)
+    }
+
+    fn current_position_sec(&self) -> f32 {
+        self.engine
+            .as_ref()
+            .map(|e| e.current_position())
+            .unwrap_or(0.0)
+    }
+
+    fn stop_if_playing(&mut self) -> bool {
+        let was_playing = self.is_playing();
+        if was_playing {
+            self.stop();
+        }
+        was_playing
+    }
+
+    fn request_rebuild_preserving_playback(&mut self) {
+        let was_playing = self.stop_if_playing();
+        self.request_rebuild(was_playing);
+    }
+
+    fn clear_processing_job(&mut self) {
+        self.is_processing = false;
+        self.processing_rx = None;
+        self.active_job_id = None;
+    }
+
+    fn apply_processing_result(&mut self, result: ProcessingResult) {
+        self.processed_samples = result.processed_samples;
+        self.waveform = result.waveform;
+        self.note_timeline = result.note_timeline;
+        self.note_timeline_step_sec = result.note_timeline_step_sec;
+        self.waveform_reset_view = true;
+        self.clear_processing_job();
+        self.selected_time_sec = self.selected_time_sec.min(self.duration());
+
+        if let Some(err) = result.analysis_error {
+            self.last_error = Some(err);
+        }
+        self.update_note_probabilities(true);
+
+        if self.restart_playback_after_processing {
+            self.restart_playback_after_processing = false;
+            self.play_from_selected();
+        }
+    }
+
+    fn maybe_commit_pending_param_change(&mut self, pointer_down: bool) {
+        if self.pending_param_change && !pointer_down {
+            self.request_rebuild_preserving_playback();
+            self.pending_param_change = false;
+        }
+    }
+
     fn duration(&self) -> f32 {
         if let Some(audio) = &self.audio_raw {
             if audio.sample_rate > 0 {
@@ -334,40 +401,12 @@ impl TranscriberApp {
                 apply_speed_and_pitch(raw_samples.as_slice(), speed, pitch_semitones);
             let waveform = waveform_points(&processed_samples, sample_rate, 6000);
 
-            let (note_timeline, note_timeline_step_sec, analysis_error) = if preprocess_audio {
-                if use_cqt {
-                    match analyze_with_full_pipeline(&processed_samples, sample_rate) {
-                        Ok((_smoothed, probs)) => {
-                            let duration_sec =
-                                processed_samples.len() as f32 / sample_rate.max(1) as f32;
-                            let step_sec = if probs.is_empty() {
-                                0.0
-                            } else {
-                                (duration_sec / probs.len() as f32).max(1e-3)
-                            };
-                            (probs, step_sec, None)
-                        }
-                        Err(err) => {
-                            let fallback =
-                                Self::compute_fft_timeline(&processed_samples, sample_rate, 0.05);
-                            (
-                                fallback,
-                                0.05,
-                                Some(format!("Pro analysis failed, using FFT fallback: {err}")),
-                            )
-                        }
-                    }
-                } else {
-                    let step_sec = 0.05;
-                    (
-                        Self::compute_fft_timeline(&processed_samples, sample_rate, step_sec),
-                        step_sec,
-                        None,
-                    )
-                }
-            } else {
-                (Vec::new(), 0.0, None)
-            };
+            let (note_timeline, note_timeline_step_sec, analysis_error) = Self::build_note_timeline(
+                &processed_samples,
+                sample_rate,
+                use_cqt,
+                preprocess_audio,
+            );
 
             let _ = tx.send(ProcessingResult {
                 job_id,
@@ -388,31 +427,12 @@ impl TranscriberApp {
         match rx.try_recv() {
             Ok(result) => {
                 if Some(result.job_id) == self.active_job_id {
-                    self.processed_samples = result.processed_samples;
-                    self.waveform = result.waveform;
-                    self.note_timeline = result.note_timeline;
-                    self.note_timeline_step_sec = result.note_timeline_step_sec;
-                    self.waveform_reset_view = true;
-                    self.is_processing = false;
-                    self.processing_rx = None;
-                    self.active_job_id = None;
-                    self.selected_time_sec = self.selected_time_sec.min(self.duration());
-                    if let Some(err) = result.analysis_error {
-                        self.last_error = Some(err);
-                    }
-                    self.update_note_probabilities(true);
-
-                    if self.restart_playback_after_processing {
-                        self.restart_playback_after_processing = false;
-                        self.play_from_selected();
-                    }
+                    self.apply_processing_result(result);
                 }
             }
             Err(TryRecvError::Empty) => {}
             Err(TryRecvError::Disconnected) => {
-                self.is_processing = false;
-                self.processing_rx = None;
-                self.active_job_id = None;
+                self.clear_processing_job();
             }
         }
     }
@@ -445,7 +465,7 @@ impl TranscriberApp {
     }
 
     fn update_note_probabilities(&mut self, force: bool) {
-        if !force && self.last_prob_update.elapsed() < Duration::from_millis(80) {
+        if !force && self.last_prob_update.elapsed() < PROBABILITY_UPDATE_INTERVAL {
             return;
         }
 
@@ -471,10 +491,15 @@ impl TranscriberApp {
                     &self.processed_samples,
                     raw.sample_rate,
                     center,
-                    4096,
+                    FFT_WINDOW_SIZE,
                 )
             } else {
-                detect_note_probabilities(&self.processed_samples, raw.sample_rate, center, 4096)
+                detect_note_probabilities(
+                    &self.processed_samples,
+                    raw.sample_rate,
+                    center,
+                    FFT_WINDOW_SIZE,
+                )
             };
         }
 
@@ -505,7 +530,7 @@ impl TranscriberApp {
                 samples,
                 sample_rate,
                 center,
-                4096,
+                FFT_WINDOW_SIZE,
             ));
             t += step_sec;
         }
@@ -515,6 +540,49 @@ impl TranscriberApp {
         }
 
         timeline
+    }
+
+    fn build_note_timeline(
+        processed_samples: &[f32],
+        sample_rate: u32,
+        use_cqt: bool,
+        preprocess_audio: bool,
+    ) -> (Vec<Vec<f32>>, f32, Option<String>) {
+        if !preprocess_audio {
+            return (Vec::new(), 0.0, None);
+        }
+
+        if use_cqt {
+            match analyze_with_full_pipeline(processed_samples, sample_rate) {
+                Ok((_smoothed, probs)) => {
+                    let duration_sec = processed_samples.len() as f32 / sample_rate.max(1) as f32;
+                    let step_sec = if probs.is_empty() {
+                        0.0
+                    } else {
+                        (duration_sec / probs.len() as f32).max(1e-3)
+                    };
+                    (probs, step_sec, None)
+                }
+                Err(err) => {
+                    let fallback = Self::compute_fft_timeline(
+                        processed_samples,
+                        sample_rate,
+                        FFT_TIMELINE_STEP_SEC,
+                    );
+                    (
+                        fallback,
+                        FFT_TIMELINE_STEP_SEC,
+                        Some(format!("Pro analysis failed, using FFT fallback: {err}")),
+                    )
+                }
+            }
+        } else {
+            (
+                Self::compute_fft_timeline(processed_samples, sample_rate, FFT_TIMELINE_STEP_SEC),
+                FFT_TIMELINE_STEP_SEC,
+                None,
+            )
+        }
     }
 
     fn play_from_selected(&mut self) {
@@ -532,6 +600,46 @@ impl TranscriberApp {
             }
         } else {
             self.last_error = Some("Audio engine unavailable on this machine".to_string());
+        }
+    }
+
+    fn skip_by_seconds(&mut self, delta_sec: f32) {
+        if self.audio_raw.is_none() || self.processed_samples.is_empty() {
+            return;
+        }
+
+        let duration = self.duration();
+        let target = self.selected_time_sec + delta_sec;
+        self.selected_time_sec = if self.loop_enabled {
+            if let Some((a, b)) = self.loop_selection {
+                let start = a.min(b);
+                let end = a.max(b);
+                if end - start > LOOP_MIN_DURATION_SEC {
+                    target.clamp(start, end)
+                } else {
+                    target.clamp(0.0, duration)
+                }
+            } else {
+                target.clamp(0.0, duration)
+            }
+        } else {
+            target.clamp(0.0, duration)
+        };
+        self.update_note_probabilities(true);
+
+        if self.is_playing() {
+            if self.loop_enabled {
+                if let Some((a, b)) = self.loop_selection {
+                    let start = a.min(b);
+                    let end = a.max(b);
+                    if end - start > LOOP_MIN_DURATION_SEC {
+                        self.loop_playback_enabled = true;
+                        self.play_range(self.selected_time_sec, Some(end));
+                        return;
+                    }
+                }
+            }
+            self.play_from_selected();
         }
     }
 
@@ -558,7 +666,7 @@ impl TranscriberApp {
             if let Some((a, b)) = self.loop_selection {
                 let start = a.min(b);
                 let end = a.max(b);
-                if end - start > 0.01 {
+                if end - start > LOOP_MIN_DURATION_SEC {
                     self.loop_playback_enabled = true;
                     self.selected_time_sec = start;
                     self.play_range(start, Some(end));
@@ -568,11 +676,7 @@ impl TranscriberApp {
         }
 
         self.loop_playback_enabled = false;
-        let is_playing = self
-            .engine
-            .as_ref()
-            .map(|e| e.is_playing())
-            .unwrap_or(false);
+        let is_playing = self.is_playing();
 
         if is_playing {
             if let Some(engine) = &mut self.engine {
@@ -581,11 +685,7 @@ impl TranscriberApp {
             return;
         }
 
-        let current_pos = self
-            .engine
-            .as_ref()
-            .map(|e| e.current_position())
-            .unwrap_or(0.0);
+        let current_pos = self.current_position_sec();
 
         if current_pos <= 0.0 {
             self.play_from_selected();
@@ -611,7 +711,7 @@ impl TranscriberApp {
                 if let Some((a, b)) = self.loop_selection {
                     let start = a.min(b);
                     let end = a.max(b);
-                    if end - start > 0.01 {
+                    if end - start > LOOP_MIN_DURATION_SEC {
                         self.selected_time_sec = start;
                         self.play_range(start, Some(end));
                     }
@@ -619,19 +719,95 @@ impl TranscriberApp {
             }
         }
     }
-}
 
-impl eframe::App for TranscriberApp {
-    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        apply_brand_theme(ctx, self.dark_mode, self.highlight_color);
+    fn draw_settings_menu(&mut self, ui: &mut egui::Ui) {
+        ui.set_min_width(360.0);
 
-        if ctx.input(|i| i.key_pressed(egui::Key::Space)) {
-            self.handle_space_replay();
+        setting_toggle_row(ui, &mut self.dark_mode, "Dark Mode");
+        ui.separator();
+
+        ui.label("Highlight Presets");
+        ui.horizontal_wrapped(|ui| {
+            for (name, color) in PRESET_HIGHLIGHT_COLORS {
+                let swatch = egui::RichText::new("   ").background_color(color);
+                if ui
+                    .add(egui::Button::new(swatch))
+                    .on_hover_text(name)
+                    .clicked()
+                {
+                    self.highlight_color = color;
+                    self.custom_rgb = [color.r(), color.g(), color.b()];
+                    push_recent_color(&mut self.recent_highlight_hex, color);
+                }
+            }
+        });
+
+        ui.separator();
+        ui.label("Custom RGB");
+        let mut rgb_changed = false;
+        rgb_changed |= ui
+            .add(egui::Slider::new(&mut self.custom_rgb[0], 0..=255).text("R"))
+            .changed();
+        rgb_changed |= ui
+            .add(egui::Slider::new(&mut self.custom_rgb[1], 0..=255).text("G"))
+            .changed();
+        rgb_changed |= ui
+            .add(egui::Slider::new(&mut self.custom_rgb[2], 0..=255).text("B"))
+            .changed();
+
+        if rgb_changed {
+            self.highlight_color =
+                egui::Color32::from_rgb(self.custom_rgb[0], self.custom_rgb[1], self.custom_rgb[2]);
         }
 
-        self.poll_processing_result();
-        self.sync_playhead_from_engine();
+        ui.horizontal(|ui| {
+            ui.label(color_to_hex(self.highlight_color));
+            if ui.button("Save Color").clicked() {
+                push_recent_color(&mut self.recent_highlight_hex, self.highlight_color);
+            }
+        });
 
+        if !self.recent_highlight_hex.is_empty() {
+            ui.label("Recent Colors");
+            ui.horizontal_wrapped(|ui| {
+                for hex in self.recent_highlight_hex.clone() {
+                    if let Some(color) = parse_hex_color(&hex) {
+                        let swatch = egui::RichText::new("   ").background_color(color);
+                        if ui
+                            .add(egui::Button::new(swatch))
+                            .on_hover_text(hex.clone())
+                            .clicked()
+                        {
+                            self.highlight_color = color;
+                            self.custom_rgb = [color.r(), color.g(), color.b()];
+                        }
+                    }
+                }
+            });
+        }
+
+        ui.separator();
+
+        let preprocess_changed = setting_toggle_row(
+            ui,
+            &mut self.preprocess_audio,
+            "Preprocess Audio (recommended)",
+        );
+
+        let cqt_changed = setting_toggle_row(
+            ui,
+            &mut self.use_cqt_analysis,
+            "Use CQT Analysis (Pro Mode)",
+        );
+
+        let _ = setting_toggle_row(ui, &mut self.show_note_hist_window, "Show Probability Pane");
+
+        if preprocess_changed || cqt_changed {
+            self.request_rebuild_preserving_playback();
+        }
+    }
+
+    fn draw_top_controls_panel(&mut self, ctx: &egui::Context) {
         egui::TopBottomPanel::top("controls").show(ctx, |ui| {
             ui.horizontal_wrapped(|ui| {
                 if icon_button(ui, DOWNLOAD_SIMPLE, "Import Audio", true).clicked() {
@@ -651,120 +827,11 @@ impl eframe::App for TranscriberApp {
                 }
 
                 ui.menu_button(egui::RichText::new(GEAR).font(icon_font_id(18.0)), |ui| {
-                    ui.set_min_width(360.0);
-
-                    setting_toggle_row(ui, &mut self.dark_mode, "Dark Mode");
-                    ui.separator();
-
-                    ui.label("Highlight Presets");
-                    ui.horizontal_wrapped(|ui| {
-                        for (name, color) in PRESET_HIGHLIGHT_COLORS {
-                            let swatch = egui::RichText::new("   ").background_color(color);
-                            if ui
-                                .add(egui::Button::new(swatch))
-                                .on_hover_text(name)
-                                .clicked()
-                            {
-                                self.highlight_color = color;
-                                self.custom_rgb = [color.r(), color.g(), color.b()];
-                                push_recent_color(&mut self.recent_highlight_hex, color);
-                            }
-                        }
-                    });
-
-                    ui.separator();
-                    ui.label("Custom RGB");
-                    let mut rgb_changed = false;
-                    rgb_changed |= ui
-                        .add(egui::Slider::new(&mut self.custom_rgb[0], 0..=255).text("R"))
-                        .changed();
-                    rgb_changed |= ui
-                        .add(egui::Slider::new(&mut self.custom_rgb[1], 0..=255).text("G"))
-                        .changed();
-                    rgb_changed |= ui
-                        .add(egui::Slider::new(&mut self.custom_rgb[2], 0..=255).text("B"))
-                        .changed();
-
-                    if rgb_changed {
-                        self.highlight_color = egui::Color32::from_rgb(
-                            self.custom_rgb[0],
-                            self.custom_rgb[1],
-                            self.custom_rgb[2],
-                        );
-                    }
-
-                    ui.horizontal(|ui| {
-                        ui.label(color_to_hex(self.highlight_color));
-                        if ui.button("Save Color").clicked() {
-                            push_recent_color(&mut self.recent_highlight_hex, self.highlight_color);
-                        }
-                    });
-
-                    if !self.recent_highlight_hex.is_empty() {
-                        ui.label("Recent Colors");
-                        ui.horizontal_wrapped(|ui| {
-                            for hex in self.recent_highlight_hex.clone() {
-                                if let Some(color) = parse_hex_color(&hex) {
-                                    let swatch = egui::RichText::new("   ").background_color(color);
-                                    if ui
-                                        .add(egui::Button::new(swatch))
-                                        .on_hover_text(hex.clone())
-                                        .clicked()
-                                    {
-                                        self.highlight_color = color;
-                                        self.custom_rgb = [color.r(), color.g(), color.b()];
-                                    }
-                                }
-                            }
-                        });
-                    }
-
-                    ui.separator();
-
-                    let preprocess_changed = setting_toggle_row(
-                        ui,
-                        &mut self.preprocess_audio,
-                        "Preprocess Audio (recommended)",
-                    );
-
-                    let cqt_changed = setting_toggle_row(
-                        ui,
-                        &mut self.use_cqt_analysis,
-                        "Use CQT Analysis (Pro Mode)",
-                    );
-
-                    let _ = setting_toggle_row(
-                        ui,
-                        &mut self.show_note_hist_window,
-                        "Show Probability Pane",
-                    );
-
-                    if preprocess_changed || cqt_changed {
-                        let was_playing = self
-                            .engine
-                            .as_ref()
-                            .map(|e| e.is_playing())
-                            .unwrap_or(false);
-                        if was_playing {
-                            self.stop();
-                        }
-                        self.request_rebuild(was_playing);
-                    }
+                    self.draw_settings_menu(ui);
                 });
 
                 let pointer_down = ui.input(|i| i.pointer.primary_down());
-                if self.pending_param_change && !pointer_down {
-                    let was_playing = self
-                        .engine
-                        .as_ref()
-                        .map(|e| e.is_playing())
-                        .unwrap_or(false);
-                    if was_playing {
-                        self.stop();
-                    }
-                    self.request_rebuild(was_playing);
-                    self.pending_param_change = false;
-                }
+                self.maybe_commit_pending_param_change(pointer_down);
             });
 
             if let Some(err) = &self.last_error {
@@ -780,6 +847,27 @@ impl eframe::App for TranscriberApp {
                 ui.colored_label(egui::Color32::from_rgb(240, 180, 30), msg);
             }
         });
+    }
+}
+
+impl eframe::App for TranscriberApp {
+    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        apply_brand_theme(ctx, self.dark_mode, self.highlight_color);
+
+        if ctx.input(|i| i.key_pressed(egui::Key::Space)) {
+            self.handle_space_replay();
+        }
+        if ctx.input(|i| i.key_pressed(egui::Key::ArrowLeft)) {
+            self.skip_by_seconds(-SEEK_STEP_SEC);
+        }
+        if ctx.input(|i| i.key_pressed(egui::Key::ArrowRight)) {
+            self.skip_by_seconds(SEEK_STEP_SEC);
+        }
+
+        self.poll_processing_result();
+        self.sync_playhead_from_engine();
+
+        self.draw_top_controls_panel(ctx);
 
         let mut piano_panel_builder = egui::TopBottomPanel::bottom("piano_panel")
             .resizable(true)
@@ -925,9 +1013,11 @@ impl eframe::App for TranscriberApp {
                 .height(waveform_height)
                 .allow_scroll(false)
                 .allow_zoom(false)
-                .allow_drag(analysis_ready)
+                .allow_drag(false)
                 .allow_boxed_zoom(false)
                 .show_grid(false)
+                .show_x(false)
+                .show_y(false)
                 .show_axes([false, false])
                 .include_y(-1.05)
                 .include_y(1.05)
@@ -1133,19 +1223,16 @@ impl eframe::App for TranscriberApp {
 
                     if analysis_ready && drag_stopped {
                         if let Some((a, b)) = self.loop_selection {
-                            if (a - b).abs() < 0.01 {
+                            if (a - b).abs() < LOOP_MIN_DURATION_SEC {
                                 self.loop_selection = None;
                                 self.loop_playback_enabled = false;
                             } else {
                                 let start = a.min(b);
                                 let end = a.max(b);
                                 self.selected_time_sec = start;
-                                if self.loop_enabled {
-                                    self.loop_playback_enabled = true;
-                                    self.play_range(start, Some(end));
-                                } else {
-                                    self.loop_playback_enabled = false;
-                                }
+                                self.loop_enabled = true;
+                                self.loop_playback_enabled = true;
+                                self.play_range(start, Some(end));
                             }
                         }
                         self.drag_select_anchor_sec = None;
@@ -1157,12 +1244,7 @@ impl eframe::App for TranscriberApp {
                             self.loop_selection = None;
                             self.loop_playback_enabled = false;
                             self.update_note_probabilities(true);
-                            if self
-                                .engine
-                                .as_ref()
-                                .map(|e| e.is_playing())
-                                .unwrap_or(false)
-                            {
+                            if self.is_playing() {
                                 self.play_from_selected();
                             }
                         }
@@ -1172,28 +1254,21 @@ impl eframe::App for TranscriberApp {
             ui.add_space(8.0);
             let available_w = ui.available_width();
             let media_width = available_w.min(980.0);
-            let free_w = (available_w - media_width).max(0.0);
-            let center_bias_px = 10.0;
-            let base_left_gutter = (free_w * 0.5).floor();
-            let left_gutter = (base_left_gutter + center_bias_px).min(free_w);
-            let right_gutter = (free_w - left_gutter).max(0.0);
-            ui.scope(|ui| {
-                ui.spacing_mut().item_spacing.x = 0.0;
-                ui.horizontal(|ui| {
-                    if left_gutter > 0.0 {
-                        ui.allocate_exact_size(egui::vec2(left_gutter, 0.0), egui::Sense::hover());
-                    }
-                    ui.allocate_ui_with_layout(
-                        egui::vec2(media_width, 0.0),
-                        egui::Layout::top_down(egui::Align::Center),
-                        |ui| {
-                            draw_media_controls(self, ui, analysis_ready, duration);
-                        },
-                    );
-                    if right_gutter > 0.0 {
-                        ui.allocate_exact_size(egui::vec2(right_gutter, 0.0), egui::Sense::hover());
-                    }
-                });
+            let remaining_h = ui.available_height();
+            let media_height = 96.0;
+            let top_pad = ((remaining_h - media_height) * 0.5).max(0.0);
+            if top_pad > 0.0 {
+                ui.add_space(top_pad);
+            }
+
+            ui.horizontal_centered(|ui| {
+                ui.allocate_ui_with_layout(
+                    egui::vec2(media_width, media_height),
+                    egui::Layout::top_down(egui::Align::Center),
+                    |ui| {
+                        draw_media_controls(self, ui, analysis_ready, duration);
+                    },
+                );
             });
         });
         self.waveform_panel_height = waveform_central.response.rect.height().clamp(120.0, 5000.0);
@@ -1212,630 +1287,4 @@ impl Drop for TranscriberApp {
     fn drop(&mut self) {
         self.save_state_to_disk();
     }
-}
-
-struct KeyboardDrawResult {
-    clicked: bool,
-    max_scroll_px: f32,
-}
-
-fn keyboard_white_key_width(viewport_width: f32, zoom: f32) -> f32 {
-    let white_count = (PIANO_LOW_MIDI..=PIANO_HIGH_MIDI)
-        .filter(|midi| !is_black_key(*midi))
-        .count() as f32;
-    let fit_width = (viewport_width / white_count.max(1.0)).max(1.0);
-    fit_width * zoom.clamp(PIANO_ZOOM_MIN, PIANO_ZOOM_MAX)
-}
-
-fn white_index_before_midi(midi: u8) -> usize {
-    (PIANO_LOW_MIDI..midi).filter(|m| !is_black_key(*m)).count()
-}
-
-fn draw_piano_view(
-    ui: &mut egui::Ui,
-    probs: &[f32],
-    sensitivity: f32,
-    zoom: f32,
-    key_height: f32,
-    scroll_px: f32,
-    highlight_color: egui::Color32,
-) -> KeyboardDrawResult {
-    let desired_size = egui::vec2(
-        ui.available_width(),
-        key_height.clamp(MIN_PIANO_KEY_HEIGHT, 220.0),
-    );
-    let (rect, response) = ui.allocate_exact_size(desired_size, egui::Sense::click());
-    let painter = ui.painter_at(rect);
-
-    let white_count = (PIANO_LOW_MIDI..=PIANO_HIGH_MIDI)
-        .filter(|midi| !is_black_key(*midi))
-        .count();
-    let white_w = keyboard_white_key_width(rect.width(), zoom);
-    let black_w = white_w * 0.62;
-    let black_h = rect.height() * 0.62;
-    let total_w = white_w * white_count as f32;
-    let max_scroll_px = (total_w - rect.width()).max(0.0);
-    let scroll_px = scroll_px.clamp(0.0, max_scroll_px);
-    let x_start = rect.left() + ((rect.width() - total_w) * 0.5).max(0.0) - scroll_px;
-
-    let mut white_index = 0usize;
-    for midi in PIANO_LOW_MIDI..=PIANO_HIGH_MIDI {
-        if is_black_key(midi) {
-            continue;
-        }
-
-        let x0 = x_start + white_index as f32 * white_w;
-        let x1 = x0 + white_w;
-        if x1 < rect.left() || x0 > rect.right() {
-            white_index += 1;
-            continue;
-        }
-        let key_rect =
-            egui::Rect::from_min_max(egui::pos2(x0, rect.top()), egui::pos2(x1, rect.bottom()));
-
-        painter.rect_filled(key_rect, 0.0, egui::Color32::from_gray(238));
-        painter.rect_stroke(
-            key_rect,
-            0.0,
-            egui::Stroke::new(1.0, egui::Color32::from_gray(90)),
-        );
-
-        let idx = (midi - PIANO_LOW_MIDI) as usize;
-        let p = probs.get(idx).copied().unwrap_or(0.0).clamp(0.0, 1.0);
-        let s = sensitivity.clamp(0.0, 2.0);
-        let gain = s.powf(1.35);
-        let adjusted = (p * gain).clamp(0.0, 1.0).powf(1.55);
-        let activation_threshold = 0.12 - (s.min(1.5) / 1.5) * 0.06;
-        if adjusted >= activation_threshold {
-            painter.rect_filled(key_rect, 0.0, highlight_color);
-            painter.rect_stroke(
-                key_rect,
-                0.0,
-                egui::Stroke::new(1.0, egui::Color32::from_gray(90)),
-            );
-        }
-
-        white_index += 1;
-    }
-
-    let mut white_before = 0usize;
-    for midi in PIANO_LOW_MIDI..=PIANO_HIGH_MIDI {
-        if !is_black_key(midi) {
-            white_before += 1;
-            continue;
-        }
-
-        let center_x = x_start + white_before as f32 * white_w;
-        let x0 = center_x - black_w * 0.5;
-        let x1 = center_x + black_w * 0.5;
-        if x1 < rect.left() || x0 > rect.right() {
-            continue;
-        }
-        let key_rect = egui::Rect::from_min_max(
-            egui::pos2(x0, rect.top()),
-            egui::pos2(x1, rect.top() + black_h),
-        );
-
-        painter.rect_filled(key_rect, 2.0, egui::Color32::from_gray(55));
-        painter.rect_stroke(
-            key_rect,
-            2.0,
-            egui::Stroke::new(1.0, egui::Color32::from_gray(65)),
-        );
-
-        let idx = (midi - PIANO_LOW_MIDI) as usize;
-        let p = probs.get(idx).copied().unwrap_or(0.0).clamp(0.0, 1.0);
-        let s = sensitivity.clamp(0.0, 2.0);
-        let gain = s.powf(1.35);
-        let adjusted = (p * gain).clamp(0.0, 1.0).powf(1.55);
-        let activation_threshold = 0.12 - (s.min(1.5) / 1.5) * 0.06;
-        if adjusted >= activation_threshold {
-            painter.rect_filled(key_rect, 2.0, highlight_color);
-            painter.rect_stroke(
-                key_rect,
-                2.0,
-                egui::Stroke::new(1.0, egui::Color32::from_gray(65)),
-            );
-        }
-    }
-
-    // Mark Middle C (MIDI 60).
-    if (PIANO_LOW_MIDI..=PIANO_HIGH_MIDI).contains(&60) {
-        let c4_white_idx = white_index_before_midi(60);
-        let cx = x_start + c4_white_idx as f32 * white_w + white_w * 0.5;
-        if cx >= rect.left() && cx <= rect.right() {
-            painter.circle_filled(
-                egui::pos2(cx, rect.top() + 8.0),
-                4.0,
-                egui::Color32::from_gray(155),
-            );
-        }
-    }
-
-    KeyboardDrawResult {
-        clicked: response.clicked(),
-        max_scroll_px,
-    }
-}
-
-fn draw_probability_pane(
-    ui: &mut egui::Ui,
-    probs_smoothed: &[f32],
-    probs_raw: &[f32],
-    zoom: f32,
-    scroll_px: f32,
-    strip_height: f32,
-    highlight_color: egui::Color32,
-) -> KeyboardDrawResult {
-    let desired_size = egui::vec2(
-        ui.available_width(),
-        strip_height.max(MIN_PROBABILITY_STRIP_HEIGHT),
-    );
-    let (rect, response) = ui.allocate_exact_size(desired_size, egui::Sense::click());
-    let painter = ui.painter_at(rect);
-    painter.rect_filled(rect, 4.0, egui::Color32::from_rgb(33, 38, 46));
-
-    let white_count = (PIANO_LOW_MIDI..=PIANO_HIGH_MIDI)
-        .filter(|midi| !is_black_key(*midi))
-        .count();
-    let white_w = keyboard_white_key_width(rect.width(), zoom);
-    let black_w = white_w * 0.62;
-    let total_w = white_w * white_count as f32;
-    let max_scroll_px = (total_w - rect.width()).max(0.0);
-    let scroll_px = scroll_px.clamp(0.0, max_scroll_px);
-    let x_start = rect.left() + ((rect.width() - total_w) * 0.5).max(0.0) - scroll_px;
-
-    let mut white_index = 0usize;
-    for midi in PIANO_LOW_MIDI..=PIANO_HIGH_MIDI {
-        if is_black_key(midi) {
-            continue;
-        }
-
-        let x0 = x_start + white_index as f32 * white_w;
-        let x1 = x0 + white_w;
-        if x1 < rect.left() || x0 > rect.right() {
-            white_index += 1;
-            continue;
-        }
-
-        let key_rect =
-            egui::Rect::from_min_max(egui::pos2(x0, rect.top()), egui::pos2(x1, rect.bottom()));
-        painter.rect_stroke(
-            key_rect,
-            0.0,
-            egui::Stroke::new(
-                1.0,
-                egui::Color32::from_rgba_unmultiplied(120, 120, 120, 60),
-            ),
-        );
-
-        let idx = (midi - PIANO_LOW_MIDI) as usize;
-        let p_raw = probs_raw.get(idx).copied().unwrap_or(0.0).clamp(0.0, 1.0);
-        let p_smooth = probs_smoothed
-            .get(idx)
-            .copied()
-            .unwrap_or(p_raw)
-            .clamp(0.0, 1.0);
-
-        // Raw probability controls bar height, while smoothed value controls a subtle glow.
-        let h = p_raw * (rect.height() - 8.0);
-        if h > 0.5 {
-            let bar = egui::Rect::from_min_max(
-                egui::pos2(x0 + 1.0, rect.bottom() - h - 2.0),
-                egui::pos2(x1 - 1.0, rect.bottom() - 2.0),
-            );
-            painter.rect_filled(bar, 1.0, highlight_color);
-        }
-
-        let glow_h = p_smooth * (rect.height() - 8.0);
-        if glow_h > 0.5 {
-            let glow = egui::Rect::from_min_max(
-                egui::pos2(x0 + 1.0, rect.bottom() - glow_h - 2.0),
-                egui::pos2(x1 - 1.0, rect.bottom() - glow_h - 1.0),
-            );
-            painter.rect_filled(
-                glow,
-                1.0,
-                egui::Color32::from_rgba_unmultiplied(255, 215, 140, 180),
-            );
-        }
-
-        white_index += 1;
-    }
-
-    let black_h = rect.height() * 0.62;
-    let mut white_before = 0usize;
-    for midi in PIANO_LOW_MIDI..=PIANO_HIGH_MIDI {
-        if !is_black_key(midi) {
-            white_before += 1;
-            continue;
-        }
-
-        let center_x = x_start + white_before as f32 * white_w;
-        let x0 = center_x - black_w * 0.5;
-        let x1 = center_x + black_w * 0.5;
-        if x1 < rect.left() || x0 > rect.right() {
-            continue;
-        }
-
-        let key_rect = egui::Rect::from_min_max(
-            egui::pos2(x0, rect.top()),
-            egui::pos2(x1, rect.top() + black_h),
-        );
-        painter.rect_filled(key_rect, 2.0, egui::Color32::from_rgb(28, 31, 38));
-        painter.rect_stroke(
-            key_rect,
-            2.0,
-            egui::Stroke::new(
-                1.0,
-                egui::Color32::from_rgba_unmultiplied(160, 160, 170, 80),
-            ),
-        );
-
-        let idx = (midi - PIANO_LOW_MIDI) as usize;
-        let p_raw = probs_raw.get(idx).copied().unwrap_or(0.0).clamp(0.0, 1.0);
-        let p_smooth = probs_smoothed
-            .get(idx)
-            .copied()
-            .unwrap_or(p_raw)
-            .clamp(0.0, 1.0);
-
-        let h = p_raw * (key_rect.height() - 4.0);
-        if h > 0.5 {
-            let bar = egui::Rect::from_min_max(
-                egui::pos2(x0 + 1.0, key_rect.bottom() - h - 1.0),
-                egui::pos2(x1 - 1.0, key_rect.bottom() - 1.0),
-            );
-            painter.rect_filled(bar, 1.0, highlight_color);
-        }
-
-        let glow_h = p_smooth * (key_rect.height() - 4.0);
-        if glow_h > 0.5 {
-            let glow = egui::Rect::from_min_max(
-                egui::pos2(x0 + 1.0, key_rect.bottom() - glow_h - 1.0),
-                egui::pos2(x1 - 1.0, key_rect.bottom() - glow_h),
-            );
-            painter.rect_filled(
-                glow,
-                1.0,
-                egui::Color32::from_rgba_unmultiplied(255, 230, 170, 210),
-            );
-        }
-    }
-
-    KeyboardDrawResult {
-        clicked: response.clicked(),
-        max_scroll_px,
-    }
-}
-
-fn is_black_key(midi: u8) -> bool {
-    matches!(midi % 12, 1 | 3 | 6 | 8 | 10)
-}
-
-fn setting_toggle_row(ui: &mut egui::Ui, value: &mut bool, label: &str) -> bool {
-    let mut changed = false;
-    ui.horizontal(|ui| {
-        changed |= ui.checkbox(value, "").changed();
-        let response = ui.add(
-            egui::Label::new(label)
-                .wrap(false)
-                .sense(egui::Sense::click()),
-        );
-        if response.clicked() {
-            *value = !*value;
-            changed = true;
-        }
-    });
-    changed
-}
-
-fn draw_media_controls(
-    app: &mut TranscriberApp,
-    ui: &mut egui::Ui,
-    analysis_ready: bool,
-    duration: f32,
-) {
-    let art_size = 72.0;
-    let panel_fill = if app.dark_mode {
-        egui::Color32::from_rgb(19, 28, 38)
-    } else {
-        egui::Color32::from_rgb(232, 236, 243)
-    };
-
-    let target_w = ui.available_width();
-    let target_h = art_size + 24.0;
-
-    ui.allocate_ui_with_layout(
-        egui::vec2(target_w, target_h),
-        egui::Layout::top_down(egui::Align::Center),
-        |ui| {
-            egui::Frame::none()
-                .fill(panel_fill)
-                .rounding(egui::Rounding::same(8.0))
-                .inner_margin(egui::Margin::symmetric(14.0, 10.0))
-                .show(ui, |ui| {
-                    ui.horizontal_centered(|ui| {
-                        ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
-                            if let Some(texture) = &app.album_art_texture {
-                                ui.add(
-                                    egui::Image::new(texture)
-                                        .fit_to_exact_size(egui::vec2(art_size, art_size)),
-                                );
-                            } else {
-                                let (rect, _) = ui.allocate_exact_size(
-                                    egui::vec2(art_size, art_size),
-                                    egui::Sense::hover(),
-                                );
-                                let painter = ui.painter_at(rect);
-                                painter.rect_filled(rect, 6.0, egui::Color32::from_rgb(38, 49, 63));
-                                painter.text(
-                                    rect.center(),
-                                    egui::Align2::CENTER_CENTER,
-                                    PLAY,
-                                    icon_font_id(20.0),
-                                    egui::Color32::from_rgb(177, 192, 210),
-                                );
-                            }
-
-                            ui.add_space(8.0);
-
-                            ui.allocate_ui_with_layout(
-                                egui::vec2(280.0, art_size),
-                                egui::Layout::top_down(egui::Align::Min),
-                                |ui| {
-                                    let fallback_name = app
-                                        .loaded_path
-                                        .as_ref()
-                                        .and_then(|p| p.file_name())
-                                        .and_then(|s| s.to_str())
-                                        .unwrap_or("Untitled");
-
-                                    let title = app
-                                        .audio_raw
-                                        .as_ref()
-                                        .and_then(|a| a.metadata.title.as_deref())
-                                        .unwrap_or(fallback_name);
-
-                                    let artist = app
-                                        .audio_raw
-                                        .as_ref()
-                                        .and_then(|a| a.metadata.artist.as_deref())
-                                        .unwrap_or("Unknown Artist");
-
-                                    let album = app
-                                        .audio_raw
-                                        .as_ref()
-                                        .and_then(|a| a.metadata.album.as_deref())
-                                        .unwrap_or("");
-
-                                    let title_h = ui
-                                        .fonts(|f| f.row_height(&egui::FontId::proportional(17.0)));
-                                    let artist_h = ui
-                                        .fonts(|f| f.row_height(&egui::FontId::proportional(14.0)));
-                                    let block_h = title_h + artist_h + ui.spacing().item_spacing.y;
-                                    let top_pad = ((art_size - block_h) * 0.5).max(0.0);
-                                    if top_pad > 0.0 {
-                                        ui.add_space(top_pad);
-                                    }
-
-                                    ui.label(egui::RichText::new(title).size(17.0));
-                                    if album.is_empty() {
-                                        ui.label(
-                                            egui::RichText::new(artist)
-                                                .color(egui::Color32::from_rgb(166, 182, 202)),
-                                        );
-                                    } else {
-                                        ui.label(
-                                            egui::RichText::new(format!("{artist} · {album}"))
-                                                .color(egui::Color32::from_rgb(166, 182, 202)),
-                                        );
-                                    }
-                                },
-                            );
-
-                            ui.add_space(14.0);
-
-                            if icon_button(ui, SKIP_BACK, "Go To Start", analysis_ready).clicked() {
-                                app.stop();
-                                app.selected_time_sec = 0.0;
-                                app.update_note_probabilities(true);
-                            }
-
-                            let is_playing =
-                                app.engine.as_ref().map(|e| e.is_playing()).unwrap_or(false);
-                            let play_icon = if is_playing { PAUSE } else { PLAY };
-
-                            if icon_button(ui, play_icon, "Play / Pause", analysis_ready).clicked()
-                            {
-                                let current_pos = app
-                                    .engine
-                                    .as_ref()
-                                    .map(|e| e.current_position())
-                                    .unwrap_or(0.0);
-
-                                if is_playing {
-                                    if let Some(engine) = &mut app.engine {
-                                        engine.pause();
-                                    }
-                                } else if app.audio_raw.is_some() {
-                                    if app.processed_samples.is_empty() {
-                                        app.request_rebuild(false);
-                                    }
-
-                                    if current_pos <= 0.0 || current_pos >= duration - 0.01 {
-                                        app.play_from_selected();
-                                    } else if let Some(engine) = &mut app.engine {
-                                        engine.resume();
-                                    }
-                                }
-                            }
-
-                            if icon_button(ui, SKIP_FORWARD, "Go To End", analysis_ready).clicked()
-                            {
-                                app.stop();
-                                app.selected_time_sec = duration.max(0.0);
-                                app.update_note_probabilities(true);
-                            }
-
-                            ui.add_space(6.0);
-
-                            if icon_toggle_button(
-                                ui,
-                                REPEAT,
-                                "Loop Selection",
-                                app.loop_enabled,
-                                analysis_ready,
-                                app.highlight_color,
-                            )
-                            .clicked()
-                            {
-                                app.loop_enabled = !app.loop_enabled;
-                                if !app.loop_enabled {
-                                    app.loop_playback_enabled = false;
-                                }
-                            }
-
-                            ui.add_space(8.0);
-
-                            let vol_icon = if app.playback_volume <= 0.01 {
-                                SPEAKER_NONE
-                            } else {
-                                SPEAKER_HIGH
-                            };
-                            ui.label(egui::RichText::new(vol_icon).font(icon_font_id(17.0)));
-
-                            let vol_changed = ui
-                                .add_sized(
-                                    [120.0, 20.0],
-                                    egui::Slider::new(&mut app.playback_volume, 0.0..=1.5)
-                                        .show_value(false),
-                                )
-                                .changed();
-                            if vol_changed {
-                                if let Some(engine) = &mut app.engine {
-                                    engine.set_volume(app.playback_volume);
-                                }
-                            }
-
-                            ui.add_space(8.0);
-                            ui.label(
-                                egui::RichText::new(format!(
-                                    "{} / {}",
-                                    format_time(app.selected_time_sec),
-                                    format_time(duration)
-                                ))
-                                .color(egui::Color32::from_rgb(176, 188, 203)),
-                            );
-                        });
-                    });
-                });
-        },
-    );
-}
-
-fn icon_button(ui: &mut egui::Ui, icon: &str, tooltip: &str, enabled: bool) -> egui::Response {
-    icon_button_with_fill(ui, icon, tooltip, enabled, None)
-}
-
-fn icon_toggle_button(
-    ui: &mut egui::Ui,
-    icon: &str,
-    tooltip: &str,
-    enabled_state: bool,
-    enabled: bool,
-    accent_color: egui::Color32,
-) -> egui::Response {
-    let fill = if enabled_state {
-        accent_color
-    } else {
-        ui.visuals().widgets.inactive.bg_fill
-    };
-
-    icon_button_with_fill(ui, icon, tooltip, enabled, Some(fill))
-}
-
-fn icon_button_with_fill(
-    ui: &mut egui::Ui,
-    icon: &str,
-    tooltip: &str,
-    enabled: bool,
-    fill_override: Option<egui::Color32>,
-) -> egui::Response {
-    let desired = egui::vec2(34.0, 34.0);
-    let sense = if enabled {
-        egui::Sense::click()
-    } else {
-        egui::Sense::hover()
-    };
-    let (rect, response) = ui.allocate_exact_size(desired, sense);
-    let response = response.on_hover_text(tooltip);
-    let visuals = ui.style().interact(&response);
-
-    let mut bg_fill = fill_override.unwrap_or(visuals.bg_fill);
-    if !enabled {
-        bg_fill = ui.visuals().widgets.inactive.bg_fill;
-    }
-
-    ui.painter()
-        .rect(rect, visuals.rounding, bg_fill, visuals.bg_stroke);
-
-    let text_color = if enabled {
-        visuals.text_color()
-    } else {
-        ui.visuals().widgets.inactive.text_color()
-    };
-
-    ui.painter().text(
-        rect.center(),
-        egui::Align2::CENTER_CENTER,
-        icon,
-        icon_font_id(18.0),
-        text_color,
-    );
-
-    response
-}
-
-fn icon_font_id(size: f32) -> egui::FontId {
-    egui::FontId::new(size, egui::FontFamily::Name("icons".into()))
-}
-
-fn parse_hex_color(hex: &str) -> Option<egui::Color32> {
-    let trimmed = hex.trim().trim_start_matches('#');
-    if trimmed.len() != 6 {
-        return None;
-    }
-
-    let r = u8::from_str_radix(&trimmed[0..2], 16).ok()?;
-    let g = u8::from_str_radix(&trimmed[2..4], 16).ok()?;
-    let b = u8::from_str_radix(&trimmed[4..6], 16).ok()?;
-    Some(egui::Color32::from_rgb(r, g, b))
-}
-
-fn color_to_hex(color: egui::Color32) -> String {
-    format!("#{:02X}{:02X}{:02X}", color.r(), color.g(), color.b())
-}
-
-fn push_recent_color(recent: &mut Vec<String>, color: egui::Color32) {
-    let hex = color_to_hex(color);
-    recent.retain(|item| item != &hex);
-    recent.insert(0, hex);
-    if recent.len() > 10 {
-        recent.truncate(10);
-    }
-}
-
-fn accent_soft(color: egui::Color32) -> egui::Color32 {
-    let r = ((color.r() as u16 + 255) / 2) as u8;
-    let g = ((color.g() as u16 + 255) / 2) as u8;
-    let b = ((color.b() as u16 + 255) / 2) as u8;
-    egui::Color32::from_rgb(r, g, b)
-}
-
-fn format_time(sec: f32) -> String {
-    let total = sec.max(0.0).floor() as u64;
-    let m = total / 60;
-    let s = total % 60;
-    format!("{m:02}:{s:02}")
 }

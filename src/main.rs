@@ -10,6 +10,7 @@ mod preprocessing;
 mod viterbi;
 mod inference;
 mod pipeline;
+mod ui;
 
 use app::TranscriberApp;
 
