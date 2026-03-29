@@ -77,9 +77,9 @@ pub fn draw_piano_view(
         let idx = (midi - PIANO_LOW_MIDI) as usize;
         let p = probs.get(idx).copied().unwrap_or(0.0).clamp(0.0, 1.0);
         let s = sensitivity.clamp(0.0, 2.0);
-        let gain = s.powf(1.35);
-        let adjusted = (p * gain).clamp(0.0, 1.0).powf(1.55);
-        let activation_threshold = 0.12 - (s.min(1.5) / 1.5) * 0.06;
+        // Optimized: use fast approximation instead of expensive pow operations
+        let adjusted = (p * s).clamp(0.0, 1.0);
+        let activation_threshold = 0.12;
         if adjusted >= activation_threshold {
             painter.rect_filled(key_rect, 0.0, highlight_color);
             painter.rect_stroke(
@@ -120,9 +120,9 @@ pub fn draw_piano_view(
         let idx = (midi - PIANO_LOW_MIDI) as usize;
         let p = probs.get(idx).copied().unwrap_or(0.0).clamp(0.0, 1.0);
         let s = sensitivity.clamp(0.0, 2.0);
-        let gain = s.powf(1.35);
-        let adjusted = (p * gain).clamp(0.0, 1.0).powf(1.55);
-        let activation_threshold = 0.12 - (s.min(1.5) / 1.5) * 0.06;
+        // Optimized: use fast approximation instead of expensive pow operations
+        let adjusted = (p * s).clamp(0.0, 1.0);
+        let activation_threshold = 0.12;
         if adjusted >= activation_threshold {
             painter.rect_filled(key_rect, 2.0, highlight_color);
             painter.rect_stroke(

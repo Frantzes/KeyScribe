@@ -1,21 +1,38 @@
 mod analysis;
 mod app;
 mod audio_io;
-mod dsp;
-mod playback;
-mod theme;
-mod ring_buffer;
 mod cqt;
-mod preprocessing;
-mod viterbi;
+mod dsp;
 mod inference;
 mod pipeline;
+mod playback;
+mod preprocessing;
+mod ring_buffer;
+mod theme;
 mod ui;
+mod viterbi;
 
 use app::TranscriberApp;
+use eframe::egui;
+
+fn load_window_icon() -> Option<egui::IconData> {
+    let bytes = include_bytes!("../icon.png");
+    let image = image::load_from_memory(bytes).ok()?.into_rgba8();
+    let (width, height) = image.dimensions();
+
+    Some(egui::IconData {
+        rgba: image.into_raw(),
+        width,
+        height,
+    })
+}
 
 fn main() -> eframe::Result<()> {
-    let native_options = eframe::NativeOptions::default();
+    let mut native_options = eframe::NativeOptions::default();
+    if let Some(icon) = load_window_icon() {
+        native_options.viewport = native_options.viewport.with_icon(icon);
+    }
+
     eframe::run_native(
         "Audio Visual Transcriber",
         native_options,

@@ -30,7 +30,7 @@ mod media_controls;
 use media_controls::{draw_media_controls, setting_toggle_row};
 
 const STATE_FILE_NAME: &str = ".transcriber_state.json";
-const PROBABILITY_UPDATE_INTERVAL: Duration = Duration::from_millis(80);
+const PROBABILITY_UPDATE_INTERVAL: Duration = Duration::from_millis(16);
 const FFT_TIMELINE_STEP_SEC: f32 = 0.05;
 const FFT_WINDOW_SIZE: usize = 4096;
 const LOOP_MIN_DURATION_SEC: f32 = 0.01;
@@ -1252,8 +1252,6 @@ impl eframe::App for TranscriberApp {
                 });
 
             ui.add_space(8.0);
-            let available_w = ui.available_width();
-            let media_width = available_w;
             let remaining_h = ui.available_height();
             let media_height = 96.0;
             let top_pad = ((remaining_h - media_height) * 0.5).max(0.0);
@@ -1261,14 +1259,9 @@ impl eframe::App for TranscriberApp {
                 ui.add_space(top_pad);
             }
 
-            ui.horizontal_centered(|ui| {
-                ui.allocate_ui_with_layout(
-                    egui::vec2(media_width, media_height),
-                    egui::Layout::top_down(egui::Align::Center),
-                    |ui| {
-                        draw_media_controls(self, ui, analysis_ready, duration);
-                    },
-                );
+            let available_w = ui.available_width();
+            ui.allocate_ui(egui::vec2(available_w, media_height), |ui| {
+                draw_media_controls(self, ui, analysis_ready, duration);
             });
         });
         self.waveform_panel_height = waveform_central.response.rect.height().clamp(120.0, 5000.0);
