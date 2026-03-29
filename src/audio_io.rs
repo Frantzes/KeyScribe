@@ -8,13 +8,81 @@ use symphonia::core::codecs::DecoderOptions;
 use symphonia::core::errors::Error as SymphoniaError;
 use symphonia::core::formats::FormatOptions;
 use symphonia::core::io::MediaSourceStream;
-use symphonia::core::meta::MetadataOptions;
+use symphonia::core::meta::{MetadataOptions, MetadataRevision, StandardTagKey, StandardVisualKey};
 use symphonia::default::{get_codecs, get_probe};
+
+#[derive(Clone, Default)]
+pub struct AudioMetadata {
+    pub title: Option<String>,
+    pub artist: Option<String>,
+    pub album: Option<String>,
+    pub artwork_bytes: Option<Vec<u8>>,
+}
 
 #[derive(Clone)]
 pub struct AudioData {
     pub sample_rate: u32,
     pub samples_mono: Arc<Vec<f32>>,
+    pub metadata: AudioMetadata,
+}
+
+fn first_non_empty(current: &mut Option<String>, candidate: String) {
+    let trimmed = candidate.trim();
+    if current.is_none() && !trimmed.is_empty() {
+        *current = Some(trimmed.to_string());
+    }
+}
+
+fn apply_metadata_revision(metadata: &mut AudioMetadata, revision: &MetadataRevision) {
+    for tag in revision.tags() {
+        let value = tag.value.to_string();
+
+        match tag.std_key {
+            Some(StandardTagKey::TrackTitle) => first_non_empty(&mut metadata.title, value),
+            Some(StandardTagKey::Artist) | Some(StandardTagKey::Performer) => {
+                first_non_empty(&mut metadata.artist, value)
+            }
+            Some(StandardTagKey::Album) => first_non_empty(&mut metadata.album, value),
+            _ => {
+                let key = tag.key.to_ascii_lowercase();
+                if key.contains("title") {
+                    first_non_empty(&mut metadata.title, value);
+                } else if key.contains("artist") || key.contains("performer") {
+                    first_non_empty(&mut metadata.artist, value);
+                } else if key.contains("album") {
+                    first_non_empty(&mut metadata.album, value);
+                }
+            }
+        }
+    }
+
+    if metadata.artwork_bytes.is_none() {
+        if let Some(best) = revision
+            .visuals()
+            .iter()
+            .find(|v| matches!(v.usage, Some(StandardVisualKey::FrontCover)))
+            .or_else(|| revision.visuals().iter().find(|v| v.media_type.starts_with("image/")))
+            .or_else(|| revision.visuals().first())
+        {
+            metadata.artwork_bytes = Some(best.data.to_vec());
+        }
+    }
+}
+
+fn extract_audio_metadata(probed: &mut symphonia::core::probe::ProbeResult) -> AudioMetadata {
+    let mut metadata = AudioMetadata::default();
+
+    if let Some(mut probed_meta) = probed.metadata.get() {
+        if let Some(revision) = probed_meta.skip_to_latest() {
+            apply_metadata_revision(&mut metadata, revision);
+        }
+    }
+
+    if let Some(revision) = probed.format.metadata().skip_to_latest() {
+        apply_metadata_revision(&mut metadata, revision);
+    }
+
+    metadata
 }
 
 pub fn load_audio_file(path: &Path) -> Result<AudioData> {
@@ -29,6 +97,8 @@ pub fn load_audio_file(path: &Path) -> Result<AudioData> {
             &MetadataOptions::default(),
         )
         .context("Failed to probe audio format")?;
+
+    let mut metadata = extract_audio_metadata(&mut probed);
 
     let format = &mut probed.format;
     let track = format
@@ -47,6 +117,10 @@ pub fn load_audio_file(path: &Path) -> Result<AudioData> {
     let mut mono_samples = Vec::<f32>::new();
 
     loop {
+        if let Some(revision) = format.metadata().skip_to_latest() {
+            apply_metadata_revision(&mut metadata, revision);
+        }
+
         let packet = match format.next_packet() {
             Ok(packet) => packet,
             Err(SymphoniaError::IoError(_)) => break,
@@ -87,5 +161,6 @@ pub fn load_audio_file(path: &Path) -> Result<AudioData> {
     Ok(AudioData {
         sample_rate,
         samples_mono: Arc::new(mono_samples),
+        metadata,
     })
 }

@@ -1,14 +1,29 @@
 {
-  "last_file": "C:\\Users\\Fran\\Documents\\GitHub\\music\\Spotify downloader\\Micah Thomas\\Giveton Gelin - What Will I Do.mp3",
+  "last_file": "C:\\Users\\Fran\\Documents\\GitHub\\music\\Spotify downloader\\Micah Thomas\\Micah Thomas - Look at the Birds.mp3",
   "selected_time_sec": 0.0,
   "speed": 1.0,
   "pitch_semitones": 0.0,
-  "key_color_sensitivity": 0.75,
+  "key_color_sensitivity": 0.85,
   "piano_zoom": 1.0,
-  "piano_key_height": 22.000004,
-  "waveform_panel_height": 404.0,
-  "probability_panel_height": 20.0,
-  "piano_panel_height": 124.0,
-  "show_pitch_track_window": false,
-  "show_note_hist_window": true
+  "piano_key_height": 220.0,
+  "waveform_panel_height": 630.99994,
+  "probability_panel_height": 120.0,
+  "piano_panel_height": 392.00006,
+  "show_note_hist_window": true,
+  "use_cqt_analysis": true,
+  "preprocess_audio": true,
+  "playback_volume": 0.85,
+  "loop_enabled": false,
+  "dark_mode": true,
+  "highlight_hex": "#FF8C2D",
+  "recent_highlight_hex": [
+    "#FF8C2D",
+    "#48A2FF",
+    "#F87086",
+    "#38CC8E",
+    "#AA86FF",
+    "#39CDD9",
+    "#EEBE49",
+    "#A2D83A"
+  ]
 }

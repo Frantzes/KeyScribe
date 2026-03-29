@@ -1,5 +1,11 @@
 use rustfft::num_complex::Complex;
 use rustfft::FftPlanner;
+use crate::pipeline::{AudioPipeline, PipelineConfig};
+use crate::cqt::CQTransform;
+use crate::inference::{BasicPitchInference, InferenceConfig};
+use std::sync::{Mutex, OnceLock};
+
+static BASIC_PITCH_ENGINE: OnceLock<Mutex<Option<BasicPitchInference>>> = OnceLock::new();
 
 pub const PIANO_LOW_MIDI: u8 = 21;
 pub const PIANO_HIGH_MIDI: u8 = 108;
@@ -242,4 +248,214 @@ fn local_noise_floor(power: &[f32], center_bin: usize) -> f32 {
     } else {
         0.0
     }
+}
+
+// ============================================================================
+// Pro analysis using Constant-Q Transform / Basic Pitch pipeline
+// ============================================================================
+
+/// Compute Constant-Q Transform based note probabilities
+/// This provides better frequency resolution for polyphonic transcription
+pub fn detect_note_probabilities_cqt(
+    samples: &[f32],
+    sample_rate: u32,
+    center_sample: usize,
+    fft_size: usize,
+) -> Vec<f32> {
+    if let Some(probs) = detect_note_probabilities_basic_pitch(samples, sample_rate, center_sample) {
+        return probs;
+    }
+
+    detect_note_probabilities_cqt_fallback(samples, sample_rate, fft_size)
+}
+
+fn detect_note_probabilities_basic_pitch(
+    samples: &[f32],
+    sample_rate: u32,
+    center_sample: usize,
+) -> Option<Vec<f32>> {
+    if samples.is_empty() || sample_rate == 0 {
+        return None;
+    }
+
+    let config = InferenceConfig::default();
+    let source_window_samples = ((config.input_samples as f64) * (sample_rate as f64)
+        / (config.model_sample_rate as f64))
+        .round()
+        .max(1.0) as usize;
+
+    let mut start = center_sample.saturating_sub(source_window_samples / 2);
+    let mut end = (start + source_window_samples).min(samples.len());
+    if end - start < source_window_samples {
+        start = end.saturating_sub(source_window_samples);
+    }
+    end = end.max(start);
+
+    let window_src = &samples[start..end];
+    let window_model = BasicPitchInference::resample_linear(
+        window_src,
+        sample_rate,
+        config.model_sample_rate,
+    );
+
+    let engine = BASIC_PITCH_ENGINE.get_or_init(|| {
+        Mutex::new(BasicPitchInference::new(config).ok())
+    });
+
+    let mut guard = engine.lock().ok()?;
+    let model = guard.as_mut()?;
+    let note_frames = model.infer_audio_window(&window_model).ok()?;
+    if note_frames.is_empty() {
+        return None;
+    }
+
+    let note_count = (PIANO_HIGH_MIDI - PIANO_LOW_MIDI + 1) as usize;
+    let mut probs = vec![0.0f32; note_count];
+    for frame in &note_frames {
+        for (i, p) in frame.iter().take(note_count).enumerate() {
+            probs[i] = probs[i].max(*p);
+        }
+    }
+
+    Some(probs)
+}
+
+fn detect_note_probabilities_cqt_fallback(
+    samples: &[f32],
+    sample_rate: u32,
+    fft_size: usize,
+) -> Vec<f32> {
+    let note_count = (PIANO_HIGH_MIDI - PIANO_LOW_MIDI + 1) as usize;
+    let mut probs = vec![0.0f32; note_count];
+
+    if samples.len() < fft_size {
+        return probs;
+    }
+
+    // Use CQT instead of linear FFT
+    let cqt_config = crate::cqt::CQTConfig::piano_range(sample_rate);
+    let cqt = CQTransform::new(cqt_config.clone());
+
+    let frame_slice = &samples[..fft_size.min(samples.len())];
+    let cqt_frame = cqt.compute_frame(frame_slice);
+
+    // Map CQT bins to MIDI notes
+    // Since CQT is already in semitone units, mapping is direct
+    for (cqt_idx, &mag) in cqt_frame.iter().enumerate() {
+        let note_idx = (cqt_idx / cqt_config.bins_per_semitone).min(note_count - 1);
+        probs[note_idx] += mag;
+    }
+
+    // Normalize
+    let max_prob = probs.iter().copied().fold(0.0f32, f32::max);
+    if max_prob > 1e-9 {
+        for p in &mut probs {
+            *p = (*p / max_prob).clamp(0.0, 1.0);
+        }
+    }
+
+    probs
+}
+
+/// Create or get a reference to the Basic Pitch pipeline.
+pub fn create_basic_pitch_pipeline(sample_rate: u32) -> anyhow::Result<AudioPipeline> {
+    let config = PipelineConfig {
+        sample_rate,
+        chunk_size: (sample_rate as usize / 10),  // 100ms chunks
+        lookahead_frames: 5,
+        ..Default::default()
+    };
+
+    AudioPipeline::new(config)
+}
+
+/// Backward-compatible alias.
+pub fn create_hfsformer_pipeline(sample_rate: u32) -> anyhow::Result<AudioPipeline> {
+    create_basic_pitch_pipeline(sample_rate)
+}
+
+/// Compute log-magnitude CQT spectrogram
+pub fn compute_cqt_spectrogram(
+    samples: &[f32],
+    sample_rate: u32,
+    hop_size: usize,
+) -> Vec<Vec<f32>> {
+    if samples.len() < hop_size {
+        return vec![];
+    }
+
+    let cqt_config = crate::cqt::CQTConfig::piano_range(sample_rate);
+    let cqt = CQTransform::new(cqt_config);
+
+    let num_frames = (samples.len() - hop_size) / hop_size + 1;
+    let mut spectrogram = Vec::with_capacity(num_frames);
+
+    for frame_idx in 0..num_frames {
+        let start = frame_idx * hop_size;
+        let end = (start + hop_size).min(samples.len());
+        let frame = &samples[start..end];
+
+        let cqt_frame = cqt.compute_frame(frame);
+        let log_frame = CQTransform::to_log_scale(&cqt_frame, 1.0);
+
+        spectrogram.push(log_frame);
+    }
+
+    spectrogram
+}
+
+/// Pitch track using CQT (better for polyphonic audio)
+pub fn pitch_track_cqt(samples: &[f32], sample_rate: u32, points: usize) -> Vec<[f64; 2]> {
+    if samples.is_empty() || sample_rate == 0 || points == 0 {
+        return Vec::new();
+    }
+
+    let mut out = Vec::with_capacity(points);
+    let last_idx = samples.len().saturating_sub(1);
+
+    for i in 0..points {
+        let frac = i as f32 / points as f32;
+        let center = (frac * last_idx as f32) as usize;
+        let probs = detect_note_probabilities_cqt(samples, sample_rate, center, 4096);
+
+        let (best_idx, best_prob) = probs.iter().enumerate().fold(
+            (0usize, 0.0f32),
+            |acc, (idx, &p)| if p > acc.1 { (idx, p) } else { acc },
+        );
+
+        let best_midi = PIANO_LOW_MIDI as f64 + best_idx as f64;
+        let t = center as f64 / sample_rate as f64;
+
+        // CQT-based confidence gating is slightly more lenient since CQT inherently
+        // provides better separation of notes
+        let y = if best_prob > 0.25 {
+            best_midi
+        } else {
+            f64::NAN
+        };
+        out.push([t, y]);
+    }
+
+    out
+}
+
+/// Full professional pipeline: HPSS + CQT + Viterbi smoothing
+/// Returns smoothed note activations and raw probabilities
+pub fn analyze_with_full_pipeline(
+    samples: &[f32],
+    sample_rate: u32,
+) -> anyhow::Result<(Vec<Vec<bool>>, Vec<Vec<f32>>)> {
+    use crate::pipeline::{AudioPipeline, PipelineConfig};
+
+    let config = PipelineConfig {
+        sample_rate,
+        chunk_size: (sample_rate as usize / 10),  // 100ms chunks
+        lookahead_frames: 5,
+        ..Default::default()
+    };
+
+    let pipeline = AudioPipeline::new(config)?;
+    let result = pipeline.process_audio(samples)?;
+
+    Ok((result.smoothed_notes, result.note_probs_sequence))
 }

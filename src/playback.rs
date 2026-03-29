@@ -12,6 +12,7 @@ pub struct AudioEngine {
     start_pos_sec: f32,
     is_playing: bool,
     duration_sec: f32,
+    volume: f32,
 }
 
 impl AudioEngine {
@@ -26,6 +27,7 @@ impl AudioEngine {
             start_pos_sec: 0.0,
             is_playing: false,
             duration_sec: 0.0,
+            volume: 0.8,
         })
     }
 
@@ -66,6 +68,7 @@ impl AudioEngine {
         }
 
         let sink = Sink::try_new(&self.stream_handle).context("Failed to create playback sink")?;
+        sink.set_volume(self.volume.clamp(0.0, 1.5));
         let data = samples[start_idx..end_idx].to_vec();
         let source = SamplesBuffer::new(1, sample_rate, data);
 
@@ -136,4 +139,12 @@ impl AudioEngine {
             }
         }
     }
+
+    pub fn set_volume(&mut self, volume: f32) {
+        self.volume = volume.clamp(0.0, 1.5);
+        if let Some(s) = &self.sink {
+            s.set_volume(self.volume);
+        }
+    }
+
 }

@@ -4,6 +4,12 @@ mod audio_io;
 mod dsp;
 mod playback;
 mod theme;
+mod ring_buffer;
+mod cqt;
+mod preprocessing;
+mod viterbi;
+mod inference;
+mod pipeline;
 
 use app::TranscriberApp;
 

@@ -6,17 +6,21 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use eframe::egui;
+use egui_phosphor::regular::{
+    DOWNLOAD_SIMPLE, GEAR, PAUSE, PLAY, REPEAT, SKIP_BACK, SKIP_FORWARD, SPEAKER_HIGH, SPEAKER_NONE,
+};
 use egui_plot::{Line, Plot, PlotBounds, PlotPoints, Polygon, VLine};
 use rfd::FileDialog;
 use serde::{Deserialize, Serialize};
 
 use crate::analysis::{
-    detect_note_probabilities, pitch_track, waveform_points, PIANO_HIGH_MIDI, PIANO_LOW_MIDI,
+    analyze_with_full_pipeline, detect_note_probabilities, detect_note_probabilities_cqt,
+    waveform_points, PIANO_HIGH_MIDI, PIANO_LOW_MIDI,
 };
 use crate::audio_io::{load_audio_file, AudioData};
 use crate::dsp::apply_speed_and_pitch;
 use crate::playback::AudioEngine;
-use crate::theme::{apply_brand_theme, ACCENT_ORANGE, ACCENT_ORANGE_SOFT, ERROR_RED};
+use crate::theme::{apply_brand_theme, ACCENT_ORANGE, ERROR_RED};
 
 const STATE_FILE_NAME: &str = ".transcriber_state.json";
 const PIANO_ZOOM_MIN: f32 = 0.35;
@@ -24,6 +28,32 @@ const PIANO_ZOOM_MAX: f32 = 1.0;
 const WHITE_KEY_LENGTH_TO_WIDTH: f32 = 6.3;
 const MIN_PIANO_KEY_HEIGHT: f32 = 16.0;
 const MIN_PROBABILITY_STRIP_HEIGHT: f32 = 20.0;
+const PRESET_HIGHLIGHT_COLORS: [(&str, egui::Color32); 8] = [
+    ("Orange", egui::Color32::from_rgb(255, 140, 45)),
+    ("Sky", egui::Color32::from_rgb(72, 162, 255)),
+    ("Mint", egui::Color32::from_rgb(56, 204, 142)),
+    ("Rose", egui::Color32::from_rgb(248, 112, 134)),
+    ("Gold", egui::Color32::from_rgb(238, 190, 73)),
+    ("Lime", egui::Color32::from_rgb(162, 216, 58)),
+    ("Cyan", egui::Color32::from_rgb(57, 205, 217)),
+    ("Violet", egui::Color32::from_rgb(170, 134, 255)),
+];
+
+fn default_preprocess_audio() -> bool {
+    true
+}
+
+fn default_playback_volume() -> f32 {
+    0.8
+}
+
+fn default_dark_mode() -> bool {
+    true
+}
+
+fn default_highlight_hex() -> String {
+    "#FF8C2D".to_string()
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct PersistedState {
@@ -37,8 +67,21 @@ struct PersistedState {
     waveform_panel_height: f32,
     probability_panel_height: f32,
     piano_panel_height: f32,
-    show_pitch_track_window: bool,
     show_note_hist_window: bool,
+    #[serde(default)]
+    use_cqt_analysis: bool,
+    #[serde(default = "default_preprocess_audio")]
+    preprocess_audio: bool,
+    #[serde(default = "default_playback_volume")]
+    playback_volume: f32,
+    #[serde(default)]
+    loop_enabled: bool,
+    #[serde(default = "default_dark_mode")]
+    dark_mode: bool,
+    #[serde(default = "default_highlight_hex")]
+    highlight_hex: String,
+    #[serde(default)]
+    recent_highlight_hex: Vec<String>,
 }
 
 impl Default for PersistedState {
@@ -54,8 +97,14 @@ impl Default for PersistedState {
             waveform_panel_height: 320.0,
             probability_panel_height: 130.0,
             piano_panel_height: 170.0,
-            show_pitch_track_window: false,
             show_note_hist_window: true,
+            use_cqt_analysis: false,
+            preprocess_audio: true,
+            playback_volume: 0.8,
+            loop_enabled: false,
+            dark_mode: true,
+            highlight_hex: default_highlight_hex(),
+            recent_highlight_hex: Vec::new(),
         }
     }
 }
@@ -80,7 +129,8 @@ pub struct TranscriberApp {
     audio_raw: Option<AudioData>,
     processed_samples: Vec<f32>,
     waveform: Vec<[f64; 2]>,
-    pitch_line: Vec<[f64; 2]>,
+    note_timeline: Vec<Vec<f32>>,
+    note_timeline_step_sec: f32,
     note_probs: Vec<f32>,
     note_probs_smoothed: Vec<f32>,
     selected_time_sec: f32,
@@ -104,33 +154,45 @@ pub struct TranscriberApp {
     pending_param_change: bool,
     restart_playback_after_processing: bool,
     last_prob_update: Instant,
-    show_pitch_track_window: bool,
     show_note_hist_window: bool,
+    playback_volume: f32,
+    loop_enabled: bool,
+    dark_mode: bool,
+    highlight_color: egui::Color32,
+    custom_rgb: [u8; 3],
+    recent_highlight_hex: Vec<String>,
     last_state_save_at: Instant,
     waveform_reset_view: bool,
     loop_selection: Option<(f32, f32)>,
     drag_select_anchor_sec: Option<f32>,
     loop_playback_enabled: bool,
+    use_cqt_analysis: bool,
+    preprocess_audio: bool,
+    album_art_texture: Option<egui::TextureHandle>,
 }
 
 struct ProcessingResult {
     job_id: u64,
     processed_samples: Vec<f32>,
     waveform: Vec<[f64; 2]>,
-    pitch_line: Vec<[f64; 2]>,
+    note_timeline: Vec<Vec<f32>>,
+    note_timeline_step_sec: f32,
+    analysis_error: Option<String>,
 }
 
 impl TranscriberApp {
     pub fn new(_cc: &eframe::CreationContext<'_>) -> Self {
-        apply_brand_theme(&_cc.egui_ctx);
         let persisted = load_persisted_state();
+        let highlight_color = parse_hex_color(&persisted.highlight_hex).unwrap_or(ACCENT_ORANGE);
+        apply_brand_theme(&_cc.egui_ctx, persisted.dark_mode, highlight_color);
 
         let mut app = Self {
             loaded_path: None,
             audio_raw: None,
             processed_samples: Vec::new(),
             waveform: Vec::new(),
-            pitch_line: Vec::new(),
+            note_timeline: Vec::new(),
+            note_timeline_step_sec: 0.0,
             note_probs: vec![0.0; (PIANO_HIGH_MIDI - PIANO_LOW_MIDI + 1) as usize],
             note_probs_smoothed: vec![0.0; (PIANO_HIGH_MIDI - PIANO_LOW_MIDI + 1) as usize],
             selected_time_sec: persisted.selected_time_sec.max(0.0),
@@ -156,21 +218,36 @@ impl TranscriberApp {
             pending_param_change: false,
             restart_playback_after_processing: false,
             last_prob_update: Instant::now(),
-            show_pitch_track_window: persisted.show_pitch_track_window,
-            show_note_hist_window: true,
+            show_note_hist_window: persisted.show_note_hist_window,
+            playback_volume: persisted.playback_volume.clamp(0.0, 1.5),
+            loop_enabled: persisted.loop_enabled,
+            dark_mode: persisted.dark_mode,
+            highlight_color,
+            custom_rgb: [
+                highlight_color.r(),
+                highlight_color.g(),
+                highlight_color.b(),
+            ],
+            recent_highlight_hex: persisted.recent_highlight_hex,
             last_state_save_at: Instant::now(),
             waveform_reset_view: true,
             loop_selection: None,
             drag_select_anchor_sec: None,
             loop_playback_enabled: false,
+            use_cqt_analysis: persisted.use_cqt_analysis,
+            preprocess_audio: persisted.preprocess_audio,
+            album_art_texture: None,
         };
+
+        if let Some(engine) = &mut app.engine {
+            engine.set_volume(app.playback_volume);
+        }
 
         if let Some(path) = persisted.last_file {
             if path.exists() {
                 match load_audio_file(&path) {
                     Ok(audio) => {
-                        app.loaded_path = Some(path);
-                        app.audio_raw = Some(audio);
+                        app.apply_loaded_audio(path, audio, &_cc.egui_ctx);
                         app.request_rebuild(false);
                     }
                     Err(err) => {
@@ -193,7 +270,7 @@ impl TranscriberApp {
         0.0
     }
 
-    fn import_audio(&mut self) {
+    fn import_audio_with_ctx(&mut self, ctx: &egui::Context) {
         let picked = FileDialog::new()
             .add_filter("Audio", &["wav", "mp3", "flac", "ogg", "m4a", "aac"])
             .pick_file();
@@ -201,9 +278,7 @@ impl TranscriberApp {
         if let Some(path) = picked {
             match load_audio_file(&path) {
                 Ok(audio) => {
-                    self.loaded_path = Some(path);
-                    self.selected_time_sec = 0.0;
-                    self.audio_raw = Some(audio);
+                    self.apply_loaded_audio(path.to_path_buf(), audio, ctx);
                     self.request_rebuild(false);
                     self.last_error = None;
                 }
@@ -214,6 +289,25 @@ impl TranscriberApp {
         }
     }
 
+    fn apply_loaded_audio(&mut self, path: PathBuf, audio: AudioData, ctx: &egui::Context) {
+        self.loaded_path = Some(path);
+        self.selected_time_sec = 0.0;
+        self.audio_raw = Some(audio);
+        self.album_art_texture = self.create_album_art_texture(ctx);
+    }
+
+    fn create_album_art_texture(&self, ctx: &egui::Context) -> Option<egui::TextureHandle> {
+        let bytes = self
+            .audio_raw
+            .as_ref()
+            .and_then(|a| a.metadata.artwork_bytes.as_deref())?;
+
+        let image = image::load_from_memory(bytes).ok()?.to_rgba8();
+        let size = [image.width() as usize, image.height() as usize];
+        let color_image = egui::ColorImage::from_rgba_unmultiplied(size, image.as_raw());
+
+        Some(ctx.load_texture("album-art", color_image, egui::TextureOptions::LINEAR))
+    }
     fn request_rebuild(&mut self, restart_playback: bool) {
         let Some(raw) = &self.audio_raw else {
             return;
@@ -226,7 +320,8 @@ impl TranscriberApp {
         let raw_samples: Arc<Vec<f32>> = Arc::clone(&raw.samples_mono);
         let speed = self.speed;
         let pitch_semitones = self.pitch_semitones;
-        let compute_pitch_track = self.show_pitch_track_window;
+        let use_cqt = self.use_cqt_analysis;
+        let preprocess_audio = self.preprocess_audio;
 
         let (tx, rx) = mpsc::channel::<ProcessingResult>();
         self.processing_rx = Some(rx);
@@ -238,17 +333,49 @@ impl TranscriberApp {
             let processed_samples =
                 apply_speed_and_pitch(raw_samples.as_slice(), speed, pitch_semitones);
             let waveform = waveform_points(&processed_samples, sample_rate, 6000);
-            let pitch_line = if compute_pitch_track {
-                pitch_track(&processed_samples, sample_rate, 320)
+
+            let (note_timeline, note_timeline_step_sec, analysis_error) = if preprocess_audio {
+                if use_cqt {
+                    match analyze_with_full_pipeline(&processed_samples, sample_rate) {
+                        Ok((_smoothed, probs)) => {
+                            let duration_sec =
+                                processed_samples.len() as f32 / sample_rate.max(1) as f32;
+                            let step_sec = if probs.is_empty() {
+                                0.0
+                            } else {
+                                (duration_sec / probs.len() as f32).max(1e-3)
+                            };
+                            (probs, step_sec, None)
+                        }
+                        Err(err) => {
+                            let fallback =
+                                Self::compute_fft_timeline(&processed_samples, sample_rate, 0.05);
+                            (
+                                fallback,
+                                0.05,
+                                Some(format!("Pro analysis failed, using FFT fallback: {err}")),
+                            )
+                        }
+                    }
+                } else {
+                    let step_sec = 0.05;
+                    (
+                        Self::compute_fft_timeline(&processed_samples, sample_rate, step_sec),
+                        step_sec,
+                        None,
+                    )
+                }
             } else {
-                Vec::new()
+                (Vec::new(), 0.0, None)
             };
 
             let _ = tx.send(ProcessingResult {
                 job_id,
                 processed_samples,
                 waveform,
-                pitch_line,
+                note_timeline,
+                note_timeline_step_sec,
+                analysis_error,
             });
         });
     }
@@ -263,12 +390,16 @@ impl TranscriberApp {
                 if Some(result.job_id) == self.active_job_id {
                     self.processed_samples = result.processed_samples;
                     self.waveform = result.waveform;
-                    self.pitch_line = result.pitch_line;
+                    self.note_timeline = result.note_timeline;
+                    self.note_timeline_step_sec = result.note_timeline_step_sec;
                     self.waveform_reset_view = true;
                     self.is_processing = false;
                     self.processing_rx = None;
                     self.active_job_id = None;
                     self.selected_time_sec = self.selected_time_sec.min(self.duration());
+                    if let Some(err) = result.analysis_error {
+                        self.last_error = Some(err);
+                    }
                     self.update_note_probabilities(true);
 
                     if self.restart_playback_after_processing {
@@ -298,8 +429,14 @@ impl TranscriberApp {
             waveform_panel_height: self.waveform_panel_height,
             probability_panel_height: self.probability_panel_height,
             piano_panel_height: self.piano_panel_height,
-            show_pitch_track_window: self.show_pitch_track_window,
             show_note_hist_window: self.show_note_hist_window,
+            use_cqt_analysis: self.use_cqt_analysis,
+            preprocess_audio: self.preprocess_audio,
+            playback_volume: self.playback_volume,
+            loop_enabled: self.loop_enabled,
+            dark_mode: self.dark_mode,
+            highlight_hex: color_to_hex(self.highlight_color),
+            recent_highlight_hex: self.recent_highlight_hex.clone(),
         };
 
         if let Ok(raw) = serde_json::to_string_pretty(&state) {
@@ -312,17 +449,34 @@ impl TranscriberApp {
             return;
         }
 
-        let Some(raw) = &self.audio_raw else {
-            return;
-        };
+        if self.preprocess_audio {
+            if self.note_timeline.is_empty() || self.note_timeline_step_sec <= 0.0 {
+                return;
+            }
 
-        if self.processed_samples.is_empty() {
-            return;
+            let idx = (self.selected_time_sec.max(0.0) / self.note_timeline_step_sec) as usize;
+            let idx = idx.min(self.note_timeline.len().saturating_sub(1));
+            self.note_probs = self.note_timeline[idx].clone();
+        } else {
+            let Some(raw) = &self.audio_raw else {
+                return;
+            };
+            if self.processed_samples.is_empty() {
+                return;
+            }
+
+            let center = (self.selected_time_sec.max(0.0) * raw.sample_rate as f32) as usize;
+            self.note_probs = if self.use_cqt_analysis {
+                detect_note_probabilities_cqt(
+                    &self.processed_samples,
+                    raw.sample_rate,
+                    center,
+                    4096,
+                )
+            } else {
+                detect_note_probabilities(&self.processed_samples, raw.sample_rate, center, 4096)
+            };
         }
-
-        let center = (self.selected_time_sec.max(0.0) * raw.sample_rate as f32) as usize;
-        self.note_probs =
-            detect_note_probabilities(&self.processed_samples, raw.sample_rate, center, 4096);
 
         // Smooth the visual state to reduce rapid flicker between adjacent notes.
         for (smoothed, current) in self
@@ -334,6 +488,33 @@ impl TranscriberApp {
         }
 
         self.last_prob_update = Instant::now();
+    }
+
+    fn compute_fft_timeline(samples: &[f32], sample_rate: u32, step_sec: f32) -> Vec<Vec<f32>> {
+        if samples.is_empty() || sample_rate == 0 || step_sec <= 0.0 {
+            return Vec::new();
+        }
+
+        let mut timeline = Vec::new();
+        let total_sec = samples.len() as f32 / sample_rate as f32;
+        let mut t = 0.0f32;
+
+        while t <= total_sec {
+            let center = (t * sample_rate as f32) as usize;
+            timeline.push(detect_note_probabilities(
+                samples,
+                sample_rate,
+                center,
+                4096,
+            ));
+            t += step_sec;
+        }
+
+        if timeline.is_empty() {
+            timeline.push(vec![0.0; (PIANO_HIGH_MIDI - PIANO_LOW_MIDI + 1) as usize]);
+        }
+
+        timeline
     }
 
     fn play_from_selected(&mut self) {
@@ -373,14 +554,16 @@ impl TranscriberApp {
             return;
         }
 
-        if let Some((a, b)) = self.loop_selection {
-            let start = a.min(b);
-            let end = a.max(b);
-            if end - start > 0.01 {
-                self.loop_playback_enabled = true;
-                self.selected_time_sec = start;
-                self.play_range(start, Some(end));
-                return;
+        if self.loop_enabled {
+            if let Some((a, b)) = self.loop_selection {
+                let start = a.min(b);
+                let end = a.max(b);
+                if end - start > 0.01 {
+                    self.loop_playback_enabled = true;
+                    self.selected_time_sec = start;
+                    self.play_range(start, Some(end));
+                    return;
+                }
             }
         }
 
@@ -424,7 +607,7 @@ impl TranscriberApp {
             if engine.is_playing() {
                 self.selected_time_sec = engine.current_position().min(self.duration());
                 self.update_note_probabilities(false);
-            } else if self.loop_playback_enabled {
+            } else if self.loop_enabled && self.loop_playback_enabled {
                 if let Some((a, b)) = self.loop_selection {
                     let start = a.min(b);
                     let end = a.max(b);
@@ -440,7 +623,7 @@ impl TranscriberApp {
 
 impl eframe::App for TranscriberApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        apply_brand_theme(ctx);
+        apply_brand_theme(ctx, self.dark_mode, self.highlight_color);
 
         if ctx.input(|i| i.key_pressed(egui::Key::Space)) {
             self.handle_space_replay();
@@ -451,100 +634,123 @@ impl eframe::App for TranscriberApp {
 
         egui::TopBottomPanel::top("controls").show(ctx, |ui| {
             ui.horizontal_wrapped(|ui| {
-                if ui.button("Import Audio").clicked() {
-                    self.import_audio();
-                }
-
-                let play_icon = if self
-                    .engine
-                    .as_ref()
-                    .map(|e| e.is_playing())
-                    .unwrap_or(false)
-                {
-                    "⏸"
-                } else {
-                    "▶"
-                };
-
-                if ui
-                    .add(egui::Button::new(play_icon).min_size(egui::vec2(28.0, 24.0)))
-                    .on_hover_text("Play / Pause")
-                    .clicked()
-                {
-                    let is_playing = self
-                        .engine
-                        .as_ref()
-                        .map(|e| e.is_playing())
-                        .unwrap_or(false);
-                    let current_pos = self
-                        .engine
-                        .as_ref()
-                        .map(|e| e.current_position())
-                        .unwrap_or(0.0);
-
-                    if is_playing {
-                        if let Some(engine) = &mut self.engine {
-                            engine.pause();
-                        }
-                    } else if self.audio_raw.is_some() {
-                        if self.processed_samples.is_empty() {
-                            self.request_rebuild(false);
-                        }
-
-                        if current_pos <= 0.0 {
-                            self.play_from_selected();
-                        } else if let Some(engine) = &mut self.engine {
-                            engine.resume();
-                        }
-                    }
-                }
-
-                if ui
-                    .add(egui::Button::new("⏹").min_size(egui::vec2(28.0, 24.0)))
-                    .on_hover_text("Stop")
-                    .clicked()
-                {
-                    self.stop();
-                    self.selected_time_sec = 0.0;
-                    self.update_note_probabilities(true);
+                if icon_button(ui, DOWNLOAD_SIMPLE, "Import Audio", true).clicked() {
+                    self.import_audio_with_ctx(ctx);
                 }
 
                 let speed_changed = ui
-                    .add(
-                        egui::Slider::new(&mut self.speed, 0.5..=2.0)
-                            .text("Speed")
-                            .suffix("x"),
-                    )
+                    .add(egui::Slider::new(&mut self.speed, 0.5..=2.0).suffix("x"))
                     .changed();
 
                 let pitch_changed = ui
-                    .add(
-                        egui::Slider::new(&mut self.pitch_semitones, -12.0..=12.0)
-                            .text("Pitch")
-                            .suffix(" st"),
-                    )
+                    .add(egui::Slider::new(&mut self.pitch_semitones, -12.0..=12.0).suffix(" st"))
                     .changed();
 
                 if speed_changed || pitch_changed {
                     self.pending_param_change = true;
                 }
 
-                if self.loop_selection.is_some() {
-                    if ui.button("Clear Loop Selection").clicked() {
-                        self.loop_selection = None;
-                        self.loop_playback_enabled = false;
+                ui.menu_button(egui::RichText::new(GEAR).font(icon_font_id(18.0)), |ui| {
+                    ui.set_min_width(360.0);
+
+                    setting_toggle_row(ui, &mut self.dark_mode, "Dark Mode");
+                    ui.separator();
+
+                    ui.label("Highlight Presets");
+                    ui.horizontal_wrapped(|ui| {
+                        for (name, color) in PRESET_HIGHLIGHT_COLORS {
+                            let swatch = egui::RichText::new("   ").background_color(color);
+                            if ui
+                                .add(egui::Button::new(swatch))
+                                .on_hover_text(name)
+                                .clicked()
+                            {
+                                self.highlight_color = color;
+                                self.custom_rgb = [color.r(), color.g(), color.b()];
+                                push_recent_color(&mut self.recent_highlight_hex, color);
+                            }
+                        }
+                    });
+
+                    ui.separator();
+                    ui.label("Custom RGB");
+                    let mut rgb_changed = false;
+                    rgb_changed |= ui
+                        .add(egui::Slider::new(&mut self.custom_rgb[0], 0..=255).text("R"))
+                        .changed();
+                    rgb_changed |= ui
+                        .add(egui::Slider::new(&mut self.custom_rgb[1], 0..=255).text("G"))
+                        .changed();
+                    rgb_changed |= ui
+                        .add(egui::Slider::new(&mut self.custom_rgb[2], 0..=255).text("B"))
+                        .changed();
+
+                    if rgb_changed {
+                        self.highlight_color = egui::Color32::from_rgb(
+                            self.custom_rgb[0],
+                            self.custom_rgb[1],
+                            self.custom_rgb[2],
+                        );
                     }
-                }
 
-                if ui
-                    .checkbox(&mut self.show_pitch_track_window, "Pitch Track Window")
-                    .changed()
-                    && self.show_pitch_track_window
-                {
-                    self.request_rebuild(false);
-                }
+                    ui.horizontal(|ui| {
+                        ui.label(color_to_hex(self.highlight_color));
+                        if ui.button("Save Color").clicked() {
+                            push_recent_color(&mut self.recent_highlight_hex, self.highlight_color);
+                        }
+                    });
 
-                ui.checkbox(&mut self.show_note_hist_window, "Show Probability Pane");
+                    if !self.recent_highlight_hex.is_empty() {
+                        ui.label("Recent Colors");
+                        ui.horizontal_wrapped(|ui| {
+                            for hex in self.recent_highlight_hex.clone() {
+                                if let Some(color) = parse_hex_color(&hex) {
+                                    let swatch = egui::RichText::new("   ").background_color(color);
+                                    if ui
+                                        .add(egui::Button::new(swatch))
+                                        .on_hover_text(hex.clone())
+                                        .clicked()
+                                    {
+                                        self.highlight_color = color;
+                                        self.custom_rgb = [color.r(), color.g(), color.b()];
+                                    }
+                                }
+                            }
+                        });
+                    }
+
+                    ui.separator();
+
+                    let preprocess_changed = setting_toggle_row(
+                        ui,
+                        &mut self.preprocess_audio,
+                        "Preprocess Audio (recommended)",
+                    );
+
+                    let cqt_changed = setting_toggle_row(
+                        ui,
+                        &mut self.use_cqt_analysis,
+                        "Use CQT Analysis (Pro Mode)",
+                    );
+
+                    let _ = setting_toggle_row(
+                        ui,
+                        &mut self.show_note_hist_window,
+                        "Show Probability Pane",
+                    );
+
+                    if preprocess_changed || cqt_changed {
+                        let was_playing = self
+                            .engine
+                            .as_ref()
+                            .map(|e| e.is_playing())
+                            .unwrap_or(false);
+                        if was_playing {
+                            self.stop();
+                        }
+                        self.request_rebuild(was_playing);
+                    }
+                });
 
                 let pointer_down = ui.input(|i| i.pointer.primary_down());
                 if self.pending_param_change && !pointer_down {
@@ -561,19 +767,17 @@ impl eframe::App for TranscriberApp {
                 }
             });
 
-            if let Some(path) = &self.loaded_path {
-                ui.label(format!("Loaded: {}", path.display()));
-            }
-
             if let Some(err) = &self.last_error {
                 ui.colored_label(ERROR_RED, err);
             }
 
             if self.is_processing {
-                ui.colored_label(
-                    egui::Color32::from_rgb(240, 180, 30),
-                    "Processing speed/pitch update...",
-                );
+                let msg = if self.preprocess_audio {
+                    "Analyzing track... controls unlock when note extraction finishes."
+                } else {
+                    "Processing speed/pitch update..."
+                };
+                ui.colored_label(egui::Color32::from_rgb(240, 180, 30), msg);
             }
         });
 
@@ -629,6 +833,7 @@ impl eframe::App for TranscriberApp {
                     self.piano_zoom,
                     self.piano_scroll_px,
                     prob_strip_height,
+                    self.highlight_color,
                 );
                 max_scroll_px = max_scroll_px.max(prob_draw.max_scroll_px);
                 if prob_draw.clicked {
@@ -644,6 +849,7 @@ impl eframe::App for TranscriberApp {
                 self.piano_zoom,
                 key_h_for_frame,
                 self.piano_scroll_px,
+                self.highlight_color,
             );
             max_scroll_px = max_scroll_px.max(piano_draw.max_scroll_px);
 
@@ -688,10 +894,6 @@ impl eframe::App for TranscriberApp {
                         .suffix("x"),
                 );
             });
-
-            let duration = self.duration().max(0.01);
-            let current = self.selected_time_sec.min(duration);
-            ui.label(format!("Cursor: {:.2}s / {:.2}s", current, duration));
         });
         self.piano_panel_height = piano_panel.response.rect.height().max(80.0);
 
@@ -709,18 +911,21 @@ impl eframe::App for TranscriberApp {
 
         let waveform_central = egui::CentralPanel::default().show(ctx, |ui| {
             if self.audio_raw.is_none() {
-                ui.label("Import an audio file to begin visualizing waveform and pitch.");
+                ui.label("Import an audio file to begin.");
                 return;
             }
 
             let duration = self.duration().max(0.01);
-            ui.heading("Waveform");
-            let waveform_height = (ui.available_height() - 22.0).max(40.0);
+            let waveform_height = (ui.available_height() - 112.0).max(40.0);
+            let analysis_ready = !self.is_processing
+                && !self.processed_samples.is_empty()
+                && (!self.preprocess_audio || !self.note_timeline.is_empty());
+
             Plot::new("waveform_plot")
                 .height(waveform_height)
                 .allow_scroll(false)
                 .allow_zoom(false)
-                .allow_drag(false)
+                .allow_drag(analysis_ready)
                 .allow_boxed_zoom(false)
                 .show_grid(false)
                 .show_axes([false, false])
@@ -778,11 +983,13 @@ impl eframe::App for TranscriberApp {
                         }
                     } else {
                         let line = Line::new(PlotPoints::from_iter(self.waveform.iter().copied()));
-                        plot_ui.line(line.color(ACCENT_ORANGE));
+                        plot_ui.line(line.color(self.highlight_color));
                     }
 
-                    plot_ui
-                        .vline(VLine::new(self.selected_time_sec as f64).color(ACCENT_ORANGE_SOFT));
+                    plot_ui.vline(
+                        VLine::new(self.selected_time_sec as f64)
+                            .color(accent_soft(self.highlight_color)),
+                    );
 
                     if let Some((a, b)) = self.loop_selection {
                         let start = a.min(b);
@@ -909,13 +1116,13 @@ impl eframe::App for TranscriberApp {
                     plot_ui
                         .set_plot_bounds(PlotBounds::from_min_max([min_x, -1.05], [max_x, 1.05]));
 
-                    if drag_started {
+                    if analysis_ready && drag_started {
                         self.drag_select_anchor_sec = pointer
                             .map(|p| p.x.clamp(0.0, duration as f64) as f32)
                             .or(Some(self.selected_time_sec));
                     }
 
-                    if dragged {
+                    if analysis_ready && dragged {
                         if let (Some(anchor), Some(p)) = (
                             self.drag_select_anchor_sec,
                             pointer.map(|p| p.x.clamp(0.0, duration as f64) as f32),
@@ -924,7 +1131,7 @@ impl eframe::App for TranscriberApp {
                         }
                     }
 
-                    if drag_stopped {
+                    if analysis_ready && drag_stopped {
                         if let Some((a, b)) = self.loop_selection {
                             if (a - b).abs() < 0.01 {
                                 self.loop_selection = None;
@@ -933,14 +1140,18 @@ impl eframe::App for TranscriberApp {
                                 let start = a.min(b);
                                 let end = a.max(b);
                                 self.selected_time_sec = start;
-                                self.loop_playback_enabled = true;
-                                self.play_range(start, Some(end));
+                                if self.loop_enabled {
+                                    self.loop_playback_enabled = true;
+                                    self.play_range(start, Some(end));
+                                } else {
+                                    self.loop_playback_enabled = false;
+                                }
                             }
                         }
                         self.drag_select_anchor_sec = None;
                     }
 
-                    if clicked {
+                    if analysis_ready && clicked {
                         if let Some(pointer) = pointer {
                             self.selected_time_sec = pointer.x.clamp(0.0, duration as f64) as f32;
                             self.loop_selection = None;
@@ -958,40 +1169,34 @@ impl eframe::App for TranscriberApp {
                     }
                 });
 
-            ui.label(
-                "Use Ctrl + wheel to zoom waveform, Shift + wheel to scroll waveform or keyboard.",
-            );
+            ui.add_space(8.0);
+            let available_w = ui.available_width();
+            let media_width = available_w.min(980.0);
+            let free_w = (available_w - media_width).max(0.0);
+            let center_bias_px = 10.0;
+            let base_left_gutter = (free_w * 0.5).floor();
+            let left_gutter = (base_left_gutter + center_bias_px).min(free_w);
+            let right_gutter = (free_w - left_gutter).max(0.0);
+            ui.scope(|ui| {
+                ui.spacing_mut().item_spacing.x = 0.0;
+                ui.horizontal(|ui| {
+                    if left_gutter > 0.0 {
+                        ui.allocate_exact_size(egui::vec2(left_gutter, 0.0), egui::Sense::hover());
+                    }
+                    ui.allocate_ui_with_layout(
+                        egui::vec2(media_width, 0.0),
+                        egui::Layout::top_down(egui::Align::Center),
+                        |ui| {
+                            draw_media_controls(self, ui, analysis_ready, duration);
+                        },
+                    );
+                    if right_gutter > 0.0 {
+                        ui.allocate_exact_size(egui::vec2(right_gutter, 0.0), egui::Sense::hover());
+                    }
+                });
+            });
         });
         self.waveform_panel_height = waveform_central.response.rect.height().clamp(120.0, 5000.0);
-
-        if self.show_pitch_track_window {
-            let mut open = self.show_pitch_track_window;
-            egui::Window::new("Detected Pitch Track")
-                .open(&mut open)
-                .resizable(true)
-                .vscroll(true)
-                .show(ctx, |ui| {
-                    if self.pitch_line.is_empty() && !self.is_processing {
-                        ui.label("Pitch track not computed yet. Adjust speed/pitch or re-import to compute it.");
-                    }
-
-                    let duration = self.duration().max(0.01);
-                    Plot::new("pitch_track_plot")
-                        .height(220.0)
-                        .allow_scroll(false)
-                        .allow_zoom(true)
-                        .include_x(0.0)
-                        .include_x(duration as f64)
-                        .include_y(PIANO_LOW_MIDI as f64)
-                        .include_y(PIANO_HIGH_MIDI as f64)
-                        .show(ui, |plot_ui| {
-                            let line = Line::new(PlotPoints::from_iter(self.pitch_line.iter().copied()));
-                            plot_ui.line(line.color(egui::Color32::from_rgb(80, 140, 240)));
-                            plot_ui.vline(VLine::new(self.selected_time_sec as f64).color(egui::Color32::RED));
-                        });
-                });
-            self.show_pitch_track_window = open;
-        }
 
         // Keep UI responsive while playing.
         ctx.request_repaint_after(std::time::Duration::from_millis(16));
@@ -1033,6 +1238,7 @@ fn draw_piano_view(
     zoom: f32,
     key_height: f32,
     scroll_px: f32,
+    highlight_color: egui::Color32,
 ) -> KeyboardDrawResult {
     let desired_size = egui::vec2(
         ui.available_width(),
@@ -1081,9 +1287,12 @@ fn draw_piano_view(
         let adjusted = (p * gain).clamp(0.0, 1.0).powf(1.55);
         let activation_threshold = 0.12 - (s.min(1.5) / 1.5) * 0.06;
         if adjusted >= activation_threshold {
-            let alpha = (30.0 + adjusted * 180.0).clamp(30.0, 210.0) as u8;
-            let overlay = egui::Color32::from_rgba_unmultiplied(255, 150, 50, alpha);
-            painter.rect_filled(key_rect.shrink(1.0), 0.0, overlay);
+            painter.rect_filled(key_rect, 0.0, highlight_color);
+            painter.rect_stroke(
+                key_rect,
+                0.0,
+                egui::Stroke::new(1.0, egui::Color32::from_gray(90)),
+            );
         }
 
         white_index += 1;
@@ -1107,7 +1316,7 @@ fn draw_piano_view(
             egui::pos2(x1, rect.top() + black_h),
         );
 
-        painter.rect_filled(key_rect, 2.0, egui::Color32::from_gray(25));
+        painter.rect_filled(key_rect, 2.0, egui::Color32::from_gray(55));
         painter.rect_stroke(
             key_rect,
             2.0,
@@ -1121,9 +1330,12 @@ fn draw_piano_view(
         let adjusted = (p * gain).clamp(0.0, 1.0).powf(1.55);
         let activation_threshold = 0.12 - (s.min(1.5) / 1.5) * 0.06;
         if adjusted >= activation_threshold {
-            let alpha = (25.0 + adjusted * 170.0).clamp(25.0, 200.0) as u8;
-            let overlay = egui::Color32::from_rgba_unmultiplied(255, 175, 80, alpha);
-            painter.rect_filled(key_rect.shrink(1.0), 2.0, overlay);
+            painter.rect_filled(key_rect, 2.0, highlight_color);
+            painter.rect_stroke(
+                key_rect,
+                2.0,
+                egui::Stroke::new(1.0, egui::Color32::from_gray(65)),
+            );
         }
     }
 
@@ -1153,6 +1365,7 @@ fn draw_probability_pane(
     zoom: f32,
     scroll_px: f32,
     strip_height: f32,
+    highlight_color: egui::Color32,
 ) -> KeyboardDrawResult {
     let desired_size = egui::vec2(
         ui.available_width(),
@@ -1211,7 +1424,7 @@ fn draw_probability_pane(
                 egui::pos2(x0 + 1.0, rect.bottom() - h - 2.0),
                 egui::pos2(x1 - 1.0, rect.bottom() - 2.0),
             );
-            painter.rect_filled(bar, 1.0, egui::Color32::from_rgb(255, 160, 60));
+            painter.rect_filled(bar, 1.0, highlight_color);
         }
 
         let glow_h = p_smooth * (rect.height() - 8.0);
@@ -1273,7 +1486,7 @@ fn draw_probability_pane(
                 egui::pos2(x0 + 1.0, key_rect.bottom() - h - 1.0),
                 egui::pos2(x1 - 1.0, key_rect.bottom() - 1.0),
             );
-            painter.rect_filled(bar, 1.0, egui::Color32::from_rgb(255, 180, 75));
+            painter.rect_filled(bar, 1.0, highlight_color);
         }
 
         let glow_h = p_smooth * (key_rect.height() - 4.0);
@@ -1298,4 +1511,331 @@ fn draw_probability_pane(
 
 fn is_black_key(midi: u8) -> bool {
     matches!(midi % 12, 1 | 3 | 6 | 8 | 10)
+}
+
+fn setting_toggle_row(ui: &mut egui::Ui, value: &mut bool, label: &str) -> bool {
+    let mut changed = false;
+    ui.horizontal(|ui| {
+        changed |= ui.checkbox(value, "").changed();
+        let response = ui.add(
+            egui::Label::new(label)
+                .wrap(false)
+                .sense(egui::Sense::click()),
+        );
+        if response.clicked() {
+            *value = !*value;
+            changed = true;
+        }
+    });
+    changed
+}
+
+fn draw_media_controls(
+    app: &mut TranscriberApp,
+    ui: &mut egui::Ui,
+    analysis_ready: bool,
+    duration: f32,
+) {
+    let art_size = 72.0;
+    let panel_fill = if app.dark_mode {
+        egui::Color32::from_rgb(19, 28, 38)
+    } else {
+        egui::Color32::from_rgb(232, 236, 243)
+    };
+
+    let target_w = ui.available_width();
+    let target_h = art_size + 24.0;
+
+    ui.allocate_ui_with_layout(
+        egui::vec2(target_w, target_h),
+        egui::Layout::top_down(egui::Align::Center),
+        |ui| {
+            egui::Frame::none()
+                .fill(panel_fill)
+                .rounding(egui::Rounding::same(8.0))
+                .inner_margin(egui::Margin::symmetric(14.0, 10.0))
+                .show(ui, |ui| {
+                    ui.horizontal_centered(|ui| {
+                        ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
+                            if let Some(texture) = &app.album_art_texture {
+                                ui.add(
+                                    egui::Image::new(texture)
+                                        .fit_to_exact_size(egui::vec2(art_size, art_size)),
+                                );
+                            } else {
+                                let (rect, _) = ui.allocate_exact_size(
+                                    egui::vec2(art_size, art_size),
+                                    egui::Sense::hover(),
+                                );
+                                let painter = ui.painter_at(rect);
+                                painter.rect_filled(rect, 6.0, egui::Color32::from_rgb(38, 49, 63));
+                                painter.text(
+                                    rect.center(),
+                                    egui::Align2::CENTER_CENTER,
+                                    PLAY,
+                                    icon_font_id(20.0),
+                                    egui::Color32::from_rgb(177, 192, 210),
+                                );
+                            }
+
+                            ui.add_space(8.0);
+
+                            ui.allocate_ui_with_layout(
+                                egui::vec2(280.0, art_size),
+                                egui::Layout::top_down(egui::Align::Min),
+                                |ui| {
+                                    let fallback_name = app
+                                        .loaded_path
+                                        .as_ref()
+                                        .and_then(|p| p.file_name())
+                                        .and_then(|s| s.to_str())
+                                        .unwrap_or("Untitled");
+
+                                    let title = app
+                                        .audio_raw
+                                        .as_ref()
+                                        .and_then(|a| a.metadata.title.as_deref())
+                                        .unwrap_or(fallback_name);
+
+                                    let artist = app
+                                        .audio_raw
+                                        .as_ref()
+                                        .and_then(|a| a.metadata.artist.as_deref())
+                                        .unwrap_or("Unknown Artist");
+
+                                    let album = app
+                                        .audio_raw
+                                        .as_ref()
+                                        .and_then(|a| a.metadata.album.as_deref())
+                                        .unwrap_or("");
+
+                                    let title_h = ui
+                                        .fonts(|f| f.row_height(&egui::FontId::proportional(17.0)));
+                                    let artist_h = ui
+                                        .fonts(|f| f.row_height(&egui::FontId::proportional(14.0)));
+                                    let block_h = title_h + artist_h + ui.spacing().item_spacing.y;
+                                    let top_pad = ((art_size - block_h) * 0.5).max(0.0);
+                                    if top_pad > 0.0 {
+                                        ui.add_space(top_pad);
+                                    }
+
+                                    ui.label(egui::RichText::new(title).size(17.0));
+                                    if album.is_empty() {
+                                        ui.label(
+                                            egui::RichText::new(artist)
+                                                .color(egui::Color32::from_rgb(166, 182, 202)),
+                                        );
+                                    } else {
+                                        ui.label(
+                                            egui::RichText::new(format!("{artist} · {album}"))
+                                                .color(egui::Color32::from_rgb(166, 182, 202)),
+                                        );
+                                    }
+                                },
+                            );
+
+                            ui.add_space(14.0);
+
+                            if icon_button(ui, SKIP_BACK, "Go To Start", analysis_ready).clicked() {
+                                app.stop();
+                                app.selected_time_sec = 0.0;
+                                app.update_note_probabilities(true);
+                            }
+
+                            let is_playing =
+                                app.engine.as_ref().map(|e| e.is_playing()).unwrap_or(false);
+                            let play_icon = if is_playing { PAUSE } else { PLAY };
+
+                            if icon_button(ui, play_icon, "Play / Pause", analysis_ready).clicked()
+                            {
+                                let current_pos = app
+                                    .engine
+                                    .as_ref()
+                                    .map(|e| e.current_position())
+                                    .unwrap_or(0.0);
+
+                                if is_playing {
+                                    if let Some(engine) = &mut app.engine {
+                                        engine.pause();
+                                    }
+                                } else if app.audio_raw.is_some() {
+                                    if app.processed_samples.is_empty() {
+                                        app.request_rebuild(false);
+                                    }
+
+                                    if current_pos <= 0.0 || current_pos >= duration - 0.01 {
+                                        app.play_from_selected();
+                                    } else if let Some(engine) = &mut app.engine {
+                                        engine.resume();
+                                    }
+                                }
+                            }
+
+                            if icon_button(ui, SKIP_FORWARD, "Go To End", analysis_ready).clicked()
+                            {
+                                app.stop();
+                                app.selected_time_sec = duration.max(0.0);
+                                app.update_note_probabilities(true);
+                            }
+
+                            ui.add_space(6.0);
+
+                            if icon_toggle_button(
+                                ui,
+                                REPEAT,
+                                "Loop Selection",
+                                app.loop_enabled,
+                                analysis_ready,
+                                app.highlight_color,
+                            )
+                            .clicked()
+                            {
+                                app.loop_enabled = !app.loop_enabled;
+                                if !app.loop_enabled {
+                                    app.loop_playback_enabled = false;
+                                }
+                            }
+
+                            ui.add_space(8.0);
+
+                            let vol_icon = if app.playback_volume <= 0.01 {
+                                SPEAKER_NONE
+                            } else {
+                                SPEAKER_HIGH
+                            };
+                            ui.label(egui::RichText::new(vol_icon).font(icon_font_id(17.0)));
+
+                            let vol_changed = ui
+                                .add_sized(
+                                    [120.0, 20.0],
+                                    egui::Slider::new(&mut app.playback_volume, 0.0..=1.5)
+                                        .show_value(false),
+                                )
+                                .changed();
+                            if vol_changed {
+                                if let Some(engine) = &mut app.engine {
+                                    engine.set_volume(app.playback_volume);
+                                }
+                            }
+
+                            ui.add_space(8.0);
+                            ui.label(
+                                egui::RichText::new(format!(
+                                    "{} / {}",
+                                    format_time(app.selected_time_sec),
+                                    format_time(duration)
+                                ))
+                                .color(egui::Color32::from_rgb(176, 188, 203)),
+                            );
+                        });
+                    });
+                });
+        },
+    );
+}
+
+fn icon_button(ui: &mut egui::Ui, icon: &str, tooltip: &str, enabled: bool) -> egui::Response {
+    icon_button_with_fill(ui, icon, tooltip, enabled, None)
+}
+
+fn icon_toggle_button(
+    ui: &mut egui::Ui,
+    icon: &str,
+    tooltip: &str,
+    enabled_state: bool,
+    enabled: bool,
+    accent_color: egui::Color32,
+) -> egui::Response {
+    let fill = if enabled_state {
+        accent_color
+    } else {
+        ui.visuals().widgets.inactive.bg_fill
+    };
+
+    icon_button_with_fill(ui, icon, tooltip, enabled, Some(fill))
+}
+
+fn icon_button_with_fill(
+    ui: &mut egui::Ui,
+    icon: &str,
+    tooltip: &str,
+    enabled: bool,
+    fill_override: Option<egui::Color32>,
+) -> egui::Response {
+    let desired = egui::vec2(34.0, 34.0);
+    let sense = if enabled {
+        egui::Sense::click()
+    } else {
+        egui::Sense::hover()
+    };
+    let (rect, response) = ui.allocate_exact_size(desired, sense);
+    let response = response.on_hover_text(tooltip);
+    let visuals = ui.style().interact(&response);
+
+    let mut bg_fill = fill_override.unwrap_or(visuals.bg_fill);
+    if !enabled {
+        bg_fill = ui.visuals().widgets.inactive.bg_fill;
+    }
+
+    ui.painter()
+        .rect(rect, visuals.rounding, bg_fill, visuals.bg_stroke);
+
+    let text_color = if enabled {
+        visuals.text_color()
+    } else {
+        ui.visuals().widgets.inactive.text_color()
+    };
+
+    ui.painter().text(
+        rect.center(),
+        egui::Align2::CENTER_CENTER,
+        icon,
+        icon_font_id(18.0),
+        text_color,
+    );
+
+    response
+}
+
+fn icon_font_id(size: f32) -> egui::FontId {
+    egui::FontId::new(size, egui::FontFamily::Name("icons".into()))
+}
+
+fn parse_hex_color(hex: &str) -> Option<egui::Color32> {
+    let trimmed = hex.trim().trim_start_matches('#');
+    if trimmed.len() != 6 {
+        return None;
+    }
+
+    let r = u8::from_str_radix(&trimmed[0..2], 16).ok()?;
+    let g = u8::from_str_radix(&trimmed[2..4], 16).ok()?;
+    let b = u8::from_str_radix(&trimmed[4..6], 16).ok()?;
+    Some(egui::Color32::from_rgb(r, g, b))
+}
+
+fn color_to_hex(color: egui::Color32) -> String {
+    format!("#{:02X}{:02X}{:02X}", color.r(), color.g(), color.b())
+}
+
+fn push_recent_color(recent: &mut Vec<String>, color: egui::Color32) {
+    let hex = color_to_hex(color);
+    recent.retain(|item| item != &hex);
+    recent.insert(0, hex);
+    if recent.len() > 10 {
+        recent.truncate(10);
+    }
+}
+
+fn accent_soft(color: egui::Color32) -> egui::Color32 {
+    let r = ((color.r() as u16 + 255) / 2) as u8;
+    let g = ((color.g() as u16 + 255) / 2) as u8;
+    let b = ((color.b() as u16 + 255) / 2) as u8;
+    egui::Color32::from_rgb(r, g, b)
+}
+
+fn format_time(sec: f32) -> String {
+    let total = sec.max(0.0).floor() as u64;
+    let m = total / 60;
+    let s = total % 60;
+    format!("{m:02}:{s:02}")
 }
