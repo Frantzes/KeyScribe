@@ -844,7 +844,12 @@ impl TranscriberApp {
                 } else {
                     "Processing speed/pitch update..."
                 };
-                ui.colored_label(egui::Color32::from_rgb(240, 180, 30), msg);
+                let processing_color = egui::Color32::from_rgb(
+                    self.highlight_color.r().saturating_add(12),
+                    self.highlight_color.g().saturating_add(12),
+                    self.highlight_color.b().saturating_add(12),
+                );
+                ui.colored_label(processing_color, msg);
             }
         });
     }
@@ -1022,6 +1027,29 @@ impl eframe::App for TranscriberApp {
                 .include_y(-1.05)
                 .include_y(1.05)
                 .show(ui, |plot_ui| {
+                    let highlight = self.highlight_color;
+                    let loop_bg = egui::Color32::from_rgba_unmultiplied(
+                        highlight.r(),
+                        highlight.g(),
+                        highlight.b(),
+                        32,
+                    );
+                    let loop_wave_active = egui::Color32::from_rgb(
+                        highlight.r().saturating_add(24),
+                        highlight.g().saturating_add(24),
+                        highlight.b().saturating_add(24),
+                    );
+                    let loop_wave_dim = egui::Color32::from_rgb(
+                        highlight.r().saturating_sub(42),
+                        highlight.g().saturating_sub(42),
+                        highlight.b().saturating_sub(42),
+                    );
+                    let loop_edge = egui::Color32::from_rgb(
+                        highlight.r().saturating_add(18),
+                        highlight.g().saturating_add(18),
+                        highlight.b().saturating_add(18),
+                    );
+
                     if let Some((a, b)) = self.loop_selection {
                         let start = a.min(b) as f64;
                         let end = a.max(b) as f64;
@@ -1032,7 +1060,7 @@ impl eframe::App for TranscriberApp {
                             [end, 1.05],
                             [start, 1.05],
                         ]))
-                        .fill_color(egui::Color32::from_rgba_unmultiplied(255, 120, 35, 32));
+                        .fill_color(loop_bg);
                         plot_ui.polygon(highlight);
                     }
 
@@ -1056,19 +1084,19 @@ impl eframe::App for TranscriberApp {
                         if !wave_pre.is_empty() {
                             plot_ui.line(
                                 Line::new(PlotPoints::from_iter(wave_pre.into_iter()))
-                                    .color(egui::Color32::from_rgb(214, 130, 74)),
+                                    .color(loop_wave_dim),
                             );
                         }
                         if !wave_loop.is_empty() {
                             plot_ui.line(
                                 Line::new(PlotPoints::from_iter(wave_loop.into_iter()))
-                                    .color(egui::Color32::from_rgb(255, 188, 72)),
+                                    .color(loop_wave_active),
                             );
                         }
                         if !wave_post.is_empty() {
                             plot_ui.line(
                                 Line::new(PlotPoints::from_iter(wave_post.into_iter()))
-                                    .color(egui::Color32::from_rgb(214, 130, 74)),
+                                    .color(loop_wave_dim),
                             );
                         }
                     } else {
@@ -1084,12 +1112,8 @@ impl eframe::App for TranscriberApp {
                     if let Some((a, b)) = self.loop_selection {
                         let start = a.min(b);
                         let end = a.max(b);
-                        plot_ui.vline(
-                            VLine::new(start as f64).color(egui::Color32::from_rgb(255, 190, 120)),
-                        );
-                        plot_ui.vline(
-                            VLine::new(end as f64).color(egui::Color32::from_rgb(255, 190, 120)),
-                        );
+                        plot_ui.vline(VLine::new(start as f64).color(loop_edge));
+                        plot_ui.vline(VLine::new(end as f64).color(loop_edge));
                     }
 
                     // Keep Y scale fixed and clamp X so navigation stays within audio bounds.

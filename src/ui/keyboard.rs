@@ -225,11 +225,13 @@ pub fn draw_probability_pane(
                 egui::pos2(x0 + 1.0, rect.bottom() - glow_h - 2.0),
                 egui::pos2(x1 - 1.0, rect.bottom() - glow_h - 1.0),
             );
-            painter.rect_filled(
-                glow,
-                1.0,
-                egui::Color32::from_rgba_unmultiplied(255, 215, 140, 180),
+            let glow_color = egui::Color32::from_rgba_unmultiplied(
+                highlight_color.r().saturating_add(28),
+                highlight_color.g().saturating_add(28),
+                highlight_color.b().saturating_add(28),
+                180,
             );
+            painter.rect_filled(glow, 1.0, glow_color);
         }
 
         white_index += 1;
@@ -287,11 +289,13 @@ pub fn draw_probability_pane(
                 egui::pos2(x0 + 1.0, key_rect.bottom() - glow_h - 1.0),
                 egui::pos2(x1 - 1.0, key_rect.bottom() - glow_h),
             );
-            painter.rect_filled(
-                glow,
-                1.0,
-                egui::Color32::from_rgba_unmultiplied(255, 230, 170, 210),
+            let glow_color = egui::Color32::from_rgba_unmultiplied(
+                highlight_color.r().saturating_add(36),
+                highlight_color.g().saturating_add(36),
+                highlight_color.b().saturating_add(36),
+                210,
             );
+            painter.rect_filled(glow, 1.0, glow_color);
         }
     }
 
