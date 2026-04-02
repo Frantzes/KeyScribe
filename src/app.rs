@@ -7,6 +7,8 @@ use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
 
+use bincode::Options;
+use directories::ProjectDirs;
 use eframe::egui;
 use egui_phosphor::regular::{DOWNLOAD_SIMPLE, GEAR};
 use egui_plot::{Line, Plot, PlotBounds, PlotPoints, Polygon, VLine};
@@ -20,7 +22,7 @@ use crate::analysis::{
 };
 use crate::audio_io::{load_audio_file, AudioData};
 use crate::dsp::apply_speed_and_pitch;
-use crate::playback::AudioEngine;
+use crate::playback::{available_output_devices, AudioEngine, AudioOutputDeviceOption};
 use crate::theme::{apply_brand_theme, ACCENT_ORANGE, ERROR_RED};
 use crate::ui::keyboard::{
     draw_piano_view, draw_probability_pane, keyboard_white_key_width, MIN_PIANO_KEY_HEIGHT,
@@ -33,6 +35,10 @@ mod media_controls;
 use media_controls::{draw_media_controls, setting_toggle_row};
 
 const STATE_FILE_NAME: &str = ".transcriber_state.json";
+const APP_DIR_QUALIFIER: &str = "com";
+const APP_DIR_ORGANIZATION: &str = "franchescoURJC";
+const APP_DIR_APPLICATION: &str = "transcriber";
+const MAX_STATE_FILE_BYTES: u64 = 256 * 1024;
 const PROBABILITY_UPDATE_INTERVAL: Duration = Duration::from_millis(16);
 const FFT_TIMELINE_STEP_SEC: f32 = 0.05;
 const FFT_WINDOW_SIZE: usize = 4096;
@@ -42,9 +48,14 @@ const PARAM_UPDATE_PREVIEW_SEC: f32 = 8.0;
 const PARAM_UPDATE_LIVE_DEBOUNCE: Duration = Duration::from_millis(120);
 const ANALYSIS_CACHE_DIR_NAME: &str = ".transcriber_cache";
 const ANALYSIS_CACHE_LIBRARY_DIR_NAME: &str = "library";
-const ANALYSIS_CACHE_VERSION: u32 = 3;
+const ANALYSIS_CACHE_VERSION: u32 = 4;
 const ANALYSIS_CACHE_ZSTD_LEVEL: i32 = 9;
-const ANALYSIS_CACHE_MAX_DECOMPRESSED_BYTES: usize = 768 * 1024 * 1024;
+const ANALYSIS_CACHE_MAX_COMPRESSED_BYTES: usize = 128 * 1024 * 1024;
+const ANALYSIS_CACHE_MAX_DECOMPRESSED_BYTES: usize = 256 * 1024 * 1024;
+const ANALYSIS_CACHE_MAX_TIMELINE_FRAMES: usize = 120_000;
+const STARTUP_MAX_AUDIO_FILE_BYTES: u64 = 2 * 1024 * 1024 * 1024;
+const ALBUM_ART_MAX_BYTES: usize = 32 * 1024 * 1024;
+const ALBUM_ART_MAX_DIMENSION: usize = 4096;
 const PRESET_HIGHLIGHT_COLORS: [(&str, egui::Color32); 8] = [
     ("Orange", egui::Color32::from_rgb(255, 140, 45)),
     ("Sky", egui::Color32::from_rgb(72, 162, 255)),
@@ -60,11 +71,65 @@ fn default_preprocess_audio() -> bool {
     true
 }
 
+fn default_key_color_sensitivity() -> f32 {
+    0.4
+}
+
 fn default_playback_volume() -> f32 {
     0.8
 }
 
+fn default_audio_quality_mode() -> AudioQualityMode {
+    AudioQualityMode::Balanced
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+enum AudioQualityMode {
+    Draft,
+    Balanced,
+    Studio,
+}
+
+impl AudioQualityMode {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Draft => "Draft (fastest)",
+            Self::Balanced => "Balanced",
+            Self::Studio => "Studio (highest detail)",
+        }
+    }
+
+    fn fft_window_size(self) -> usize {
+        match self {
+            Self::Draft => 2048,
+            Self::Balanced => FFT_WINDOW_SIZE,
+            Self::Studio => 8192,
+        }
+    }
+
+    fn waveform_points(self) -> usize {
+        match self {
+            Self::Draft => 3000,
+            Self::Balanced => 6000,
+            Self::Studio => 12000,
+        }
+    }
+
+    fn cache_code(self) -> u8 {
+        match self {
+            Self::Draft => 0,
+            Self::Balanced => 1,
+            Self::Studio => 2,
+        }
+    }
+}
+
 fn default_dark_mode() -> bool {
+    true
+}
+
+fn default_use_cqt_analysis() -> bool {
     true
 }
 
@@ -78,6 +143,7 @@ struct PersistedState {
     selected_time_sec: f32,
     speed: f32,
     pitch_semitones: f32,
+    #[serde(default = "default_key_color_sensitivity")]
     key_color_sensitivity: f32,
     piano_zoom: f32,
     piano_key_height: f32,
@@ -85,12 +151,16 @@ struct PersistedState {
     probability_panel_height: f32,
     piano_panel_height: f32,
     show_note_hist_window: bool,
-    #[serde(default)]
+    #[serde(default = "default_use_cqt_analysis")]
     use_cqt_analysis: bool,
     #[serde(default = "default_preprocess_audio")]
     preprocess_audio: bool,
     #[serde(default = "default_playback_volume")]
     playback_volume: f32,
+    #[serde(default = "default_audio_quality_mode")]
+    audio_quality_mode: AudioQualityMode,
+    #[serde(default)]
+    audio_output_device_id: Option<String>,
     #[serde(default)]
     loop_enabled: bool,
     #[serde(default = "default_dark_mode")]
@@ -108,16 +178,18 @@ impl Default for PersistedState {
             selected_time_sec: 0.0,
             speed: 1.0,
             pitch_semitones: 0.0,
-            key_color_sensitivity: 0.75,
+            key_color_sensitivity: default_key_color_sensitivity(),
             piano_zoom: 1.0,
             piano_key_height: 72.0,
             waveform_panel_height: 320.0,
             probability_panel_height: 130.0,
             piano_panel_height: 170.0,
             show_note_hist_window: true,
-            use_cqt_analysis: false,
+            use_cqt_analysis: default_use_cqt_analysis(),
             preprocess_audio: true,
             playback_volume: 0.8,
+            audio_quality_mode: AudioQualityMode::Balanced,
+            audio_output_device_id: None,
             loop_enabled: false,
             dark_mode: true,
             highlight_hex: default_highlight_hex(),
@@ -131,6 +203,7 @@ struct AnalysisCacheBlob {
     cache_version: u32,
     sample_rate: u32,
     raw_sample_len: usize,
+    audio_quality_mode_code: u8,
     speed_bits: u32,
     pitch_bits: u32,
     use_cqt_analysis: bool,
@@ -146,6 +219,7 @@ struct AnalysisCacheSnapshot<'a> {
     cache_version: u32,
     sample_rate: u32,
     raw_sample_len: usize,
+    audio_quality_mode_code: u8,
     speed_bits: u32,
     pitch_bits: u32,
     use_cqt_analysis: bool,
@@ -156,10 +230,89 @@ struct AnalysisCacheSnapshot<'a> {
     base_note_timeline_step_sec: f32,
 }
 
+fn app_project_dirs() -> Option<ProjectDirs> {
+    ProjectDirs::from(APP_DIR_QUALIFIER, APP_DIR_ORGANIZATION, APP_DIR_APPLICATION)
+}
+
+fn app_data_dir() -> PathBuf {
+    if let Some(dirs) = app_project_dirs() {
+        dirs.data_local_dir().to_path_buf()
+    } else {
+        std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))
+    }
+}
+
+fn app_cache_base_dir() -> PathBuf {
+    if let Some(dirs) = app_project_dirs() {
+        dirs.cache_dir().to_path_buf()
+    } else {
+        std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))
+    }
+}
+
+fn ensure_parent_dir(path: &Path) -> bool {
+    path.parent()
+        .map(|parent| fs::create_dir_all(parent).is_ok())
+        .unwrap_or(true)
+}
+
+fn is_supported_audio_extension(path: &Path) -> bool {
+    let Some(ext) = path.extension().and_then(|ext| ext.to_str()) else {
+        return false;
+    };
+
+    matches!(
+        ext.to_ascii_lowercase().as_str(),
+        "wav" | "mp3" | "flac" | "ogg" | "m4a" | "aac"
+    )
+}
+
+#[cfg(windows)]
+fn is_windows_network_path(path: &Path) -> bool {
+    use std::path::{Component, Prefix};
+
+    matches!(
+        path.components().next(),
+        Some(Component::Prefix(prefix))
+            if matches!(
+                prefix.kind(),
+                Prefix::UNC(_, _) | Prefix::VerbatimUNC(_, _) | Prefix::DeviceNS(_)
+            )
+    )
+}
+
+#[cfg(not(windows))]
+fn is_windows_network_path(_path: &Path) -> bool {
+    false
+}
+
+fn is_safe_startup_audio_path(path: &Path) -> bool {
+    if !path.is_absolute() || is_windows_network_path(path) {
+        return false;
+    }
+    if !is_supported_audio_extension(path) || !path.is_file() {
+        return false;
+    }
+
+    match fs::metadata(path) {
+        Ok(meta) => meta.len() <= STARTUP_MAX_AUDIO_FILE_BYTES,
+        Err(_) => false,
+    }
+}
+
+fn validate_cached_note_timeline(note_timeline: &[Vec<f32>]) -> bool {
+    if note_timeline.len() > ANALYSIS_CACHE_MAX_TIMELINE_FRAMES {
+        return false;
+    }
+
+    let note_count = (PIANO_HIGH_MIDI - PIANO_LOW_MIDI + 1) as usize;
+    note_timeline
+        .iter()
+        .all(|frame| frame.len() == note_count && frame.iter().all(|value| value.is_finite()))
+}
+
 fn analysis_cache_dir() -> PathBuf {
-    std::env::current_dir()
-        .unwrap_or_else(|_| PathBuf::from("."))
-        .join(ANALYSIS_CACHE_DIR_NAME)
+    app_cache_base_dir().join(ANALYSIS_CACHE_DIR_NAME)
 }
 
 fn analysis_cache_library_dir() -> PathBuf {
@@ -200,6 +353,7 @@ fn fnv1a64_update(mut hash: u64, bytes: &[u8]) -> u64 {
 fn analysis_cache_variant_key(
     sample_rate: u32,
     raw_sample_len: usize,
+    audio_quality_mode: AudioQualityMode,
     speed: f32,
     pitch_semitones: f32,
     use_cqt_analysis: bool,
@@ -208,6 +362,7 @@ fn analysis_cache_variant_key(
     let mut hash = 14695981039346656037u64;
     hash = fnv1a64_update(hash, &sample_rate.to_le_bytes());
     hash = fnv1a64_update(hash, &(raw_sample_len as u64).to_le_bytes());
+    hash = fnv1a64_update(hash, &[audio_quality_mode.cache_code()]);
     hash = fnv1a64_update(hash, &speed.to_bits().to_le_bytes());
     hash = fnv1a64_update(hash, &pitch_semitones.to_bits().to_le_bytes());
     hash = fnv1a64_update(hash, &[if use_cqt_analysis { 1 } else { 0 }]);
@@ -253,13 +408,17 @@ fn unshuffle_f32_bytes(shuffled: &[u8], sample_len: usize) -> Option<Vec<f32>> {
 }
 
 fn state_file_path() -> PathBuf {
-    std::env::current_dir()
-        .unwrap_or_else(|_| PathBuf::from("."))
-        .join(STATE_FILE_NAME)
+    app_data_dir().join(STATE_FILE_NAME)
 }
 
 fn load_persisted_state() -> PersistedState {
     let path = state_file_path();
+    if let Ok(meta) = fs::metadata(&path) {
+        if meta.len() > MAX_STATE_FILE_BYTES {
+            return PersistedState::default();
+        }
+    }
+
     let Ok(raw) = fs::read_to_string(path) else {
         return PersistedState::default();
     };
@@ -306,6 +465,9 @@ pub struct TranscriberApp {
     last_prob_update: Instant,
     show_note_hist_window: bool,
     playback_volume: f32,
+    audio_quality_mode: AudioQualityMode,
+    audio_output_device_id: Option<String>,
+    audio_output_devices: Vec<AudioOutputDeviceOption>,
     loop_enabled: bool,
     dark_mode: bool,
     highlight_color: egui::Color32,
@@ -380,7 +542,10 @@ impl TranscriberApp {
             piano_scroll_px: 0.0,
             piano_has_focus: false,
             last_error: None,
-            engine: AudioEngine::new().ok(),
+            engine: AudioEngine::new_with_output_device(
+                persisted.audio_output_device_id.as_deref(),
+            )
+            .ok(),
             processing_rx: None,
             processing_epoch: Arc::new(AtomicU64::new(0)),
             active_rebuild_mode: RebuildMode::Full,
@@ -394,6 +559,9 @@ impl TranscriberApp {
             last_prob_update: Instant::now(),
             show_note_hist_window: persisted.show_note_hist_window,
             playback_volume: persisted.playback_volume.clamp(0.0, 1.5),
+            audio_quality_mode: persisted.audio_quality_mode,
+            audio_output_device_id: persisted.audio_output_device_id.clone(),
+            audio_output_devices: Vec::new(),
             loop_enabled: persisted.loop_enabled,
             dark_mode: persisted.dark_mode,
             highlight_color,
@@ -414,12 +582,21 @@ impl TranscriberApp {
             album_art_texture: None,
         };
 
+        app.refresh_audio_output_devices();
+        if let Some(selected) = app.audio_output_device_id.clone() {
+            let exists = app.audio_output_devices.iter().any(|d| d.id == selected);
+            if !exists {
+                app.audio_output_device_id = None;
+                app.engine = AudioEngine::new().ok();
+            }
+        }
+
         if let Some(engine) = &mut app.engine {
             engine.set_volume(app.playback_volume);
         }
 
         if let Some(path) = persisted.last_file {
-            if path.exists() {
+            if is_safe_startup_audio_path(path.as_path()) {
                 match load_audio_file(&path) {
                     Ok(audio) => {
                         app.apply_loaded_audio(path.clone(), audio, &_cc.egui_ctx);
@@ -481,6 +658,48 @@ impl TranscriberApp {
         self.restart_playback_after_processing = false;
     }
 
+    fn refresh_audio_output_devices(&mut self) {
+        self.audio_output_devices = available_output_devices();
+        if let Some(selected) = self.audio_output_device_id.as_deref() {
+            let exists = self.audio_output_devices.iter().any(|d| d.id == selected);
+            if !exists {
+                self.audio_output_device_id = None;
+            }
+        }
+    }
+
+    fn apply_audio_output_device_change(&mut self, device_id: Option<String>) {
+        if self.audio_output_device_id == device_id {
+            return;
+        }
+
+        let was_playing = self.is_playing();
+        let resume_pos = self.current_position_sec().min(self.source_duration());
+        self.stop();
+
+        match AudioEngine::new_with_output_device(device_id.as_deref()) {
+            Ok(mut engine) => {
+                engine.set_volume(self.playback_volume);
+                self.engine = Some(engine);
+                self.audio_output_device_id = device_id;
+                self.last_error = None;
+
+                if was_playing && !self.processed_samples.is_empty() {
+                    self.selected_time_sec = resume_pos;
+                    self.play_from_selected();
+                }
+            }
+            Err(err) => {
+                self.last_error = Some(format!("Audio device error: {err}"));
+                self.engine = AudioEngine::new().ok();
+                if let Some(engine) = &mut self.engine {
+                    engine.set_volume(self.playback_volume);
+                }
+                self.audio_output_device_id = None;
+            }
+        }
+    }
+
     fn try_restore_analysis_cache(&mut self, source_path: &Path) -> bool {
         let Some(audio) = &self.audio_raw else {
             return false;
@@ -502,6 +721,7 @@ impl TranscriberApp {
         let variant_key = analysis_cache_variant_key(
             sample_rate,
             raw_sample_len,
+            self.audio_quality_mode,
             self.speed,
             self.pitch_semitones,
             self.use_cqt_analysis,
@@ -512,17 +732,31 @@ impl TranscriberApp {
         let Ok(bytes) = fs::read(cache_path) else {
             return false;
         };
-        let payload =
-            zstd::bulk::decompress(&bytes, ANALYSIS_CACHE_MAX_DECOMPRESSED_BYTES).unwrap_or(bytes);
-        let Ok(cache) = bincode::deserialize::<AnalysisCacheBlob>(&payload) else {
+        if bytes.is_empty() || bytes.len() > ANALYSIS_CACHE_MAX_COMPRESSED_BYTES {
+            return false;
+        }
+
+        let Ok(payload) = zstd::bulk::decompress(&bytes, ANALYSIS_CACHE_MAX_DECOMPRESSED_BYTES)
+        else {
             return false;
         };
+        let options = bincode::options().with_limit(ANALYSIS_CACHE_MAX_DECOMPRESSED_BYTES as u64);
+        let Ok(cache) = options.deserialize::<AnalysisCacheBlob>(&payload) else {
+            return false;
+        };
+
+        if !cache.base_note_timeline_step_sec.is_finite()
+            || !validate_cached_note_timeline(cache.base_note_timeline.as_slice())
+        {
+            return false;
+        }
 
         let expected_speed_bits = self.speed.to_bits();
         let expected_pitch_bits = self.pitch_semitones.to_bits();
         let cache_matches = cache.cache_version == ANALYSIS_CACHE_VERSION
             && cache.sample_rate == sample_rate
             && cache.raw_sample_len == raw_sample_len
+            && cache.audio_quality_mode_code == self.audio_quality_mode.cache_code()
             && cache.speed_bits == expected_speed_bits
             && cache.pitch_bits == expected_pitch_bits
             && cache.use_cqt_analysis == self.use_cqt_analysis
@@ -533,6 +767,10 @@ impl TranscriberApp {
         }
 
         let processed_samples = if let Some(shuffled) = cache.processed_samples_shuffled_bytes {
+            let max_processed_len = raw_sample_len.saturating_mul(8);
+            if cache.processed_samples_len > max_processed_len {
+                return false;
+            }
             if cache.processed_samples_len == 0 {
                 return false;
             }
@@ -573,6 +811,7 @@ impl TranscriberApp {
         self.waveform = Self::build_waveform_for_processed(
             self.processed_samples.as_slice(),
             sample_rate,
+            self.audio_quality_mode,
             self.speed,
         );
         self.note_timeline = note_timeline;
@@ -592,6 +831,7 @@ impl TranscriberApp {
         song_hash: &str,
         sample_rate: u32,
         raw_sample_len: usize,
+        audio_quality_mode: AudioQualityMode,
         speed: f32,
         pitch_semitones: f32,
         use_cqt_analysis: bool,
@@ -612,6 +852,7 @@ impl TranscriberApp {
         let variant_key = analysis_cache_variant_key(
             sample_rate,
             raw_sample_len,
+            audio_quality_mode,
             speed,
             pitch_semitones,
             use_cqt_analysis,
@@ -636,6 +877,7 @@ impl TranscriberApp {
             cache_version: ANALYSIS_CACHE_VERSION,
             sample_rate,
             raw_sample_len,
+            audio_quality_mode_code: audio_quality_mode.cache_code(),
             speed_bits: speed.to_bits(),
             pitch_bits: pitch_semitones.to_bits(),
             use_cqt_analysis,
@@ -652,17 +894,27 @@ impl TranscriberApp {
 
         let compressed =
             zstd::bulk::compress(&serialized, ANALYSIS_CACHE_ZSTD_LEVEL).unwrap_or(serialized);
+        if compressed.len() > ANALYSIS_CACHE_MAX_COMPRESSED_BYTES {
+            return;
+        }
 
         let cache_path = analysis_cache_file_path(song_hash, &variant_key);
-        let _ = fs::write(cache_path, compressed);
+        if ensure_parent_dir(cache_path.as_path()) {
+            let _ = fs::write(cache_path, compressed);
+        }
     }
 
     fn build_waveform_for_processed(
         processed_samples: &[f32],
         sample_rate: u32,
+        audio_quality_mode: AudioQualityMode,
         speed: f32,
     ) -> Vec<[f64; 2]> {
-        let mut waveform = waveform_points(processed_samples, sample_rate, 6000);
+        let mut waveform = waveform_points(
+            processed_samples,
+            sample_rate,
+            audio_quality_mode.waveform_points(),
+        );
         let speed_for_waveform = speed.clamp(0.25, 4.0) as f64;
         if (speed_for_waveform - 1.0).abs() > f64::EPSILON {
             for pt in &mut waveform {
@@ -880,10 +1132,6 @@ impl TranscriberApp {
         source_sec / self.playback_rate()
     }
 
-    fn output_duration(&self) -> f32 {
-        self.source_to_output_time(self.source_duration())
-    }
-
     fn play_preview_at(&mut self, start_sec: f32, end_sec: Option<f32>) -> bool {
         if !self.is_param_render_in_progress() {
             return false;
@@ -941,9 +1189,22 @@ impl TranscriberApp {
             .audio_raw
             .as_ref()
             .and_then(|a| a.metadata.artwork_bytes.as_deref())?;
+        if bytes.len() > ALBUM_ART_MAX_BYTES {
+            return None;
+        }
 
         let image = image::load_from_memory(bytes).ok()?.to_rgba8();
-        let size = [image.width() as usize, image.height() as usize];
+        let width = image.width() as usize;
+        let height = image.height() as usize;
+        if width == 0
+            || height == 0
+            || width > ALBUM_ART_MAX_DIMENSION
+            || height > ALBUM_ART_MAX_DIMENSION
+        {
+            return None;
+        }
+
+        let size = [width, height];
         let color_image = egui::ColorImage::from_rgba_unmultiplied(size, image.as_raw());
 
         Some(ctx.load_texture("album-art", color_image, egui::TextureOptions::LINEAR))
@@ -960,6 +1221,7 @@ impl TranscriberApp {
         let raw_samples: Arc<Vec<f32>> = Arc::clone(&raw.samples_mono);
         let speed = self.speed;
         let pitch_semitones = self.pitch_semitones;
+        let audio_quality_mode = self.audio_quality_mode;
         let use_cqt = self.use_cqt_analysis;
         let preprocess_audio = self.preprocess_audio;
         let base_timeline = Arc::clone(&self.base_note_timeline);
@@ -1038,14 +1300,19 @@ impl TranscriberApp {
                 return;
             }
 
-            let waveform =
-                Self::build_waveform_for_processed(&processed_samples, sample_rate, speed);
+            let waveform = Self::build_waveform_for_processed(
+                &processed_samples,
+                sample_rate,
+                audio_quality_mode,
+                speed,
+            );
 
             let (base_note_timeline, base_note_timeline_step_sec, analysis_error) = match mode {
                 RebuildMode::Full => {
                     let (timeline, step, err) = Self::build_note_timeline(
                         raw_samples.as_slice(),
                         sample_rate,
+                        audio_quality_mode.fft_window_size(),
                         use_cqt,
                         preprocess_audio,
                     );
@@ -1071,6 +1338,7 @@ impl TranscriberApp {
                     song_hash,
                     sample_rate,
                     raw_samples.len(),
+                    audio_quality_mode,
                     speed,
                     pitch_semitones,
                     use_cqt,
@@ -1130,6 +1398,8 @@ impl TranscriberApp {
             use_cqt_analysis: self.use_cqt_analysis,
             preprocess_audio: self.preprocess_audio,
             playback_volume: self.playback_volume,
+            audio_quality_mode: self.audio_quality_mode,
+            audio_output_device_id: self.audio_output_device_id.clone(),
             loop_enabled: self.loop_enabled,
             dark_mode: self.dark_mode,
             highlight_hex: color_to_hex(self.highlight_color),
@@ -1137,7 +1407,10 @@ impl TranscriberApp {
         };
 
         if let Ok(raw) = serde_json::to_string_pretty(&state) {
-            let _ = fs::write(state_file_path(), raw);
+            let path = state_file_path();
+            if ensure_parent_dir(path.as_path()) {
+                let _ = fs::write(path, raw);
+            }
         }
     }
 
@@ -1164,19 +1437,20 @@ impl TranscriberApp {
 
             let output_time_sec = self.source_to_output_time(self.selected_time_sec.max(0.0));
             let center = (output_time_sec * raw.sample_rate as f32) as usize;
+            let fft_window_size = self.audio_quality_mode.fft_window_size();
             self.note_probs = if self.use_cqt_analysis {
                 detect_note_probabilities_cqt(
                     &self.processed_samples,
                     raw.sample_rate,
                     center,
-                    FFT_WINDOW_SIZE,
+                    fft_window_size,
                 )
             } else {
                 detect_note_probabilities(
                     &self.processed_samples,
                     raw.sample_rate,
                     center,
-                    FFT_WINDOW_SIZE,
+                    fft_window_size,
                 )
             };
         }
@@ -1193,8 +1467,13 @@ impl TranscriberApp {
         self.last_prob_update = Instant::now();
     }
 
-    fn compute_fft_timeline(samples: &[f32], sample_rate: u32, step_sec: f32) -> Vec<Vec<f32>> {
-        if samples.is_empty() || sample_rate == 0 || step_sec <= 0.0 {
+    fn compute_fft_timeline(
+        samples: &[f32],
+        sample_rate: u32,
+        step_sec: f32,
+        fft_window_size: usize,
+    ) -> Vec<Vec<f32>> {
+        if samples.is_empty() || sample_rate == 0 || step_sec <= 0.0 || fft_window_size < 64 {
             return Vec::new();
         }
 
@@ -1208,7 +1487,7 @@ impl TranscriberApp {
                 samples,
                 sample_rate,
                 center,
-                FFT_WINDOW_SIZE,
+                fft_window_size,
             ));
             t += step_sec;
         }
@@ -1223,6 +1502,7 @@ impl TranscriberApp {
     fn build_note_timeline(
         source_samples: &[f32],
         sample_rate: u32,
+        fft_window_size: usize,
         use_cqt: bool,
         preprocess_audio: bool,
     ) -> (Vec<Vec<f32>>, f32, Option<String>) {
@@ -1246,6 +1526,7 @@ impl TranscriberApp {
                         source_samples,
                         sample_rate,
                         FFT_TIMELINE_STEP_SEC,
+                        fft_window_size,
                     );
                     (
                         fallback,
@@ -1256,7 +1537,12 @@ impl TranscriberApp {
             }
         } else {
             (
-                Self::compute_fft_timeline(source_samples, sample_rate, FFT_TIMELINE_STEP_SEC),
+                Self::compute_fft_timeline(
+                    source_samples,
+                    sample_rate,
+                    FFT_TIMELINE_STEP_SEC,
+                    fft_window_size,
+                ),
                 FFT_TIMELINE_STEP_SEC,
                 None,
             )
@@ -1544,6 +1830,83 @@ impl TranscriberApp {
                     }
                 }
             });
+        }
+
+        ui.separator();
+
+        ui.label("Audio Config");
+        let mut quality_changed = false;
+        egui::ComboBox::from_id_source("audio_quality_mode")
+            .selected_text(self.audio_quality_mode.label())
+            .show_ui(ui, |ui| {
+                quality_changed |= ui
+                    .selectable_value(
+                        &mut self.audio_quality_mode,
+                        AudioQualityMode::Draft,
+                        AudioQualityMode::Draft.label(),
+                    )
+                    .changed();
+                quality_changed |= ui
+                    .selectable_value(
+                        &mut self.audio_quality_mode,
+                        AudioQualityMode::Balanced,
+                        AudioQualityMode::Balanced.label(),
+                    )
+                    .changed();
+                quality_changed |= ui
+                    .selectable_value(
+                        &mut self.audio_quality_mode,
+                        AudioQualityMode::Studio,
+                        AudioQualityMode::Studio.label(),
+                    )
+                    .changed();
+            });
+
+        if quality_changed {
+            self.request_rebuild_preserving_playback();
+        }
+
+        ui.horizontal(|ui| {
+            ui.label("Output Device");
+            if ui.button("Refresh").clicked() {
+                self.refresh_audio_output_devices();
+            }
+        });
+
+        let selected_device_text = self
+            .audio_output_device_id
+            .as_deref()
+            .and_then(|id| self.audio_output_devices.iter().find(|d| d.id == id))
+            .map(|d| d.name.clone())
+            .unwrap_or_else(|| "System Default".to_string());
+
+        let mut pending_device_change: Option<Option<String>> = None;
+        egui::ComboBox::from_id_source("audio_output_device")
+            .selected_text(selected_device_text)
+            .show_ui(ui, |ui| {
+                if ui
+                    .selectable_label(self.audio_output_device_id.is_none(), "System Default")
+                    .clicked()
+                {
+                    pending_device_change = Some(None);
+                }
+
+                for option in self.audio_output_devices.clone() {
+                    let label = if option.is_default {
+                        format!("{} (OS Default)", option.name)
+                    } else {
+                        option.name.clone()
+                    };
+                    let selected =
+                        self.audio_output_device_id.as_deref() == Some(option.id.as_str());
+                    if ui.selectable_label(selected, label).clicked() {
+                        pending_device_change = Some(Some(option.id.clone()));
+                    }
+                }
+            });
+
+        if let Some(device_change) = pending_device_change {
+            self.apply_audio_output_device_change(device_change);
         }
 
         ui.separator();

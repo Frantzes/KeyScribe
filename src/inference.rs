@@ -1,3 +1,5 @@
+#![allow(dead_code)]
+
 use anyhow::{anyhow, Result};
 use ort::{session::Session, value::Tensor};
 use std::path::Path;

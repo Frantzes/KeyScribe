@@ -1,3 +1,5 @@
+#![allow(dead_code)]
+
 /// Viterbi decoding for note smoothing
 /// Implements Hidden Markov Model-based smoothing to eliminate glitches
 /// and ghost notes in transcription

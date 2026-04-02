@@ -1,3 +1,5 @@
+#![allow(dead_code)]
+
 use crate::inference::{BasicPitchInference, InferenceConfig};
 use crate::preprocessing::PreprocessingConfig;
 use crate::viterbi::{ViterbiConfig, ViterbiDecoder};

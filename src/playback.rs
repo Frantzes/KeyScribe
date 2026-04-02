@@ -1,8 +1,66 @@
 use std::time::Instant;
 
-use anyhow::{Context, Result};
+use anyhow::{bail, Context, Result};
 use rodio::buffer::SamplesBuffer;
+use rodio::cpal::traits::{DeviceTrait, HostTrait};
+use rodio::cpal::Device;
 use rodio::{OutputStream, OutputStreamHandle, Sink};
+
+#[derive(Debug, Clone)]
+pub struct AudioOutputDeviceOption {
+    pub id: String,
+    pub name: String,
+    pub is_default: bool,
+}
+
+fn collect_output_devices() -> Vec<(String, Device)> {
+    let host = rodio::cpal::default_host();
+    let Ok(devices) = host.output_devices() else {
+        return Vec::new();
+    };
+
+    let mut out = Vec::new();
+    for device in devices {
+        let name = device
+            .name()
+            .unwrap_or_else(|_| "Unknown output device".to_string());
+        out.push((name, device));
+    }
+    out
+}
+
+pub fn available_output_devices() -> Vec<AudioOutputDeviceOption> {
+    let host = rodio::cpal::default_host();
+    let default_name = host
+        .default_output_device()
+        .and_then(|d| d.name().ok())
+        .unwrap_or_default();
+
+    collect_output_devices()
+        .into_iter()
+        .enumerate()
+        .map(|(idx, (name, _device))| AudioOutputDeviceOption {
+            id: format!("{idx}:{name}"),
+            is_default: !default_name.is_empty() && name == default_name,
+            name,
+        })
+        .collect()
+}
+
+fn open_output_stream(device_id: Option<&str>) -> Result<(OutputStream, OutputStreamHandle)> {
+    if let Some(id) = device_id {
+        for (idx, (name, device)) in collect_output_devices().into_iter().enumerate() {
+            let current_id = format!("{idx}:{name}");
+            if current_id == id {
+                return OutputStream::try_from_device(&device)
+                    .context("Failed to open selected audio output device");
+            }
+        }
+        bail!("Selected output device is no longer available");
+    }
+
+    OutputStream::try_default().context("No audio output device found")
+}
 
 pub struct AudioEngine {
     _stream: OutputStream,
@@ -18,8 +76,11 @@ pub struct AudioEngine {
 
 impl AudioEngine {
     pub fn new() -> Result<Self> {
-        let (stream, stream_handle) =
-            OutputStream::try_default().context("No audio output device found")?;
+        Self::new_with_output_device(None)
+    }
+
+    pub fn new_with_output_device(device_id: Option<&str>) -> Result<Self> {
+        let (stream, stream_handle) = open_output_stream(device_id)?;
         Ok(Self {
             _stream: stream,
             stream_handle,

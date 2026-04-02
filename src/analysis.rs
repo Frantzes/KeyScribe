@@ -1,8 +1,10 @@
-use rustfft::num_complex::Complex;
-use rustfft::FftPlanner;
-use crate::pipeline::{AudioPipeline, PipelineConfig};
+#![allow(dead_code)]
+
 use crate::cqt::CQTransform;
 use crate::inference::{BasicPitchInference, InferenceConfig};
+use crate::pipeline::{AudioPipeline, PipelineConfig};
+use rustfft::num_complex::Complex;
+use rustfft::FftPlanner;
 use std::sync::{Mutex, OnceLock};
 
 static BASIC_PITCH_ENGINE: OnceLock<Mutex<Option<BasicPitchInference>>> = OnceLock::new();
@@ -262,7 +264,8 @@ pub fn detect_note_probabilities_cqt(
     center_sample: usize,
     fft_size: usize,
 ) -> Vec<f32> {
-    if let Some(probs) = detect_note_probabilities_basic_pitch(samples, sample_rate, center_sample) {
+    if let Some(probs) = detect_note_probabilities_basic_pitch(samples, sample_rate, center_sample)
+    {
         return probs;
     }
 
@@ -292,15 +295,11 @@ fn detect_note_probabilities_basic_pitch(
     end = end.max(start);
 
     let window_src = &samples[start..end];
-    let window_model = BasicPitchInference::resample_linear(
-        window_src,
-        sample_rate,
-        config.model_sample_rate,
-    );
+    let window_model =
+        BasicPitchInference::resample_linear(window_src, sample_rate, config.model_sample_rate);
 
-    let engine = BASIC_PITCH_ENGINE.get_or_init(|| {
-        Mutex::new(BasicPitchInference::new(config).ok())
-    });
+    let engine =
+        BASIC_PITCH_ENGINE.get_or_init(|| Mutex::new(BasicPitchInference::new(config).ok()));
 
     let mut guard = engine.lock().ok()?;
     let model = guard.as_mut()?;
@@ -361,7 +360,7 @@ fn detect_note_probabilities_cqt_fallback(
 pub fn create_basic_pitch_pipeline(sample_rate: u32) -> anyhow::Result<AudioPipeline> {
     let config = PipelineConfig {
         sample_rate,
-        chunk_size: (sample_rate as usize / 10),  // 100ms chunks
+        chunk_size: (sample_rate as usize / 10), // 100ms chunks
         lookahead_frames: 5,
         ..Default::default()
     };
@@ -449,7 +448,7 @@ pub fn analyze_with_full_pipeline(
 
     let config = PipelineConfig {
         sample_rate,
-        chunk_size: (sample_rate as usize / 10),  // 100ms chunks
+        chunk_size: (sample_rate as usize / 10), // 100ms chunks
         lookahead_frames: 5,
         ..Default::default()
     };

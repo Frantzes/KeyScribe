@@ -1,5 +1,6 @@
+#![allow(dead_code)]
+
 use rustfft::num_complex::Complex;
-use rustfft::FftPlanner;
 use std::f32::consts::PI;
 
 /// Constant-Q Transform configuration
