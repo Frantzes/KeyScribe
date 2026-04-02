@@ -1,87 +1,116 @@
-pub fn apply_speed_and_pitch(samples: &[f32], speed: f32, pitch_semitones: f32) -> Vec<f32> {
+use signalsmith_stretch::Stretch;
+
+pub fn apply_speed_and_pitch(
+    samples: &[f32],
+    sample_rate: u32,
+    speed: f32,
+    pitch_semitones: f32,
+) -> Vec<f32> {
     if samples.is_empty() {
         return Vec::new();
     }
 
     let clamped_speed = speed.clamp(0.25, 4.0);
+    let speed_is_unity = (clamped_speed - 1.0).abs() < 1.0e-4;
+    let pitch_is_zero = pitch_semitones.abs() < 1.0e-4;
 
-    // Tempo control: stretch/compress in time while mostly keeping perceived pitch.
-    let tempo_adjusted = time_stretch_ola(samples, 1.0 / clamped_speed);
-
-    if pitch_semitones.abs() < f32::EPSILON {
-        return tempo_adjusted;
+    if speed_is_unity && pitch_is_zero {
+        return samples.to_vec();
     }
 
-    let pitch_ratio = 2.0_f32.powf(pitch_semitones / 12.0);
-
-    // Pitch shift is approximated by resampling plus inverse time stretching.
-    let resampled = resample_linear(&tempo_adjusted, pitch_ratio);
-    time_stretch_ola(&resampled, pitch_ratio)
-}
-
-fn hann(n: usize, size: usize) -> f32 {
-    if size <= 1 {
-        return 1.0;
-    }
-    let phase = 2.0 * std::f32::consts::PI * n as f32 / (size - 1) as f32;
-    0.5 - 0.5 * phase.cos()
-}
-
-fn time_stretch_ola(input: &[f32], stretch: f32) -> Vec<f32> {
-    if input.len() < 1024 {
-        return input.to_vec();
+    if sample_rate == 0 {
+        return samples.to_vec();
     }
 
-    let stretch = stretch.clamp(0.25, 4.0);
-    let win = 1024usize;
-    let hop_in = 256usize;
-    let hop_out = ((hop_in as f32) * stretch).max(1.0) as usize;
+    let mut stretch = Stretch::preset_default(1, sample_rate);
+    stretch.set_transpose_factor_semitones(pitch_semitones, None);
 
-    let frames = (input.len().saturating_sub(win)) / hop_in + 1;
-    let out_len = frames * hop_out + win + 1;
+    let target_frames = ((samples.len() as f32) / clamped_speed).round().max(1.0) as usize;
+    let input_latency = stretch.input_latency();
+    let output_latency = stretch.output_latency();
+    let silence_out_len = if input_latency > 0 {
+        ((input_latency as f32) / clamped_speed).ceil().max(1.0) as usize
+    } else {
+        0
+    };
 
-    let mut output = vec![0.0f32; out_len];
-    let mut norm = vec![0.0f32; out_len];
+    if input_latency > 0 {
+        let mut seek_input = vec![0.0f32; input_latency];
+        let copy = input_latency.min(samples.len());
+        seek_input[..copy].copy_from_slice(&samples[..copy]);
+        stretch.seek(&seek_input, clamped_speed as f64);
+    }
 
+    const BLOCK_OUT: usize = 4096;
+    let mut output = Vec::with_capacity(target_frames + BLOCK_OUT);
     let mut in_pos = 0usize;
-    let mut out_pos = 0usize;
+    let mut rendered = 0usize;
+    let max_in_len = ((BLOCK_OUT as f32) * clamped_speed).ceil().max(1.0) as usize;
+    let scratch_in_len = max_in_len.max(input_latency.max(1));
+    let scratch_out_len = BLOCK_OUT.max(output_latency.max(silence_out_len).max(1));
+    let mut input_scratch = vec![0.0f32; scratch_in_len];
+    let mut output_chunk = vec![0.0f32; scratch_out_len];
+    let mut skip_front = output_latency;
 
-    while in_pos + win <= input.len() {
-        for i in 0..win {
-            let w = hann(i, win);
-            let dst = out_pos + i;
-            output[dst] += input[in_pos + i] * w;
-            norm[dst] += w * w;
+    #[inline]
+    fn push_chunk_with_skip(output: &mut Vec<f32>, chunk: &[f32], skip_front: &mut usize) {
+        if chunk.is_empty() {
+            return;
         }
-        in_pos += hop_in;
-        out_pos += hop_out;
+
+        let skip = (*skip_front).min(chunk.len());
+        *skip_front -= skip;
+        output.extend_from_slice(&chunk[skip..]);
     }
 
-    for (sample, n) in output.iter_mut().zip(norm.iter()) {
-        if *n > 1.0e-6 {
-            *sample /= *n;
+    while rendered < target_frames {
+        let out_len = (target_frames - rendered).min(BLOCK_OUT);
+        let in_len = ((out_len as f32) * clamped_speed).ceil().max(1.0) as usize;
+
+        if in_pos + in_len <= samples.len() {
+            let input_chunk = &samples[in_pos..in_pos + in_len];
+            in_pos += in_len;
+            stretch.process(input_chunk, &mut output_chunk[..out_len]);
+        } else {
+            let available = samples.len().saturating_sub(in_pos).min(in_len);
+            if available > 0 {
+                input_scratch[..available].copy_from_slice(&samples[in_pos..in_pos + available]);
+                in_pos += available;
+            }
+            if available < in_len {
+                input_scratch[available..in_len].fill(0.0);
+            }
+            stretch.process(&input_scratch[..in_len], &mut output_chunk[..out_len]);
+        }
+
+        push_chunk_with_skip(&mut output, &output_chunk[..out_len], &mut skip_front);
+        rendered += out_len;
+    }
+
+    if input_latency > 0 && silence_out_len > 0 {
+        let input_chunk = &input_scratch[..input_latency];
+        stretch.process(input_chunk, &mut output_chunk[..silence_out_len]);
+        push_chunk_with_skip(
+            &mut output,
+            &output_chunk[..silence_out_len],
+            &mut skip_front,
+        );
+    }
+
+    if output_latency > 0 {
+        let mut flushed = 0usize;
+        while flushed < output_latency {
+            let len = (output_latency - flushed).min(output_chunk.len());
+            stretch.flush(&mut output_chunk[..len]);
+            push_chunk_with_skip(&mut output, &output_chunk[..len], &mut skip_front);
+            flushed += len;
         }
     }
 
-    output
-}
-
-fn resample_linear(input: &[f32], ratio: f32) -> Vec<f32> {
-    if input.len() < 2 {
-        return input.to_vec();
-    }
-
-    let ratio = ratio.clamp(0.25, 4.0);
-    let out_len = ((input.len() as f32) / ratio).max(2.0) as usize;
-    let mut output = Vec::with_capacity(out_len);
-
-    for i in 0..out_len {
-        let src = (i as f32) * ratio;
-        let i0 = src.floor() as usize;
-        let i1 = (i0 + 1).min(input.len() - 1);
-        let frac = src - i0 as f32;
-        let v = input[i0] * (1.0 - frac) + input[i1] * frac;
-        output.push(v);
+    if output.len() < target_frames {
+        output.resize(target_frames, 0.0);
+    } else {
+        output.truncate(target_frames);
     }
 
     output

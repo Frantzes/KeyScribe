@@ -178,7 +178,10 @@ pub(super) fn draw_media_controls(
                                             app.stop();
                                         } else if app.audio_raw.is_some() {
                                             if app.processed_samples.is_empty() {
-                                                app.request_rebuild(false);
+                                                app.request_rebuild(
+                                                    false,
+                                                    super::RebuildMode::Full,
+                                                );
                                             }
 
                                             if current_pos <= 0.0 || current_pos >= duration - 0.01

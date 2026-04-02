@@ -23,3 +23,4 @@ target
 #.idea/
 python/*
 .transcriber_state.json
+.transcriber_cache/

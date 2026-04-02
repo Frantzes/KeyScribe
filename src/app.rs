@@ -1,5 +1,7 @@
 use std::fs;
-use std::path::PathBuf;
+use std::io::{BufReader, Read};
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, TryRecvError};
 use std::sync::Arc;
 use std::thread;
@@ -8,6 +10,7 @@ use std::time::{Duration, Instant};
 use eframe::egui;
 use egui_phosphor::regular::{DOWNLOAD_SIMPLE, GEAR};
 use egui_plot::{Line, Plot, PlotBounds, PlotPoints, Polygon, VLine};
+use rayon::prelude::*;
 use rfd::FileDialog;
 use serde::{Deserialize, Serialize};
 
@@ -35,6 +38,13 @@ const FFT_TIMELINE_STEP_SEC: f32 = 0.05;
 const FFT_WINDOW_SIZE: usize = 4096;
 const LOOP_MIN_DURATION_SEC: f32 = 0.01;
 const SEEK_STEP_SEC: f32 = 5.0;
+const PARAM_UPDATE_PREVIEW_SEC: f32 = 8.0;
+const PARAM_UPDATE_LIVE_DEBOUNCE: Duration = Duration::from_millis(120);
+const ANALYSIS_CACHE_DIR_NAME: &str = ".transcriber_cache";
+const ANALYSIS_CACHE_LIBRARY_DIR_NAME: &str = "library";
+const ANALYSIS_CACHE_VERSION: u32 = 3;
+const ANALYSIS_CACHE_ZSTD_LEVEL: i32 = 9;
+const ANALYSIS_CACHE_MAX_DECOMPRESSED_BYTES: usize = 768 * 1024 * 1024;
 const PRESET_HIGHLIGHT_COLORS: [(&str, egui::Color32); 8] = [
     ("Orange", egui::Color32::from_rgb(255, 140, 45)),
     ("Sky", egui::Color32::from_rgb(72, 162, 255)),
@@ -116,6 +126,132 @@ impl Default for PersistedState {
     }
 }
 
+#[derive(Debug, Deserialize)]
+struct AnalysisCacheBlob {
+    cache_version: u32,
+    sample_rate: u32,
+    raw_sample_len: usize,
+    speed_bits: u32,
+    pitch_bits: u32,
+    use_cqt_analysis: bool,
+    preprocess_audio: bool,
+    processed_samples_len: usize,
+    processed_samples_shuffled_bytes: Option<Vec<u8>>,
+    base_note_timeline: Vec<Vec<f32>>,
+    base_note_timeline_step_sec: f32,
+}
+
+#[derive(Serialize)]
+struct AnalysisCacheSnapshot<'a> {
+    cache_version: u32,
+    sample_rate: u32,
+    raw_sample_len: usize,
+    speed_bits: u32,
+    pitch_bits: u32,
+    use_cqt_analysis: bool,
+    preprocess_audio: bool,
+    processed_samples_len: usize,
+    processed_samples_shuffled_bytes: Option<&'a [u8]>,
+    base_note_timeline: &'a [Vec<f32>],
+    base_note_timeline_step_sec: f32,
+}
+
+fn analysis_cache_dir() -> PathBuf {
+    std::env::current_dir()
+        .unwrap_or_else(|_| PathBuf::from("."))
+        .join(ANALYSIS_CACHE_DIR_NAME)
+}
+
+fn analysis_cache_library_dir() -> PathBuf {
+    analysis_cache_dir().join(ANALYSIS_CACHE_LIBRARY_DIR_NAME)
+}
+
+fn analysis_cache_file_path(song_hash: &str, variant_key: &str) -> PathBuf {
+    analysis_cache_library_dir()
+        .join(song_hash)
+        .join(format!("{variant_key}.bin.zst"))
+}
+
+fn compute_file_hash(path: &Path) -> Option<String> {
+    let file = fs::File::open(path).ok()?;
+    let mut reader = BufReader::with_capacity(1024 * 1024, file);
+    let mut hasher = blake3::Hasher::new();
+    let mut chunk = vec![0u8; 1024 * 1024];
+
+    loop {
+        let read = reader.read(&mut chunk).ok()?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&chunk[..read]);
+    }
+
+    Some(hasher.finalize().to_hex().to_string())
+}
+
+fn fnv1a64_update(mut hash: u64, bytes: &[u8]) -> u64 {
+    for &b in bytes {
+        hash ^= b as u64;
+        hash = hash.wrapping_mul(1099511628211);
+    }
+    hash
+}
+
+fn analysis_cache_variant_key(
+    sample_rate: u32,
+    raw_sample_len: usize,
+    speed: f32,
+    pitch_semitones: f32,
+    use_cqt_analysis: bool,
+    preprocess_audio: bool,
+) -> String {
+    let mut hash = 14695981039346656037u64;
+    hash = fnv1a64_update(hash, &sample_rate.to_le_bytes());
+    hash = fnv1a64_update(hash, &(raw_sample_len as u64).to_le_bytes());
+    hash = fnv1a64_update(hash, &speed.to_bits().to_le_bytes());
+    hash = fnv1a64_update(hash, &pitch_semitones.to_bits().to_le_bytes());
+    hash = fnv1a64_update(hash, &[if use_cqt_analysis { 1 } else { 0 }]);
+    hash = fnv1a64_update(hash, &[if preprocess_audio { 1 } else { 0 }]);
+    hash = fnv1a64_update(hash, &ANALYSIS_CACHE_VERSION.to_le_bytes());
+
+    format!("{hash:016x}")
+}
+
+fn speed_pitch_is_identity(speed: f32, pitch_semitones: f32) -> bool {
+    (speed.clamp(0.25, 4.0) - 1.0).abs() < 1.0e-4 && pitch_semitones.abs() < 1.0e-4
+}
+
+fn shuffle_f32_bytes(samples: &[f32]) -> Vec<u8> {
+    let len = samples.len();
+    let mut shuffled = vec![0u8; len * 4];
+    for (i, sample) in samples.iter().enumerate() {
+        let bytes = sample.to_le_bytes();
+        shuffled[i] = bytes[0];
+        shuffled[len + i] = bytes[1];
+        shuffled[len * 2 + i] = bytes[2];
+        shuffled[len * 3 + i] = bytes[3];
+    }
+    shuffled
+}
+
+fn unshuffle_f32_bytes(shuffled: &[u8], sample_len: usize) -> Option<Vec<f32>> {
+    if shuffled.len() != sample_len.saturating_mul(4) {
+        return None;
+    }
+
+    let mut samples = Vec::with_capacity(sample_len);
+    for i in 0..sample_len {
+        let bytes = [
+            shuffled[i],
+            shuffled[sample_len + i],
+            shuffled[sample_len * 2 + i],
+            shuffled[sample_len * 3 + i],
+        ];
+        samples.push(f32::from_le_bytes(bytes));
+    }
+    Some(samples)
+}
+
 fn state_file_path() -> PathBuf {
     std::env::current_dir()
         .unwrap_or_else(|_| PathBuf::from("."))
@@ -133,11 +269,14 @@ fn load_persisted_state() -> PersistedState {
 
 pub struct TranscriberApp {
     loaded_path: Option<PathBuf>,
+    loaded_audio_hash: Option<String>,
     audio_raw: Option<AudioData>,
     processed_samples: Vec<f32>,
     waveform: Vec<[f64; 2]>,
-    note_timeline: Vec<Vec<f32>>,
+    note_timeline: Arc<Vec<Vec<f32>>>,
     note_timeline_step_sec: f32,
+    base_note_timeline: Arc<Vec<Vec<f32>>>,
+    base_note_timeline_step_sec: f32,
     note_probs: Vec<f32>,
     note_probs_smoothed: Vec<f32>,
     selected_time_sec: f32,
@@ -155,10 +294,14 @@ pub struct TranscriberApp {
     last_error: Option<String>,
     engine: Option<AudioEngine>,
     processing_rx: Option<Receiver<ProcessingResult>>,
+    processing_epoch: Arc<AtomicU64>,
+    active_rebuild_mode: RebuildMode,
     active_job_id: Option<u64>,
     next_job_id: u64,
     is_processing: bool,
     pending_param_change: bool,
+    last_param_change_at: Option<Instant>,
+    queued_param_update: bool,
     restart_playback_after_processing: bool,
     last_prob_update: Instant,
     show_note_hist_window: bool,
@@ -173,6 +316,7 @@ pub struct TranscriberApp {
     loop_selection: Option<(f32, f32)>,
     drag_select_anchor_sec: Option<f32>,
     loop_playback_enabled: bool,
+    playing_preview_buffer: bool,
     use_cqt_analysis: bool,
     preprocess_audio: bool,
     album_art_texture: Option<egui::TextureHandle>,
@@ -180,11 +324,27 @@ pub struct TranscriberApp {
 
 struct ProcessingResult {
     job_id: u64,
+    mode: RebuildMode,
     processed_samples: Vec<f32>,
     waveform: Vec<[f64; 2]>,
-    note_timeline: Vec<Vec<f32>>,
+    note_timeline: Arc<Vec<Vec<f32>>>,
     note_timeline_step_sec: f32,
+    base_note_timeline: Arc<Vec<Vec<f32>>>,
+    base_note_timeline_step_sec: f32,
     analysis_error: Option<String>,
+    preview_playback: Option<PreviewPlayback>,
+}
+
+struct PreviewPlayback {
+    samples: Vec<f32>,
+    timeline_start_sec: f32,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum RebuildMode {
+    Full,
+    ParametersOnly,
+    ParametersPreview,
 }
 
 impl TranscriberApp {
@@ -195,11 +355,14 @@ impl TranscriberApp {
 
         let mut app = Self {
             loaded_path: None,
+            loaded_audio_hash: None,
             audio_raw: None,
             processed_samples: Vec::new(),
             waveform: Vec::new(),
-            note_timeline: Vec::new(),
+            note_timeline: Arc::new(Vec::new()),
             note_timeline_step_sec: 0.0,
+            base_note_timeline: Arc::new(Vec::new()),
+            base_note_timeline_step_sec: 0.0,
             note_probs: vec![0.0; (PIANO_HIGH_MIDI - PIANO_LOW_MIDI + 1) as usize],
             note_probs_smoothed: vec![0.0; (PIANO_HIGH_MIDI - PIANO_LOW_MIDI + 1) as usize],
             selected_time_sec: persisted.selected_time_sec.max(0.0),
@@ -219,10 +382,14 @@ impl TranscriberApp {
             last_error: None,
             engine: AudioEngine::new().ok(),
             processing_rx: None,
+            processing_epoch: Arc::new(AtomicU64::new(0)),
+            active_rebuild_mode: RebuildMode::Full,
             active_job_id: None,
             next_job_id: 1,
             is_processing: false,
             pending_param_change: false,
+            last_param_change_at: None,
+            queued_param_update: false,
             restart_playback_after_processing: false,
             last_prob_update: Instant::now(),
             show_note_hist_window: persisted.show_note_hist_window,
@@ -241,6 +408,7 @@ impl TranscriberApp {
             loop_selection: None,
             drag_select_anchor_sec: None,
             loop_playback_enabled: false,
+            playing_preview_buffer: false,
             use_cqt_analysis: persisted.use_cqt_analysis,
             preprocess_audio: persisted.preprocess_audio,
             album_art_texture: None,
@@ -254,8 +422,15 @@ impl TranscriberApp {
             if path.exists() {
                 match load_audio_file(&path) {
                     Ok(audio) => {
-                        app.apply_loaded_audio(path, audio, &_cc.egui_ctx);
-                        app.request_rebuild(false);
+                        app.apply_loaded_audio(path.clone(), audio, &_cc.egui_ctx);
+                        if !app.try_restore_analysis_cache(&path) {
+                            let restore_mode = if app.preprocess_audio {
+                                RebuildMode::Full
+                            } else {
+                                RebuildMode::ParametersOnly
+                            };
+                            app.request_rebuild(false, restore_mode);
+                        }
                     }
                     Err(err) => {
                         app.last_error =
@@ -292,23 +467,336 @@ impl TranscriberApp {
 
     fn request_rebuild_preserving_playback(&mut self) {
         let was_playing = self.stop_if_playing();
-        self.request_rebuild(was_playing);
+        self.request_rebuild(was_playing, RebuildMode::Full);
+    }
+
+    fn cancel_active_processing(&mut self) {
+        let cancel_epoch = self.next_job_id;
+        self.next_job_id = self.next_job_id.saturating_add(1);
+        self.processing_epoch.store(cancel_epoch, Ordering::Release);
+        self.clear_processing_job();
+        self.pending_param_change = false;
+        self.last_param_change_at = None;
+        self.queued_param_update = false;
+        self.restart_playback_after_processing = false;
+    }
+
+    fn try_restore_analysis_cache(&mut self, source_path: &Path) -> bool {
+        let Some(audio) = &self.audio_raw else {
+            return false;
+        };
+        let sample_rate = audio.sample_rate;
+        let raw_sample_len = audio.samples_mono.len();
+        let raw_samples = Arc::clone(&audio.samples_mono);
+
+        let song_hash = if let Some(hash) = self.loaded_audio_hash.clone() {
+            hash
+        } else {
+            let Some(hash) = compute_file_hash(source_path) else {
+                return false;
+            };
+            self.loaded_audio_hash = Some(hash.clone());
+            hash
+        };
+
+        let variant_key = analysis_cache_variant_key(
+            sample_rate,
+            raw_sample_len,
+            self.speed,
+            self.pitch_semitones,
+            self.use_cqt_analysis,
+            self.preprocess_audio,
+        );
+        let cache_path = analysis_cache_file_path(&song_hash, &variant_key);
+
+        let Ok(bytes) = fs::read(cache_path) else {
+            return false;
+        };
+        let payload =
+            zstd::bulk::decompress(&bytes, ANALYSIS_CACHE_MAX_DECOMPRESSED_BYTES).unwrap_or(bytes);
+        let Ok(cache) = bincode::deserialize::<AnalysisCacheBlob>(&payload) else {
+            return false;
+        };
+
+        let expected_speed_bits = self.speed.to_bits();
+        let expected_pitch_bits = self.pitch_semitones.to_bits();
+        let cache_matches = cache.cache_version == ANALYSIS_CACHE_VERSION
+            && cache.sample_rate == sample_rate
+            && cache.raw_sample_len == raw_sample_len
+            && cache.speed_bits == expected_speed_bits
+            && cache.pitch_bits == expected_pitch_bits
+            && cache.use_cqt_analysis == self.use_cqt_analysis
+            && cache.preprocess_audio == self.preprocess_audio;
+
+        if !cache_matches {
+            return false;
+        }
+
+        let processed_samples = if let Some(shuffled) = cache.processed_samples_shuffled_bytes {
+            if cache.processed_samples_len == 0 {
+                return false;
+            }
+            let Some(samples) = unshuffle_f32_bytes(&shuffled, cache.processed_samples_len) else {
+                return false;
+            };
+            if samples.is_empty() {
+                return false;
+            }
+            samples
+        } else if speed_pitch_is_identity(self.speed, self.pitch_semitones) {
+            raw_samples.as_slice().to_vec()
+        } else {
+            return false;
+        };
+
+        let base_note_timeline = Arc::new(cache.base_note_timeline);
+        let base_note_timeline_step_sec = cache.base_note_timeline_step_sec;
+
+        if self.preprocess_audio
+            && (base_note_timeline.is_empty() || base_note_timeline_step_sec <= 0.0)
+        {
+            return false;
+        }
+
+        let (note_timeline, note_timeline_step_sec) = if self.preprocess_audio {
+            Self::transform_note_timeline(
+                Arc::clone(&base_note_timeline),
+                base_note_timeline_step_sec,
+                self.speed,
+                self.pitch_semitones,
+            )
+        } else {
+            (Arc::new(Vec::new()), 0.0)
+        };
+
+        self.processed_samples = processed_samples;
+        self.waveform = Self::build_waveform_for_processed(
+            self.processed_samples.as_slice(),
+            sample_rate,
+            self.speed,
+        );
+        self.note_timeline = note_timeline;
+        self.note_timeline_step_sec = note_timeline_step_sec;
+        self.base_note_timeline = base_note_timeline;
+        self.base_note_timeline_step_sec = base_note_timeline_step_sec;
+        self.waveform_reset_view = true;
+        self.selected_time_sec = self.selected_time_sec.min(self.source_duration());
+        self.playing_preview_buffer = false;
+        self.update_note_probabilities(true);
+
+        true
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn persist_analysis_cache(
+        song_hash: &str,
+        sample_rate: u32,
+        raw_sample_len: usize,
+        speed: f32,
+        pitch_semitones: f32,
+        use_cqt_analysis: bool,
+        preprocess_audio: bool,
+        processed_samples: &[f32],
+        base_note_timeline: &[Vec<f32>],
+        base_note_timeline_step_sec: f32,
+    ) {
+        if processed_samples.is_empty() {
+            return;
+        }
+
+        if preprocess_audio && (base_note_timeline.is_empty() || base_note_timeline_step_sec <= 0.0)
+        {
+            return;
+        }
+
+        let variant_key = analysis_cache_variant_key(
+            sample_rate,
+            raw_sample_len,
+            speed,
+            pitch_semitones,
+            use_cqt_analysis,
+            preprocess_audio,
+        );
+        let song_dir = analysis_cache_library_dir().join(song_hash);
+        if fs::create_dir_all(&song_dir).is_err() {
+            return;
+        }
+
+        let store_processed = !speed_pitch_is_identity(speed, pitch_semitones);
+        let (processed_samples_len, processed_samples_shuffled_bytes) = if store_processed {
+            (
+                processed_samples.len(),
+                Some(shuffle_f32_bytes(processed_samples)),
+            )
+        } else {
+            (0usize, None)
+        };
+
+        let snapshot = AnalysisCacheSnapshot {
+            cache_version: ANALYSIS_CACHE_VERSION,
+            sample_rate,
+            raw_sample_len,
+            speed_bits: speed.to_bits(),
+            pitch_bits: pitch_semitones.to_bits(),
+            use_cqt_analysis,
+            preprocess_audio,
+            processed_samples_len,
+            processed_samples_shuffled_bytes: processed_samples_shuffled_bytes.as_deref(),
+            base_note_timeline,
+            base_note_timeline_step_sec,
+        };
+
+        let Ok(serialized) = bincode::serialize(&snapshot) else {
+            return;
+        };
+
+        let compressed =
+            zstd::bulk::compress(&serialized, ANALYSIS_CACHE_ZSTD_LEVEL).unwrap_or(serialized);
+
+        let cache_path = analysis_cache_file_path(song_hash, &variant_key);
+        let _ = fs::write(cache_path, compressed);
+    }
+
+    fn build_waveform_for_processed(
+        processed_samples: &[f32],
+        sample_rate: u32,
+        speed: f32,
+    ) -> Vec<[f64; 2]> {
+        let mut waveform = waveform_points(processed_samples, sample_rate, 6000);
+        let speed_for_waveform = speed.clamp(0.25, 4.0) as f64;
+        if (speed_for_waveform - 1.0).abs() > f64::EPSILON {
+            for pt in &mut waveform {
+                pt[0] *= speed_for_waveform;
+            }
+        }
+        waveform
+    }
+
+    fn request_param_update_preserving_playback(&mut self) {
+        self.refresh_timeline_for_current_params();
+
+        // Parameter-only rebuilds rely on an existing analyzed base timeline.
+        // If analysis is not ready yet, force a full rebuild to avoid ending up
+        // with an empty timeline state that blocks playback controls.
+        let needs_full_rebuild = self.preprocess_audio
+            && (self.base_note_timeline.is_empty() || self.base_note_timeline_step_sec <= 0.0);
+        if needs_full_rebuild {
+            let was_playing = self.stop_if_playing();
+            self.request_rebuild(was_playing, RebuildMode::Full);
+            return;
+        }
+
+        let was_playing = self.stop_if_playing();
+        if was_playing {
+            self.request_rebuild(true, RebuildMode::ParametersPreview);
+        } else {
+            self.request_rebuild(false, RebuildMode::ParametersOnly);
+        }
+    }
+
+    fn refresh_timeline_for_current_params(&mut self) {
+        if !self.preprocess_audio {
+            return;
+        }
+        if self.base_note_timeline.is_empty() || self.base_note_timeline_step_sec <= 0.0 {
+            return;
+        }
+
+        let idx = (self.selected_time_sec.max(0.0) / self.base_note_timeline_step_sec) as usize;
+        let idx = idx.min(self.base_note_timeline.len().saturating_sub(1));
+        let frame = &self.base_note_timeline[idx];
+
+        self.note_probs = if self.pitch_semitones.abs() < 1.0e-6 {
+            frame.clone()
+        } else {
+            Self::transpose_frame(frame, self.pitch_semitones)
+        };
+
+        for (smoothed, current) in self
+            .note_probs_smoothed
+            .iter_mut()
+            .zip(self.note_probs.iter())
+        {
+            *smoothed = *smoothed * 0.78 + *current * 0.22;
+        }
+
+        self.last_prob_update = Instant::now();
     }
 
     fn clear_processing_job(&mut self) {
         self.is_processing = false;
         self.processing_rx = None;
         self.active_job_id = None;
+        self.active_rebuild_mode = RebuildMode::Full;
     }
 
     fn apply_processing_result(&mut self, result: ProcessingResult) {
+        if result.mode == RebuildMode::ParametersPreview {
+            if self.queued_param_update {
+                self.queued_param_update = false;
+                self.clear_processing_job();
+                self.request_param_update_preserving_playback();
+                return;
+            }
+
+            self.clear_processing_job();
+
+            if self.restart_playback_after_processing {
+                self.restart_playback_after_processing = false;
+                if let Some(preview) = result.preview_playback {
+                    let playback_rate = self.playback_rate();
+                    if let Some(raw) = &self.audio_raw {
+                        if let Some(engine) = &mut self.engine {
+                            if let Err(err) = engine.play_chunk_at_timeline(
+                                &preview.samples,
+                                raw.sample_rate,
+                                preview.timeline_start_sec,
+                                playback_rate,
+                            ) {
+                                self.last_error = Some(format!("Playback error: {err}"));
+                            } else {
+                                self.playing_preview_buffer = true;
+                            }
+                        }
+                    }
+                }
+            }
+
+            // Continue with full render in the background so seeking and waveform stay accurate.
+            self.request_rebuild(false, RebuildMode::ParametersOnly);
+            return;
+        }
+
+        if result.mode == RebuildMode::ParametersOnly && self.queued_param_update {
+            self.queued_param_update = false;
+            self.clear_processing_job();
+            self.request_param_update_preserving_playback();
+            return;
+        }
+
+        let handoff_pos = if result.mode == RebuildMode::ParametersOnly
+            && self.playing_preview_buffer
+            && self.is_playing()
+        {
+            Some(self.current_position_sec())
+        } else {
+            None
+        };
+        let handoff_loop_end = if self.loop_enabled && self.loop_playback_enabled {
+            self.loop_selection.map(|(a, b)| a.max(b))
+        } else {
+            None
+        };
+
         self.processed_samples = result.processed_samples;
         self.waveform = result.waveform;
         self.note_timeline = result.note_timeline;
         self.note_timeline_step_sec = result.note_timeline_step_sec;
+        self.base_note_timeline = result.base_note_timeline;
+        self.base_note_timeline_step_sec = result.base_note_timeline_step_sec;
         self.waveform_reset_view = true;
         self.clear_processing_job();
-        self.selected_time_sec = self.selected_time_sec.min(self.duration());
+        self.selected_time_sec = self.selected_time_sec.min(self.source_duration());
 
         if let Some(err) = result.analysis_error {
             self.last_error = Some(err);
@@ -318,23 +806,99 @@ impl TranscriberApp {
         if self.restart_playback_after_processing {
             self.restart_playback_after_processing = false;
             self.play_from_selected();
+        } else if let Some(source_pos) = handoff_pos {
+            if let Some(loop_end) = handoff_loop_end {
+                if loop_end - source_pos > LOOP_MIN_DURATION_SEC {
+                    self.play_range(source_pos, Some(loop_end));
+                } else {
+                    self.play_from_selected();
+                }
+            } else {
+                self.play_range(source_pos, None);
+            }
+            self.selected_time_sec = source_pos.min(self.source_duration());
+            self.playing_preview_buffer = false;
+        } else {
+            self.playing_preview_buffer = false;
         }
     }
 
     fn maybe_commit_pending_param_change(&mut self, pointer_down: bool) {
-        if self.pending_param_change && !pointer_down {
-            self.request_rebuild_preserving_playback();
-            self.pending_param_change = false;
+        if !self.pending_param_change {
+            return;
         }
+
+        let debounce_elapsed = self
+            .last_param_change_at
+            .map(|at| at.elapsed() >= PARAM_UPDATE_LIVE_DEBOUNCE)
+            .unwrap_or(!pointer_down);
+
+        if pointer_down && !debounce_elapsed {
+            return;
+        }
+
+        self.refresh_timeline_for_current_params();
+
+        if self.is_param_render_in_progress() {
+            self.queued_param_update = true;
+        } else {
+            self.request_param_update_preserving_playback();
+        }
+
+        self.pending_param_change = false;
+        self.last_param_change_at = None;
     }
 
-    fn duration(&self) -> f32 {
+    fn is_blocking_processing(&self) -> bool {
+        self.is_processing
+            && self.active_rebuild_mode == RebuildMode::Full
+            && self.processed_samples.is_empty()
+    }
+
+    fn is_param_render_in_progress(&self) -> bool {
+        self.is_processing
+            && matches!(
+                self.active_rebuild_mode,
+                RebuildMode::ParametersOnly | RebuildMode::ParametersPreview
+            )
+    }
+
+    fn playback_rate(&self) -> f32 {
+        self.speed.clamp(0.25, 4.0)
+    }
+
+    fn source_duration(&self) -> f32 {
         if let Some(audio) = &self.audio_raw {
             if audio.sample_rate > 0 {
-                return self.processed_samples.len() as f32 / audio.sample_rate as f32;
+                return audio.samples_mono.len() as f32 / audio.sample_rate as f32;
             }
         }
         0.0
+    }
+
+    fn source_to_output_time(&self, source_sec: f32) -> f32 {
+        source_sec / self.playback_rate()
+    }
+
+    fn output_duration(&self) -> f32 {
+        self.source_to_output_time(self.source_duration())
+    }
+
+    fn play_preview_at(&mut self, start_sec: f32, end_sec: Option<f32>) -> bool {
+        if !self.is_param_render_in_progress() {
+            return false;
+        }
+
+        let _ = end_sec;
+        self.selected_time_sec = start_sec.max(0.0);
+
+        if self.active_rebuild_mode == RebuildMode::ParametersPreview {
+            self.restart_playback_after_processing = true;
+        } else {
+            self.request_rebuild(true, RebuildMode::ParametersPreview);
+        }
+
+        true
     }
 
     fn import_audio_with_ctx(&mut self, ctx: &egui::Context) {
@@ -345,8 +909,11 @@ impl TranscriberApp {
         if let Some(path) = picked {
             match load_audio_file(&path) {
                 Ok(audio) => {
-                    self.apply_loaded_audio(path.to_path_buf(), audio, ctx);
-                    self.request_rebuild(false);
+                    let source_path = path.to_path_buf();
+                    self.apply_loaded_audio(source_path.clone(), audio, ctx);
+                    if !self.try_restore_analysis_cache(&source_path) {
+                        self.request_rebuild(false, RebuildMode::Full);
+                    }
                     self.last_error = None;
                 }
                 Err(err) => {
@@ -357,9 +924,15 @@ impl TranscriberApp {
     }
 
     fn apply_loaded_audio(&mut self, path: PathBuf, audio: AudioData, ctx: &egui::Context) {
+        self.cancel_active_processing();
+        self.loaded_audio_hash = compute_file_hash(path.as_path());
         self.loaded_path = Some(path);
         self.selected_time_sec = 0.0;
         self.audio_raw = Some(audio);
+        self.note_timeline = Arc::new(Vec::new());
+        self.note_timeline_step_sec = 0.0;
+        self.base_note_timeline = Arc::new(Vec::new());
+        self.base_note_timeline_step_sec = 0.0;
         self.album_art_texture = self.create_album_art_texture(ctx);
     }
 
@@ -375,7 +948,7 @@ impl TranscriberApp {
 
         Some(ctx.load_texture("album-art", color_image, egui::TextureOptions::LINEAR))
     }
-    fn request_rebuild(&mut self, restart_playback: bool) {
+    fn request_rebuild(&mut self, restart_playback: bool, mode: RebuildMode) {
         let Some(raw) = &self.audio_raw else {
             return;
         };
@@ -389,32 +962,136 @@ impl TranscriberApp {
         let pitch_semitones = self.pitch_semitones;
         let use_cqt = self.use_cqt_analysis;
         let preprocess_audio = self.preprocess_audio;
+        let base_timeline = Arc::clone(&self.base_note_timeline);
+        let base_step = self.base_note_timeline_step_sec;
+        let selected_time_sec = self.selected_time_sec;
+        let source_hash = self.loaded_audio_hash.clone();
+        let processing_epoch = Arc::clone(&self.processing_epoch);
 
         let (tx, rx) = mpsc::channel::<ProcessingResult>();
         self.processing_rx = Some(rx);
+        self.active_rebuild_mode = mode;
         self.active_job_id = Some(job_id);
         self.is_processing = true;
         self.restart_playback_after_processing |= restart_playback;
+        self.processing_epoch.store(job_id, Ordering::Release);
 
         thread::spawn(move || {
-            let processed_samples =
-                apply_speed_and_pitch(raw_samples.as_slice(), speed, pitch_semitones);
-            let waveform = waveform_points(&processed_samples, sample_rate, 6000);
+            if mode == RebuildMode::ParametersPreview {
+                if processing_epoch.load(Ordering::Acquire) != job_id {
+                    return;
+                }
 
-            let (note_timeline, note_timeline_step_sec, analysis_error) = Self::build_note_timeline(
-                &processed_samples,
-                sample_rate,
-                use_cqt,
-                preprocess_audio,
+                let preview_start_idx = (selected_time_sec.max(0.0) * sample_rate as f32) as usize;
+                let preview_len = (PARAM_UPDATE_PREVIEW_SEC * sample_rate as f32) as usize;
+                let preview_end_idx =
+                    (preview_start_idx.saturating_add(preview_len)).min(raw_samples.len());
+
+                let preview_samples = if preview_start_idx < preview_end_idx {
+                    apply_speed_and_pitch(
+                        &raw_samples[preview_start_idx..preview_end_idx],
+                        sample_rate,
+                        speed,
+                        pitch_semitones,
+                    )
+                } else {
+                    Vec::new()
+                };
+
+                if processing_epoch.load(Ordering::Acquire) != job_id {
+                    return;
+                }
+
+                let _ = tx.send(ProcessingResult {
+                    job_id,
+                    mode,
+                    processed_samples: Vec::new(),
+                    waveform: Vec::new(),
+                    note_timeline: Arc::new(Vec::new()),
+                    note_timeline_step_sec: 0.0,
+                    base_note_timeline: Arc::new(Vec::new()),
+                    base_note_timeline_step_sec: 0.0,
+                    analysis_error: None,
+                    preview_playback: Some(PreviewPlayback {
+                        samples: preview_samples,
+                        timeline_start_sec: selected_time_sec.max(0.0),
+                    }),
+                });
+                return;
+            }
+
+            let processed_samples = if processing_epoch.load(Ordering::Acquire) != job_id {
+                None
+            } else {
+                Some(apply_speed_and_pitch(
+                    raw_samples.as_slice(),
+                    sample_rate,
+                    speed,
+                    pitch_semitones,
+                ))
+            };
+            let Some(processed_samples) = processed_samples else {
+                return;
+            };
+
+            if processing_epoch.load(Ordering::Acquire) != job_id {
+                return;
+            }
+
+            let waveform =
+                Self::build_waveform_for_processed(&processed_samples, sample_rate, speed);
+
+            let (base_note_timeline, base_note_timeline_step_sec, analysis_error) = match mode {
+                RebuildMode::Full => {
+                    let (timeline, step, err) = Self::build_note_timeline(
+                        raw_samples.as_slice(),
+                        sample_rate,
+                        use_cqt,
+                        preprocess_audio,
+                    );
+                    (Arc::new(timeline), step, err)
+                }
+                RebuildMode::ParametersOnly => (base_timeline, base_step, None),
+                RebuildMode::ParametersPreview => unreachable!("preview mode returns early"),
+            };
+
+            let (note_timeline, note_timeline_step_sec) = Self::transform_note_timeline(
+                Arc::clone(&base_note_timeline),
+                base_note_timeline_step_sec,
+                speed,
+                pitch_semitones,
             );
+
+            if processing_epoch.load(Ordering::Acquire) != job_id {
+                return;
+            }
+
+            if let Some(song_hash) = source_hash.as_ref() {
+                Self::persist_analysis_cache(
+                    song_hash,
+                    sample_rate,
+                    raw_samples.len(),
+                    speed,
+                    pitch_semitones,
+                    use_cqt,
+                    preprocess_audio,
+                    processed_samples.as_slice(),
+                    base_note_timeline.as_ref(),
+                    base_note_timeline_step_sec,
+                );
+            }
 
             let _ = tx.send(ProcessingResult {
                 job_id,
+                mode,
                 processed_samples,
                 waveform,
                 note_timeline,
                 note_timeline_step_sec,
+                base_note_timeline,
+                base_note_timeline_step_sec,
                 analysis_error,
+                preview_playback: None,
             });
         });
     }
@@ -485,7 +1162,8 @@ impl TranscriberApp {
                 return;
             }
 
-            let center = (self.selected_time_sec.max(0.0) * raw.sample_rate as f32) as usize;
+            let output_time_sec = self.source_to_output_time(self.selected_time_sec.max(0.0));
+            let center = (output_time_sec * raw.sample_rate as f32) as usize;
             self.note_probs = if self.use_cqt_analysis {
                 detect_note_probabilities_cqt(
                     &self.processed_samples,
@@ -543,7 +1221,7 @@ impl TranscriberApp {
     }
 
     fn build_note_timeline(
-        processed_samples: &[f32],
+        source_samples: &[f32],
         sample_rate: u32,
         use_cqt: bool,
         preprocess_audio: bool,
@@ -553,9 +1231,9 @@ impl TranscriberApp {
         }
 
         if use_cqt {
-            match analyze_with_full_pipeline(processed_samples, sample_rate) {
+            match analyze_with_full_pipeline(source_samples, sample_rate) {
                 Ok((_smoothed, probs)) => {
-                    let duration_sec = processed_samples.len() as f32 / sample_rate.max(1) as f32;
+                    let duration_sec = source_samples.len() as f32 / sample_rate.max(1) as f32;
                     let step_sec = if probs.is_empty() {
                         0.0
                     } else {
@@ -565,7 +1243,7 @@ impl TranscriberApp {
                 }
                 Err(err) => {
                     let fallback = Self::compute_fft_timeline(
-                        processed_samples,
+                        source_samples,
                         sample_rate,
                         FFT_TIMELINE_STEP_SEC,
                     );
@@ -578,25 +1256,92 @@ impl TranscriberApp {
             }
         } else {
             (
-                Self::compute_fft_timeline(processed_samples, sample_rate, FFT_TIMELINE_STEP_SEC),
+                Self::compute_fft_timeline(source_samples, sample_rate, FFT_TIMELINE_STEP_SEC),
                 FFT_TIMELINE_STEP_SEC,
                 None,
             )
         }
     }
 
+    fn transpose_frame(frame: &[f32], semitones: f32) -> Vec<f32> {
+        if frame.is_empty() {
+            return Vec::new();
+        }
+
+        if semitones.abs() < 1.0e-6 {
+            return frame.to_vec();
+        }
+
+        let n = frame.len() as f32;
+        let mut out = vec![0.0f32; frame.len()];
+        for (dst_idx, dst) in out.iter_mut().enumerate() {
+            let src_idx = dst_idx as f32 - semitones;
+            if src_idx < 0.0 || src_idx >= n - 1.0 {
+                continue;
+            }
+
+            let i0 = src_idx.floor() as usize;
+            let i1 = (i0 + 1).min(frame.len() - 1);
+            let frac = src_idx - i0 as f32;
+            *dst = frame[i0] * (1.0 - frac) + frame[i1] * frac;
+        }
+
+        out
+    }
+
+    fn transform_note_timeline(
+        base_timeline: Arc<Vec<Vec<f32>>>,
+        base_step_sec: f32,
+        speed: f32,
+        pitch_semitones: f32,
+    ) -> (Arc<Vec<Vec<f32>>>, f32) {
+        if base_timeline.is_empty() || base_step_sec <= 0.0 {
+            return (Arc::new(Vec::new()), 0.0);
+        }
+
+        let transformed = if pitch_semitones.abs() < 1.0e-6 {
+            base_timeline
+        } else {
+            let transformed = if base_timeline.len() >= 256 {
+                base_timeline
+                    .par_iter()
+                    .map(|frame| Self::transpose_frame(frame, pitch_semitones))
+                    .collect()
+            } else {
+                base_timeline
+                    .iter()
+                    .map(|frame| Self::transpose_frame(frame, pitch_semitones))
+                    .collect()
+            };
+            Arc::new(transformed)
+        };
+
+        let _ = speed;
+        let step_sec = base_step_sec;
+        (transformed, step_sec)
+    }
+
     fn play_from_selected(&mut self) {
+        if self.play_preview_at(self.selected_time_sec, None) {
+            return;
+        }
+
         let Some(raw) = &self.audio_raw else {
             return;
         };
+        let playback_rate = self.playback_rate();
 
         if let Some(engine) = &mut self.engine {
             if let Err(err) = engine.play_from(
                 &self.processed_samples,
                 raw.sample_rate,
                 self.selected_time_sec,
+                playback_rate,
             ) {
                 self.last_error = Some(format!("Playback error: {err}"));
+                self.playing_preview_buffer = false;
+            } else {
+                self.playing_preview_buffer = false;
             }
         } else {
             self.last_error = Some("Audio engine unavailable on this machine".to_string());
@@ -608,7 +1353,7 @@ impl TranscriberApp {
             return;
         }
 
-        let duration = self.duration();
+        let duration = self.source_duration();
         let target = self.selected_time_sec + delta_sec;
         self.selected_time_sec = if self.loop_enabled {
             if let Some((a, b)) = self.loop_selection {
@@ -644,15 +1389,27 @@ impl TranscriberApp {
     }
 
     fn play_range(&mut self, start_sec: f32, end_sec: Option<f32>) {
+        if self.play_preview_at(start_sec, end_sec) {
+            return;
+        }
+
         let Some(raw) = &self.audio_raw else {
             return;
         };
+        let playback_rate = self.playback_rate();
 
         if let Some(engine) = &mut self.engine {
-            if let Err(err) =
-                engine.play_range(&self.processed_samples, raw.sample_rate, start_sec, end_sec)
-            {
+            if let Err(err) = engine.play_range(
+                &self.processed_samples,
+                raw.sample_rate,
+                start_sec,
+                end_sec,
+                playback_rate,
+            ) {
                 self.last_error = Some(format!("Playback error: {err}"));
+                self.playing_preview_buffer = false;
+            } else {
+                self.playing_preview_buffer = false;
             }
         }
     }
@@ -699,13 +1456,14 @@ impl TranscriberApp {
             engine.stop();
         }
         self.loop_playback_enabled = false;
+        self.playing_preview_buffer = false;
     }
 
     fn sync_playhead_from_engine(&mut self) {
         if let Some(engine) = &mut self.engine {
             engine.sync_finished();
             if engine.is_playing() {
-                self.selected_time_sec = engine.current_position().min(self.duration());
+                self.selected_time_sec = engine.current_position().min(self.source_duration());
                 self.update_note_probabilities(false);
             } else if self.loop_enabled && self.loop_playback_enabled {
                 if let Some((a, b)) = self.loop_selection {
@@ -716,6 +1474,8 @@ impl TranscriberApp {
                         self.play_range(start, Some(end));
                     }
                 }
+            } else {
+                self.playing_preview_buffer = false;
             }
         }
     }
@@ -824,6 +1584,7 @@ impl TranscriberApp {
 
                 if speed_changed || pitch_changed {
                     self.pending_param_change = true;
+                    self.last_param_change_at = Some(Instant::now());
                 }
 
                 ui.menu_button(egui::RichText::new(GEAR).font(icon_font_id(18.0)), |ui| {
@@ -839,10 +1600,12 @@ impl TranscriberApp {
             }
 
             if self.is_processing {
-                let msg = if self.preprocess_audio {
-                    "Analyzing track... controls unlock when note extraction finishes."
-                } else {
-                    "Processing speed/pitch update..."
+                let msg = match self.active_rebuild_mode {
+                    RebuildMode::Full if self.preprocess_audio => {
+                        "Analyzing track... controls unlock when note extraction finishes."
+                    }
+                    RebuildMode::ParametersPreview => "Buffering speed/pitch preview...",
+                    _ => "Rendering full speed/pitch update...",
                 };
                 let processing_color = egui::Color32::from_rgb(
                     self.highlight_color.r().saturating_add(12),
@@ -1008,9 +1771,9 @@ impl eframe::App for TranscriberApp {
                 return;
             }
 
-            let duration = self.duration().max(0.01);
+            let source_duration = self.source_duration().max(0.01);
             let waveform_height = (ui.available_height() - 112.0).max(40.0);
-            let analysis_ready = !self.is_processing
+            let analysis_ready = !self.is_blocking_processing()
                 && !self.processed_samples.is_empty()
                 && (!self.preprocess_audio || !self.note_timeline.is_empty());
 
@@ -1120,7 +1883,7 @@ impl eframe::App for TranscriberApp {
                     // On a fresh load, force full-track bounds first and clamp from those values.
                     let mut b = if self.waveform_reset_view {
                         self.waveform_reset_view = false;
-                        PlotBounds::from_min_max([0.0, -1.05], [duration as f64, 1.05])
+                        PlotBounds::from_min_max([0.0, -1.05], [source_duration as f64, 1.05])
                     } else {
                         plot_ui.plot_bounds()
                     };
@@ -1194,14 +1957,14 @@ impl eframe::App for TranscriberApp {
                             let zoom = zoom_from_wheel * zoom_from_input;
 
                             if (zoom - 1.0).abs() > f64::EPSILON {
-                                let min_span = (duration as f64 / 400.0).max(0.02);
-                                let max_span = duration as f64;
+                                let min_span = (source_duration as f64 / 400.0).max(0.02);
+                                let max_span = source_duration as f64;
                                 let new_span = (span * zoom).clamp(min_span, max_span);
 
                                 let center_x = pointer
                                     .map(|p| p.x)
                                     .unwrap_or((b.min()[0] + b.max()[0]) * 0.5)
-                                    .clamp(0.0, duration as f64);
+                                    .clamp(0.0, source_duration as f64);
 
                                 let left_ratio = ((center_x - b.min()[0]) / span).clamp(0.0, 1.0);
                                 let new_min = center_x - left_ratio * new_span;
@@ -1215,7 +1978,7 @@ impl eframe::App for TranscriberApp {
                     }
 
                     let mut x_span = (b.max()[0] - b.min()[0]).max(0.001);
-                    let max_span = duration as f64;
+                    let max_span = source_duration as f64;
                     if x_span > max_span {
                         x_span = max_span;
                     }
@@ -1232,14 +1995,14 @@ impl eframe::App for TranscriberApp {
 
                     if analysis_ready && drag_started {
                         self.drag_select_anchor_sec = pointer
-                            .map(|p| p.x.clamp(0.0, duration as f64) as f32)
+                            .map(|p| p.x.clamp(0.0, source_duration as f64) as f32)
                             .or(Some(self.selected_time_sec));
                     }
 
                     if analysis_ready && dragged {
                         if let (Some(anchor), Some(p)) = (
                             self.drag_select_anchor_sec,
-                            pointer.map(|p| p.x.clamp(0.0, duration as f64) as f32),
+                            pointer.map(|p| p.x.clamp(0.0, source_duration as f64) as f32),
                         ) {
                             self.loop_selection = Some((anchor, p));
                         }
@@ -1264,7 +2027,8 @@ impl eframe::App for TranscriberApp {
 
                     if analysis_ready && clicked {
                         if let Some(pointer) = pointer {
-                            self.selected_time_sec = pointer.x.clamp(0.0, duration as f64) as f32;
+                            self.selected_time_sec =
+                                pointer.x.clamp(0.0, source_duration as f64) as f32;
                             self.loop_selection = None;
                             self.loop_playback_enabled = false;
                             self.update_note_probabilities(true);
@@ -1285,7 +2049,7 @@ impl eframe::App for TranscriberApp {
 
             let available_w = ui.available_width();
             ui.allocate_ui(egui::vec2(available_w, media_height), |ui| {
-                draw_media_controls(self, ui, analysis_ready, duration);
+                draw_media_controls(self, ui, analysis_ready, source_duration);
             });
         });
         self.waveform_panel_height = waveform_central.response.rect.height().clamp(120.0, 5000.0);
