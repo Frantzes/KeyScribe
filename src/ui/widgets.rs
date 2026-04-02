@@ -1,7 +1,7 @@
 use eframe::egui;
 
 pub fn icon_button(ui: &mut egui::Ui, icon: &str, tooltip: &str, enabled: bool) -> egui::Response {
-    icon_button_with_fill(ui, icon, tooltip, enabled, None)
+    icon_button_with_fill(ui, icon, tooltip, enabled, None, None)
 }
 
 pub fn icon_toggle_button(
@@ -18,7 +18,13 @@ pub fn icon_toggle_button(
         ui.visuals().widgets.inactive.bg_fill
     };
 
-    icon_button_with_fill(ui, icon, tooltip, enabled, Some(fill))
+    let text_color_override = if enabled && enabled_state {
+        Some(egui::Color32::WHITE)
+    } else {
+        None
+    };
+
+    icon_button_with_fill(ui, icon, tooltip, enabled, Some(fill), text_color_override)
 }
 
 fn icon_button_with_fill(
@@ -27,6 +33,7 @@ fn icon_button_with_fill(
     tooltip: &str,
     enabled: bool,
     fill_override: Option<egui::Color32>,
+    text_color_override: Option<egui::Color32>,
 ) -> egui::Response {
     let desired = egui::vec2(34.0, 34.0);
     let sense = if enabled {
@@ -46,11 +53,13 @@ fn icon_button_with_fill(
     ui.painter()
         .rect(rect, visuals.rounding, bg_fill, visuals.bg_stroke);
 
-    let text_color = if enabled {
-        visuals.text_color()
-    } else {
-        ui.visuals().widgets.inactive.text_color()
-    };
+    let text_color = text_color_override.unwrap_or_else(|| {
+        if enabled {
+            visuals.text_color()
+        } else {
+            ui.visuals().widgets.inactive.text_color()
+        }
+    });
 
     ui.painter().text(
         rect.center(),

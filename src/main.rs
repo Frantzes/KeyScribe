@@ -1,3 +1,5 @@
+#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+
 mod analysis;
 mod app;
 mod audio_io;
@@ -29,6 +31,7 @@ fn load_window_icon() -> Option<egui::IconData> {
 
 fn main() -> eframe::Result<()> {
     let mut native_options = eframe::NativeOptions::default();
+    native_options.viewport = native_options.viewport.with_maximized(true);
     if let Some(icon) = load_window_icon() {
         native_options.viewport = native_options.viewport.with_icon(icon);
     }

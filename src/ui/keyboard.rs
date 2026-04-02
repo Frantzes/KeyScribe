@@ -137,9 +137,11 @@ pub fn draw_piano_view(
         let c4_white_idx = white_index_before_midi(60);
         let cx = x_start + c4_white_idx as f32 * white_w + white_w * 0.5;
         if cx >= rect.left() && cx <= rect.right() {
+            let marker_radius = 4.0;
+            let marker_y = (rect.bottom() - marker_radius - 2.0).max(rect.top() + marker_radius);
             painter.circle_filled(
-                egui::pos2(cx, rect.top() + 8.0),
-                4.0,
+                egui::pos2(cx, marker_y),
+                marker_radius,
                 egui::Color32::from_gray(155),
             );
         }

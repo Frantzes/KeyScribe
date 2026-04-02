@@ -32,6 +32,15 @@ cargo build --release
 cargo run --release
 ```
 
+### Build Portable Windows Bundle
+```powershell
+powershell -ExecutionPolicy Bypass -File scripts/build-windows.ps1
+```
+
+Output artifacts are created under `build/windows/`:
+- `build/windows/transcriber-windows-x64/`
+- `build/windows/transcriber-windows-x64.zip`
+
 ### Enable Pro Mode
 1. Load an audio file
 2. Check "Use CQT Analysis (Pro Mode)" in settings

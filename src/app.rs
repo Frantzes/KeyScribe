@@ -8,7 +8,6 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use bincode::Options;
-use directories::ProjectDirs;
 use eframe::egui;
 use egui_phosphor::regular::{DOWNLOAD_SIMPLE, GEAR};
 use egui_plot::{Line, Plot, PlotBounds, PlotPoints, Polygon, VLine};
@@ -29,15 +28,12 @@ use crate::ui::keyboard::{
     MIN_PROBABILITY_STRIP_HEIGHT, PIANO_ZOOM_MAX, PIANO_ZOOM_MIN, WHITE_KEY_LENGTH_TO_WIDTH,
 };
 use crate::ui::utils::{accent_soft, color_to_hex, parse_hex_color, push_recent_color};
-use crate::ui::widgets::{icon_button, icon_font_id};
+use crate::ui::widgets::icon_button;
 
 mod media_controls;
 use media_controls::{draw_media_controls, setting_toggle_row};
 
 const STATE_FILE_NAME: &str = ".transcriber_state.json";
-const APP_DIR_QUALIFIER: &str = "com";
-const APP_DIR_ORGANIZATION: &str = "franchescoURJC";
-const APP_DIR_APPLICATION: &str = "transcriber";
 const MAX_STATE_FILE_BYTES: u64 = 256 * 1024;
 const PROBABILITY_UPDATE_INTERVAL: Duration = Duration::from_millis(16);
 const FFT_TIMELINE_STEP_SEC: f32 = 0.05;
@@ -230,24 +226,21 @@ struct AnalysisCacheSnapshot<'a> {
     base_note_timeline_step_sec: f32,
 }
 
-fn app_project_dirs() -> Option<ProjectDirs> {
-    ProjectDirs::from(APP_DIR_QUALIFIER, APP_DIR_ORGANIZATION, APP_DIR_APPLICATION)
+fn app_portable_base_dir() -> PathBuf {
+    // Portable build behavior: persist all runtime data beside the executable.
+    std::env::current_exe()
+        .ok()
+        .and_then(|exe| exe.parent().map(|parent| parent.to_path_buf()))
+        .or_else(|| std::env::current_dir().ok())
+        .unwrap_or_else(|| PathBuf::from("."))
 }
 
 fn app_data_dir() -> PathBuf {
-    if let Some(dirs) = app_project_dirs() {
-        dirs.data_local_dir().to_path_buf()
-    } else {
-        std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))
-    }
+    app_portable_base_dir()
 }
 
 fn app_cache_base_dir() -> PathBuf {
-    if let Some(dirs) = app_project_dirs() {
-        dirs.cache_dir().to_path_buf()
-    } else {
-        std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))
-    }
+    app_portable_base_dir()
 }
 
 fn ensure_parent_dir(path: &Path) -> bool {
@@ -482,6 +475,7 @@ pub struct TranscriberApp {
     use_cqt_analysis: bool,
     preprocess_audio: bool,
     album_art_texture: Option<egui::TextureHandle>,
+    startup_min_window_size_locked: bool,
 }
 
 struct ProcessingResult {
@@ -580,6 +574,7 @@ impl TranscriberApp {
             use_cqt_analysis: persisted.use_cqt_analysis,
             preprocess_audio: persisted.preprocess_audio,
             album_art_texture: None,
+            startup_min_window_size_locked: false,
         };
 
         app.refresh_audio_output_devices();
@@ -618,6 +613,36 @@ impl TranscriberApp {
         }
 
         app
+    }
+
+    fn lock_startup_min_window_size_once(&mut self, ctx: &egui::Context) {
+        if self.startup_min_window_size_locked {
+            return;
+        }
+
+        let viewport = ctx.input(|i| i.viewport().clone());
+        let Some(inner_rect) = viewport.inner_rect else {
+            return;
+        };
+
+        let size = inner_rect.size();
+        if size.x <= 1.0 || size.y <= 1.0 {
+            return;
+        }
+
+        let sized_like_fullscreen = viewport
+            .monitor_size
+            .map(|monitor| size.x >= monitor.x * 0.9 && size.y >= monitor.y * 0.9)
+            .unwrap_or(false);
+
+        let should_lock = viewport.maximized.unwrap_or(false)
+            || viewport.fullscreen.unwrap_or(false)
+            || sized_like_fullscreen;
+
+        if should_lock {
+            ctx.send_viewport_cmd(egui::ViewportCommand::MinInnerSize(size));
+            self.startup_min_window_size_locked = true;
+        }
     }
 
     fn is_playing(&self) -> bool {
@@ -1930,53 +1955,188 @@ impl TranscriberApp {
         }
     }
 
-    fn draw_top_controls_panel(&mut self, ctx: &egui::Context) {
-        egui::TopBottomPanel::top("controls").show(ctx, |ui| {
-            ui.horizontal_wrapped(|ui| {
-                if icon_button(ui, DOWNLOAD_SIMPLE, "Import Audio", true).clicked() {
-                    self.import_audio_with_ctx(ctx);
-                }
+    fn top_bar_slider_with_input(
+        ui: &mut egui::Ui,
+        label: &str,
+        value: &mut f32,
+        min: f32,
+        max: f32,
+        suffix: &str,
+        drag_speed: f64,
+        max_decimals: usize,
+    ) -> bool {
+        let mut changed = false;
 
-                let speed_changed = ui
-                    .add(egui::Slider::new(&mut self.speed, 0.5..=2.0).suffix("x"))
-                    .changed();
+        let dark = ui.visuals().dark_mode;
+        let row_fill = if dark {
+            egui::Color32::from_rgb(28, 34, 43)
+        } else {
+            egui::Color32::from_rgb(234, 238, 244)
+        };
+        let row_stroke = if dark {
+            egui::Color32::from_rgb(82, 93, 108)
+        } else {
+            egui::Color32::from_rgb(166, 176, 191)
+        };
+        let rail_fill = if dark {
+            egui::Color32::from_rgb(78, 89, 105)
+        } else {
+            egui::Color32::from_rgb(184, 194, 210)
+        };
+        let rail_fill_hover = if dark {
+            egui::Color32::from_rgb(95, 108, 126)
+        } else {
+            egui::Color32::from_rgb(170, 182, 199)
+        };
+        let rail_fill_active = if dark {
+            egui::Color32::from_rgb(108, 124, 145)
+        } else {
+            egui::Color32::from_rgb(156, 170, 190)
+        };
 
-                let pitch_changed = ui
-                    .add(egui::Slider::new(&mut self.pitch_semitones, -12.0..=12.0).suffix(" st"))
-                    .changed();
+        egui::Frame::none()
+            .fill(row_fill)
+            .rounding(egui::Rounding::same(8.0))
+            .stroke(egui::Stroke::new(1.0, row_stroke))
+            .outer_margin(egui::Margin::symmetric(1.0, 0.0))
+            .inner_margin(egui::Margin::symmetric(9.0, 6.0))
+            .show(ui, |ui| {
+                ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
+                    ui.spacing_mut().item_spacing.x = 8.0;
 
-                if speed_changed || pitch_changed {
-                    self.pending_param_change = true;
-                    self.last_param_change_at = Some(Instant::now());
-                }
+                    let label_color = ui.visuals().text_color();
+                    let label_font = egui::TextStyle::Body.resolve(ui.style());
+                    let label_width = ui
+                        .fonts(|fonts| {
+                            fonts
+                                .layout_no_wrap(label.to_owned(), label_font.clone(), label_color)
+                                .size()
+                                .x
+                        })
+                        .max(56.0);
+                    let (label_rect, _) =
+                        ui.allocate_exact_size(egui::vec2(label_width, 22.0), egui::Sense::hover());
+                    ui.painter().text(
+                        label_rect.left_center(),
+                        egui::Align2::LEFT_CENTER,
+                        label,
+                        label_font,
+                        label_color,
+                    );
 
-                ui.menu_button(egui::RichText::new(GEAR).font(icon_font_id(18.0)), |ui| {
-                    self.draw_settings_menu(ui);
+                    ui.scope(|ui| {
+                        let visuals = ui.visuals_mut();
+                        visuals.slider_trailing_fill = true;
+                        visuals.widgets.inactive.weak_bg_fill = rail_fill;
+                        visuals.widgets.hovered.weak_bg_fill = rail_fill_hover;
+                        visuals.widgets.active.weak_bg_fill = rail_fill_active;
+                        visuals.widgets.inactive.bg_stroke = egui::Stroke::new(1.0, row_stroke);
+                        visuals.widgets.hovered.bg_stroke = egui::Stroke::new(1.0, row_stroke);
+                        visuals.widgets.active.bg_stroke = egui::Stroke::new(1.0, row_stroke);
+
+                        changed |= ui
+                            .add_sized(
+                                [142.0, 22.0],
+                                egui::Slider::new(value, min..=max)
+                                    .show_value(false)
+                                    .suffix(suffix),
+                            )
+                            .changed();
+
+                        changed |= ui
+                            .add_sized(
+                                [74.0, 22.0],
+                                egui::DragValue::new(value)
+                                    .clamp_range(min..=max)
+                                    .speed(drag_speed)
+                                    .max_decimals(max_decimals)
+                                    .suffix(suffix),
+                            )
+                            .changed();
+                    });
                 });
-
-                let pointer_down = ui.input(|i| i.pointer.primary_down());
-                self.maybe_commit_pending_param_change(pointer_down);
             });
 
-            if let Some(err) = &self.last_error {
-                ui.colored_label(ERROR_RED, err);
-            }
+        changed
+    }
 
-            if self.is_processing {
-                let msg = match self.active_rebuild_mode {
-                    RebuildMode::Full if self.preprocess_audio => {
-                        "Analyzing track... controls unlock when note extraction finishes."
+    fn draw_top_controls_panel(&mut self, ctx: &egui::Context) {
+        egui::TopBottomPanel::top("controls").show(ctx, |ui| {
+            egui::Frame::none()
+                .inner_margin(egui::Margin::symmetric(12.0, 10.0))
+                .show(ui, |ui| {
+                    ui.horizontal_wrapped(|ui| {
+                        ui.spacing_mut().item_spacing.x = 12.0;
+
+                        if icon_button(ui, DOWNLOAD_SIMPLE, "Import Audio", true).clicked() {
+                            self.import_audio_with_ctx(ctx);
+                        }
+
+                        let speed_changed = Self::top_bar_slider_with_input(
+                            ui,
+                            "Speed",
+                            &mut self.speed,
+                            0.5,
+                            2.0,
+                            "x",
+                            0.01,
+                            2,
+                        );
+
+                        let pitch_changed = Self::top_bar_slider_with_input(
+                            ui,
+                            "Pitch",
+                            &mut self.pitch_semitones,
+                            -12.0,
+                            12.0,
+                            " st",
+                            0.1,
+                            1,
+                        );
+
+                        if speed_changed || pitch_changed {
+                            self.pending_param_change = true;
+                            self.last_param_change_at = Some(Instant::now());
+                        }
+
+                        let settings_popup_id = ui.make_persistent_id("settings_popup_menu");
+                        let settings_response = icon_button(ui, GEAR, "Settings", true);
+                        if settings_response.clicked() {
+                            ui.memory_mut(|mem| mem.toggle_popup(settings_popup_id));
+                        }
+                        egui::popup::popup_below_widget(
+                            ui,
+                            settings_popup_id,
+                            &settings_response,
+                            |ui| {
+                                self.draw_settings_menu(ui);
+                            },
+                        );
+
+                        let pointer_down = ui.input(|i| i.pointer.primary_down());
+                        self.maybe_commit_pending_param_change(pointer_down);
+                    });
+
+                    if let Some(err) = &self.last_error {
+                        ui.colored_label(ERROR_RED, err);
                     }
-                    RebuildMode::ParametersPreview => "Buffering speed/pitch preview...",
-                    _ => "Rendering full speed/pitch update...",
-                };
-                let processing_color = egui::Color32::from_rgb(
-                    self.highlight_color.r().saturating_add(12),
-                    self.highlight_color.g().saturating_add(12),
-                    self.highlight_color.b().saturating_add(12),
-                );
-                ui.colored_label(processing_color, msg);
-            }
+
+                    if self.is_processing {
+                        let msg = match self.active_rebuild_mode {
+                            RebuildMode::Full if self.preprocess_audio => {
+                                "Analyzing track... controls unlock when note extraction finishes."
+                            }
+                            RebuildMode::ParametersPreview => "Buffering speed/pitch preview...",
+                            _ => "Rendering full speed/pitch update...",
+                        };
+                        let processing_color = egui::Color32::from_rgb(
+                            self.highlight_color.r().saturating_add(12),
+                            self.highlight_color.g().saturating_add(12),
+                            self.highlight_color.b().saturating_add(12),
+                        );
+                        ui.colored_label(processing_color, msg);
+                    }
+                });
         });
     }
 }
@@ -1984,6 +2144,7 @@ impl TranscriberApp {
 impl eframe::App for TranscriberApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         apply_brand_theme(ctx, self.dark_mode, self.highlight_color);
+        self.lock_startup_min_window_size_once(ctx);
 
         if ctx.input(|i| i.key_pressed(egui::Key::Space)) {
             self.handle_space_replay();
@@ -2101,18 +2262,35 @@ impl eframe::App for TranscriberApp {
             }
 
             ui.separator();
-            ui.horizontal_wrapped(|ui| {
-                ui.add_sized(
-                    [720.0, 0.0],
-                    egui::Slider::new(&mut self.key_color_sensitivity, 0.0..=2.0)
-                        .text("Key Color Sensitivity"),
-                );
-                ui.add(
-                    egui::Slider::new(&mut self.piano_zoom, PIANO_ZOOM_MIN..=PIANO_ZOOM_MAX)
-                        .text("Piano Zoom")
-                        .suffix("x"),
-                );
-            });
+            egui::Frame::none()
+                .inner_margin(egui::Margin::symmetric(12.0, 10.0))
+                .show(ui, |ui| {
+                    ui.horizontal_wrapped(|ui| {
+                        ui.spacing_mut().item_spacing.x = 12.0;
+
+                        let _ = Self::top_bar_slider_with_input(
+                            ui,
+                            "Key Color Sensitivity",
+                            &mut self.key_color_sensitivity,
+                            0.0,
+                            2.0,
+                            "",
+                            0.01,
+                            2,
+                        );
+
+                        let _ = Self::top_bar_slider_with_input(
+                            ui,
+                            "Piano Zoom",
+                            &mut self.piano_zoom,
+                            PIANO_ZOOM_MIN,
+                            PIANO_ZOOM_MAX,
+                            "x",
+                            0.01,
+                            2,
+                        );
+                    });
+                });
         });
         self.piano_panel_height = piano_panel.response.rect.height().max(80.0);
 
@@ -2186,7 +2364,8 @@ impl eframe::App for TranscriberApp {
                             [end, 1.05],
                             [start, 1.05],
                         ]))
-                        .fill_color(loop_bg);
+                        .fill_color(loop_bg)
+                        .stroke(egui::Stroke::new(1.0, loop_edge));
                         plot_ui.polygon(highlight);
                     }
 
