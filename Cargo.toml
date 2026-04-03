@@ -3,14 +3,25 @@ name = "transcriber"
 version = "0.1.0"
 edition = "2021"
 
+[features]
+default = ["desktop-ui"]
+desktop-ui = [
+	"dep:eframe",
+	"dep:egui_plot",
+	"dep:egui-phosphor",
+	"dep:image",
+	"dep:rfd",
+	"dep:rodio",
+]
+
 [dependencies]
 anyhow = "1.0"
-eframe = "0.27"
-egui_plot = "0.27"
-egui-phosphor = "0.5"
-image = { version = "0.25", default-features = false, features = ["jpeg", "png", "gif", "bmp", "webp"] }
-rfd = "0.14"
-rodio = "0.19"
+eframe = { version = "0.27", optional = true }
+egui_plot = { version = "0.27", optional = true }
+egui-phosphor = { version = "0.5", optional = true }
+image = { version = "0.25", default-features = false, features = ["jpeg", "png", "gif", "bmp", "webp"], optional = true }
+rfd = { version = "0.14", optional = true }
+rodio = { version = "0.19", optional = true }
 rustfft = "6.2"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"

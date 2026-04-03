@@ -1,0 +1,19 @@
+pub mod analysis;
+pub mod audio_io;
+pub mod core;
+pub mod cqt;
+pub mod dsp;
+pub mod inference;
+pub mod pipeline;
+pub mod preprocessing;
+pub mod ring_buffer;
+pub mod viterbi;
+
+#[cfg(feature = "desktop-ui")]
+pub mod app;
+#[cfg(feature = "desktop-ui")]
+pub mod playback;
+#[cfg(feature = "desktop-ui")]
+pub mod theme;
+#[cfg(feature = "desktop-ui")]
+pub mod ui;

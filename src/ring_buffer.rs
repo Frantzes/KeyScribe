@@ -15,17 +15,20 @@ struct CircularBuffer {
     write_pos: usize,
     read_pos: usize,
     capacity: usize,
+    len: usize,
 }
 
 impl RingBuffer {
     /// Create a new ring buffer with given capacity
     pub fn new(capacity: usize) -> Self {
+        let capacity = capacity.max(1);
         Self {
             buffer: Arc::new(Mutex::new(CircularBuffer {
                 data: vec![0.0; capacity],
                 write_pos: 0,
                 read_pos: 0,
                 capacity,
+                len: 0,
             })),
         }
     }
@@ -37,15 +40,16 @@ impl RingBuffer {
         let mut written = 0;
 
         for &sample in samples {
+            if buf.len == buf.capacity {
+                buf.read_pos = (buf.read_pos + 1) % buf.capacity;
+            } else {
+                buf.len += 1;
+            }
+
             let write_idx = buf.write_pos;
             buf.data[write_idx] = sample;
             buf.write_pos = (buf.write_pos + 1) % buf.capacity;
             written += 1;
-
-            // If we've caught up to read position, advance read position
-            if buf.write_pos == buf.read_pos && written > 1 {
-                buf.read_pos = (buf.read_pos + 1) % buf.capacity;
-            }
         }
 
         written
@@ -57,9 +61,10 @@ impl RingBuffer {
         let mut buf = self.buffer.lock();
         let mut read_count = 0;
 
-        while read_count < output.len() && buf.read_pos != buf.write_pos {
+        while read_count < output.len() && buf.len > 0 {
             output[read_count] = buf.data[buf.read_pos];
             buf.read_pos = (buf.read_pos + 1) % buf.capacity;
+            buf.len -= 1;
             read_count += 1;
         }
 
@@ -68,12 +73,7 @@ impl RingBuffer {
 
     /// Get available samples to read without consuming them
     pub fn available(&self) -> usize {
-        let buf = self.buffer.lock();
-        if buf.write_pos >= buf.read_pos {
-            buf.write_pos - buf.read_pos
-        } else {
-            buf.capacity - buf.read_pos + buf.write_pos
-        }
+        self.buffer.lock().len
     }
 
     /// Peek at samples without consuming them
@@ -82,7 +82,7 @@ impl RingBuffer {
         let mut read_count = 0;
         let mut pos = buf.read_pos;
 
-        while read_count < output.len() && pos != buf.write_pos {
+        while read_count < output.len() && read_count < buf.len {
             output[read_count] = buf.data[pos];
             pos = (pos + 1) % buf.capacity;
             read_count += 1;
@@ -95,6 +95,7 @@ impl RingBuffer {
     pub fn clear(&self) {
         let mut buf = self.buffer.lock();
         buf.read_pos = buf.write_pos;
+        buf.len = 0;
     }
 
     /// Get the capacity of the buffer

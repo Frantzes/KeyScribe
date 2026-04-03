@@ -190,6 +190,38 @@ impl AudioEngine {
         Ok(())
     }
 
+    pub fn has_active_sink(&self) -> bool {
+        self.sink.is_some()
+    }
+
+    pub fn append_samples(
+        &mut self,
+        samples: &[f32],
+        sample_rate: u32,
+        timeline_rate: f32,
+    ) -> Result<()> {
+        if samples.is_empty() || sample_rate == 0 {
+            return Ok(());
+        }
+
+        let Some(sink) = self.sink.as_ref() else {
+            return Ok(());
+        };
+
+        let timeline_rate = timeline_rate.clamp(0.25, 4.0);
+        sink.append(SamplesBuffer::new(1, sample_rate, samples.to_vec()));
+        self.duration_sec += (samples.len() as f32 / sample_rate as f32) * timeline_rate;
+        self.timeline_rate = timeline_rate;
+
+        // If playback reached queue end and new audio arrives, resume timeline tracking.
+        if !self.is_playing && !sink.is_paused() {
+            self.started_at = Some(Instant::now());
+            self.is_playing = true;
+        }
+
+        Ok(())
+    }
+
     pub fn stop(&mut self) {
         if let Some(s) = self.sink.take() {
             s.stop();
@@ -238,12 +270,12 @@ impl AudioEngine {
     }
 
     pub fn sync_finished(&mut self) {
-        if let Some(s) = &self.sink {
-            if s.empty() {
-                self.is_playing = false;
-                self.started_at = None;
-                self.start_pos_sec = self.duration_sec;
-            }
+        let is_empty = self.sink.as_ref().map(|s| s.empty()).unwrap_or(false);
+        if is_empty {
+            self.sink = None;
+            self.is_playing = false;
+            self.started_at = None;
+            self.start_pos_sec = self.duration_sec;
         }
     }
 

@@ -1,22 +1,14 @@
-#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+#![cfg_attr(
+    all(not(debug_assertions), feature = "desktop-ui"),
+    windows_subsystem = "windows"
+)]
 
-mod analysis;
-mod app;
-mod audio_io;
-mod cqt;
-mod dsp;
-mod inference;
-mod pipeline;
-mod playback;
-mod preprocessing;
-mod ring_buffer;
-mod theme;
-mod ui;
-mod viterbi;
-
-use app::TranscriberApp;
+#[cfg(feature = "desktop-ui")]
 use eframe::egui;
+#[cfg(feature = "desktop-ui")]
+use transcriber::app::TranscriberApp;
 
+#[cfg(feature = "desktop-ui")]
 fn load_window_icon() -> Option<egui::IconData> {
     let bytes = include_bytes!("../icon.png");
     let image = image::load_from_memory(bytes).ok()?.into_rgba8();
@@ -29,6 +21,7 @@ fn load_window_icon() -> Option<egui::IconData> {
     })
 }
 
+#[cfg(feature = "desktop-ui")]
 fn main() -> eframe::Result<()> {
     let mut native_options = eframe::NativeOptions::default();
     native_options.viewport = native_options.viewport.with_maximized(true);
@@ -41,4 +34,9 @@ fn main() -> eframe::Result<()> {
         native_options,
         Box::new(|cc| Box::new(TranscriberApp::new(cc))),
     )
+}
+
+#[cfg(not(feature = "desktop-ui"))]
+fn main() {
+    eprintln!("Desktop UI is disabled. Enable the `desktop-ui` feature to run this binary.");
 }

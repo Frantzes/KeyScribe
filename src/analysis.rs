@@ -269,7 +269,20 @@ pub fn detect_note_probabilities_cqt(
         return probs;
     }
 
-    detect_note_probabilities_cqt_fallback(samples, sample_rate, fft_size)
+    detect_note_probabilities_cqt_fallback(samples, sample_rate, center_sample, fft_size)
+}
+
+/// Lightweight CQT detector for responsive live previews.
+///
+/// This intentionally avoids Basic Pitch ONNX inference so UI-driven updates remain smooth
+/// while loading. Full Pro analysis still runs in the background pipeline.
+pub fn detect_note_probabilities_cqt_preview(
+    samples: &[f32],
+    sample_rate: u32,
+    center_sample: usize,
+    fft_size: usize,
+) -> Vec<f32> {
+    detect_note_probabilities_cqt_fallback(samples, sample_rate, center_sample, fft_size)
 }
 
 fn detect_note_probabilities_basic_pitch(
@@ -322,34 +335,98 @@ fn detect_note_probabilities_basic_pitch(
 fn detect_note_probabilities_cqt_fallback(
     samples: &[f32],
     sample_rate: u32,
+    center_sample: usize,
     fft_size: usize,
 ) -> Vec<f32> {
     let note_count = (PIANO_HIGH_MIDI - PIANO_LOW_MIDI + 1) as usize;
     let mut probs = vec![0.0f32; note_count];
 
-    if samples.len() < fft_size {
+    if samples.is_empty() || sample_rate == 0 || fft_size < 32 {
         return probs;
     }
+
+    let window_size = fft_size.min(samples.len());
+    let half_window = window_size / 2;
+    let start = center_sample
+        .saturating_sub(half_window)
+        .min(samples.len().saturating_sub(window_size));
+    let end = start + window_size;
 
     // Use CQT instead of linear FFT
     let cqt_config = crate::cqt::CQTConfig::piano_range(sample_rate);
     let cqt = CQTransform::new(cqt_config.clone());
 
-    let frame_slice = &samples[..fft_size.min(samples.len())];
+    let frame_slice = &samples[start..end];
     let cqt_frame = cqt.compute_frame(frame_slice);
 
-    // Map CQT bins to MIDI notes
-    // Since CQT is already in semitone units, mapping is direct
-    for (cqt_idx, &mag) in cqt_frame.iter().enumerate() {
-        let note_idx = (cqt_idx / cqt_config.bins_per_semitone).min(note_count - 1);
-        probs[note_idx] += mag;
+    if cqt_frame.is_empty() {
+        return probs;
     }
 
-    // Normalize
+    let cqt_sum = cqt_frame.iter().copied().sum::<f32>();
+    if cqt_sum <= 1.0e-12 {
+        return probs;
+    }
+
+    // Similar to the FFT path, gate noisy/percussive frames so we don't paint the full keyboard.
+    let n = cqt_frame.len() as f32;
+    let geo = (cqt_frame.iter().map(|v| (v + 1.0e-12).ln()).sum::<f32>() / n).exp();
+    let arith = (cqt_sum / n).max(1.0e-12);
+    let flatness = (geo / arith).clamp(0.0, 1.0);
+    let tonal_factor = (1.0 - flatness).clamp(0.0, 1.0).powf(1.2);
+    if tonal_factor < 0.08 {
+        return probs;
+    }
+
+    // Map CQT bins to MIDI notes. Since CQT is already in semitone units,
+    // map each bin directly into the note bucket and accumulate energy.
+    let bins_per_semitone = cqt_config.bins_per_semitone.max(1);
+    for (cqt_idx, &mag) in cqt_frame.iter().enumerate() {
+        let note_idx = (cqt_idx / bins_per_semitone).min(note_count - 1);
+        probs[note_idx] += mag * mag;
+    }
+
     let max_prob = probs.iter().copied().fold(0.0f32, f32::max);
-    if max_prob > 1e-9 {
+    if max_prob <= 1.0e-9 {
+        return probs;
+    }
+
+    for p in &mut probs {
+        *p = (*p / max_prob).clamp(0.0, 1.0).powf(1.25);
+    }
+
+    // Keep only a sparse set of strongest candidates (same principle as FFT detector).
+    let mut ranked = probs.clone();
+    ranked.sort_by(|a, b| b.partial_cmp(a).unwrap_or(std::cmp::Ordering::Equal));
+    let sparse_floor = ranked.get(11).copied().unwrap_or(0.0) * 0.78;
+
+    for p in &mut probs {
+        let s = ((*p - sparse_floor).max(0.0) / (1.0 - sparse_floor + 1.0e-6)).powf(1.7);
+        let gated = (s * tonal_factor).clamp(0.0, 1.0);
+        *p = if gated >= 0.08 { gated } else { 0.0 };
+    }
+
+    // Suppress shoulders around peaks so adjacent notes don't all stay lit.
+    let snapshot = probs.clone();
+    for i in 0..note_count {
+        let left = if i > 0 { snapshot[i - 1] } else { 0.0 };
+        let right = if i + 1 < note_count {
+            snapshot[i + 1]
+        } else {
+            0.0
+        };
+        if snapshot[i] < left.max(right) * 0.92 {
+            probs[i] *= 0.45;
+        }
+        if probs[i] < 0.08 {
+            probs[i] = 0.0;
+        }
+    }
+
+    let max_after = probs.iter().copied().fold(0.0f32, f32::max);
+    if max_after > 1.0e-9 {
         for p in &mut probs {
-            *p = (*p / max_prob).clamp(0.0, 1.0);
+            *p /= max_after;
         }
     }
 
@@ -360,7 +437,7 @@ fn detect_note_probabilities_cqt_fallback(
 pub fn create_basic_pitch_pipeline(sample_rate: u32) -> anyhow::Result<AudioPipeline> {
     let config = PipelineConfig {
         sample_rate,
-        chunk_size: (sample_rate as usize / 10), // 100ms chunks
+        chunk_size: sample_rate as usize / 10, // 100ms chunks
         lookahead_frames: 5,
         ..Default::default()
     };
