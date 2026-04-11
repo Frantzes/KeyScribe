@@ -64,8 +64,12 @@ chmod +x scripts/build-macos.sh
 
 Outputs:
 
+- Portable:
 - build/macos/transcriber-macos-arm64/ or build/macos/transcriber-macos-x64/
 - build/macos/transcriber-macos-arm64.zip or build/macos/transcriber-macos-x64.zip
+- Typical app experience:
+- build/macos/transcriber-macos-arm64-app/Transcriber.app or build/macos/transcriber-macos-x64-app/Transcriber.app
+- build/macos/transcriber-macos-arm64-app.zip or build/macos/transcriber-macos-x64-app.zip
 
 ### Linux
 
@@ -82,7 +86,7 @@ Outputs:
 ## Automated Releases (Tags)
 
 Tag push triggers [.github/workflows/release-on-tag.yml](.github/workflows/release-on-tag.yml).
-Workflow builds Windows, macOS, Linux bundles and uploads zip artifacts to GitHub Release.
+Workflow builds Windows, macOS (arm64 and Intel x64), Linux bundles and uploads zip artifacts to GitHub Release.
 
 ```bash
 git tag v0.1.0

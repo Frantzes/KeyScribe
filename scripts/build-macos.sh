@@ -5,6 +5,7 @@ set -euo pipefail
 TARGET=""
 OUTPUT_ROOT="build/macos"
 SKIP_CARGO_BUILD=0
+PORTABLE_ONLY=0
 
 usage() {
     cat <<'EOF'
@@ -14,6 +15,7 @@ Options:
   --target <triple>     Rust target triple (default: host macOS target)
   --output-root <path>  Output folder root (default: build/macos)
   --skip-cargo-build    Skip cargo build step
+    --portable-only       Build only portable zip (skip .app bundle archive)
   -h, --help            Show this help
 EOF
 }
@@ -70,6 +72,10 @@ while [[ $# -gt 0 ]]; do
             ;;
         --skip-cargo-build)
             SKIP_CARGO_BUILD=1
+            shift
+            ;;
+        --portable-only)
+            PORTABLE_ONLY=1
             shift
             ;;
         -h|--help)
@@ -165,4 +171,74 @@ PY
 
 echo "Portable bundle directory: $BUNDLE_DIR"
 echo "Portable bundle archive:   $ARCHIVE_PATH"
+
+if [[ "$PORTABLE_ONLY" -eq 0 ]]; then
+    APP_STAGE_DIR="$REPO_ROOT/$OUTPUT_ROOT/$BUNDLE_NAME-app"
+    APP_BUNDLE_DIR="$APP_STAGE_DIR/Transcriber.app"
+    APP_CONTENTS_DIR="$APP_BUNDLE_DIR/Contents"
+    APP_MACOS_DIR="$APP_CONTENTS_DIR/MacOS"
+    APP_RESOURCES_DIR="$APP_CONTENTS_DIR/Resources"
+    APP_MODELS_DIR="$APP_RESOURCES_DIR/models"
+
+    rm -rf "$APP_STAGE_DIR"
+    mkdir -p "$APP_MACOS_DIR" "$APP_MODELS_DIR"
+
+    cp "$BINARY_PATH" "$APP_MACOS_DIR/transcriber-bin"
+    chmod +x "$APP_MACOS_DIR/transcriber-bin"
+    cp "$MODEL_PATH" "$APP_MODELS_DIR/basic-pitch.onnx"
+
+    if [[ -f "$REPO_ROOT/icon.png" ]]; then
+        cp "$REPO_ROOT/icon.png" "$APP_RESOURCES_DIR/AppIcon.png"
+    fi
+
+    cat > "$APP_MACOS_DIR/Transcriber" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+RESOURCES_DIR="$SCRIPT_DIR/../Resources"
+
+cd "$RESOURCES_DIR"
+exec "$SCRIPT_DIR/transcriber-bin" "$@"
+EOF
+    chmod +x "$APP_MACOS_DIR/Transcriber"
+
+    cat > "$APP_CONTENTS_DIR/Info.plist" <<'EOF'
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>CFBundleDevelopmentRegion</key>
+    <string>en</string>
+    <key>CFBundleDisplayName</key>
+    <string>Transcriber</string>
+    <key>CFBundleExecutable</key>
+    <string>Transcriber</string>
+    <key>CFBundleIconFile</key>
+    <string>AppIcon</string>
+    <key>CFBundleIdentifier</key>
+    <string>com.frantzes.visualtranscriber</string>
+    <key>CFBundleInfoDictionaryVersion</key>
+    <string>6.0</string>
+    <key>CFBundleName</key>
+    <string>Transcriber</string>
+    <key>CFBundlePackageType</key>
+    <string>APPL</string>
+    <key>CFBundleShortVersionString</key>
+    <string>0.1.0</string>
+    <key>CFBundleVersion</key>
+    <string>1</string>
+    <key>LSMinimumSystemVersion</key>
+    <string>11.0</string>
+</dict>
+</plist>
+EOF
+
+    APP_ARCHIVE_PATH="$REPO_ROOT/$OUTPUT_ROOT/$BUNDLE_NAME-app.zip"
+    rm -f "$APP_ARCHIVE_PATH"
+    ditto -c -k --sequesterRsrc --keepParent "$APP_BUNDLE_DIR" "$APP_ARCHIVE_PATH"
+
+    echo "App bundle directory:      $APP_BUNDLE_DIR"
+    echo "App bundle archive:        $APP_ARCHIVE_PATH"
+fi
 

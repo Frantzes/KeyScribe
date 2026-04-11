@@ -22,9 +22,12 @@ jobs:
           - os: windows-latest
             name: windows
             artifact_glob: build/windows/*.zip
-          - os: macos-latest
-            name: macos
-            artifact_glob: build/macos/*.zip
+          - os: macos-14
+            name: macos-arm64
+            artifact_glob: build/macos/transcriber-macos-arm64*.zip
+          - os: macos-13
+            name: macos-x64
+            artifact_glob: build/macos/transcriber-macos-x64*.zip
           - os: ubuntu-latest
             name: linux
             artifact_glob: build/linux/*.zip
@@ -63,7 +66,7 @@ jobs:
         run: powershell -ExecutionPolicy Bypass -File scripts/build-windows.ps1
 
       - name: Build macOS bundle
-        if: matrix.name == 'macos'
+        if: startsWith(matrix.name, 'macos-')
         shell: bash
         run: |
           chmod +x scripts/build-macos.sh
