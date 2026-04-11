@@ -35,7 +35,9 @@ fn icon_button_with_fill(
     fill_override: Option<egui::Color32>,
     text_color_override: Option<egui::Color32>,
 ) -> egui::Response {
-    let desired = egui::vec2(34.0, 34.0);
+    let button_size = 34.0;
+    let icon_size = 18.0;
+    let desired = egui::vec2(button_size, button_size);
     let sense = if enabled {
         egui::Sense::click()
     } else {
@@ -65,7 +67,7 @@ fn icon_button_with_fill(
         rect.center(),
         egui::Align2::CENTER_CENTER,
         icon,
-        icon_font_id(18.0),
+        icon_font_id(icon_size),
         text_color,
     );
 

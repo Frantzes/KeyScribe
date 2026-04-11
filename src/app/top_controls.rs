@@ -1,75 +1,17 @@
 use super::*;
 
+const TOOLBAR_MENU_MIN_WIDTH: f32 = 360.0;
+
 impl TranscriberApp {
-    pub(super) fn draw_settings_menu(&mut self, ui: &mut egui::Ui) {
-        ui.set_min_width(360.0);
+    fn draw_toolbar_separator(ui: &mut egui::Ui) {
+        let stroke = ui.visuals().widgets.noninteractive.bg_stroke;
+        let width = ui.available_width().max(0.0);
+        let (rect, _) = ui.allocate_exact_size(egui::vec2(width, 1.0), egui::Sense::hover());
+        ui.painter().hline(rect.x_range(), rect.center().y, stroke);
+    }
 
-        setting_toggle_row(ui, &mut self.dark_mode, "Dark Mode");
-        ui.separator();
-
-        ui.label("Highlight Presets");
-        ui.horizontal_wrapped(|ui| {
-            for (name, color) in PRESET_HIGHLIGHT_COLORS {
-                let swatch = egui::RichText::new("   ").background_color(color);
-                if ui
-                    .add(egui::Button::new(swatch))
-                    .on_hover_text(name)
-                    .clicked()
-                {
-                    self.highlight_color = color;
-                    self.custom_rgb = [color.r(), color.g(), color.b()];
-                    push_recent_color(&mut self.recent_highlight_hex, color);
-                }
-            }
-        });
-
-        ui.separator();
-        ui.label("Custom RGB");
-        let mut rgb_changed = false;
-        rgb_changed |= ui
-            .add(egui::Slider::new(&mut self.custom_rgb[0], 0..=255).text("R"))
-            .changed();
-        rgb_changed |= ui
-            .add(egui::Slider::new(&mut self.custom_rgb[1], 0..=255).text("G"))
-            .changed();
-        rgb_changed |= ui
-            .add(egui::Slider::new(&mut self.custom_rgb[2], 0..=255).text("B"))
-            .changed();
-
-        if rgb_changed {
-            self.highlight_color =
-                egui::Color32::from_rgb(self.custom_rgb[0], self.custom_rgb[1], self.custom_rgb[2]);
-        }
-
-        ui.horizontal(|ui| {
-            ui.label(color_to_hex(self.highlight_color));
-            if ui.button("Save Color").clicked() {
-                push_recent_color(&mut self.recent_highlight_hex, self.highlight_color);
-            }
-        });
-
-        if !self.recent_highlight_hex.is_empty() {
-            ui.label("Recent Colors");
-            ui.horizontal_wrapped(|ui| {
-                for hex in self.recent_highlight_hex.clone() {
-                    if let Some(color) = parse_hex_color(&hex) {
-                        let swatch = egui::RichText::new("   ").background_color(color);
-                        if ui
-                            .add(egui::Button::new(swatch))
-                            .on_hover_text(hex.clone())
-                            .clicked()
-                        {
-                            self.highlight_color = color;
-                            self.custom_rgb = [color.r(), color.g(), color.b()];
-                        }
-                    }
-                }
-            });
-        }
-
-        ui.separator();
-
-        ui.label("Audio Config");
+    pub(super) fn draw_audio_settings_menu(&mut self, ui: &mut egui::Ui) {
+        ui.label("Audio Processing");
         let mut quality_changed = false;
         egui::ComboBox::from_id_source("audio_quality_mode")
             .selected_text(self.audio_quality_mode.label())
@@ -100,6 +42,8 @@ impl TranscriberApp {
         if quality_changed {
             self.request_rebuild_preserving_playback();
         }
+
+        Self::draw_toolbar_separator(ui);
 
         ui.horizontal(|ui| {
             ui.label("Output Device");
@@ -144,7 +88,7 @@ impl TranscriberApp {
             self.apply_audio_output_device_change(device_change);
         }
 
-        ui.separator();
+        Self::draw_toolbar_separator(ui);
 
         let preprocess_changed = setting_toggle_row(
             ui,
@@ -158,10 +102,146 @@ impl TranscriberApp {
             "Use CQT Analysis (Pro Mode)",
         );
 
-        let _ = setting_toggle_row(ui, &mut self.show_note_hist_window, "Show Probability Pane");
-
         if preprocess_changed || cqt_changed {
             self.request_rebuild_preserving_playback();
+        }
+    }
+
+    pub(super) fn draw_preferences_menu(&mut self, ui: &mut egui::Ui) {
+        setting_toggle_row(ui, &mut self.dark_mode, "Dark Mode");
+        let _ = setting_toggle_row(ui, &mut self.show_note_hist_window, "Show Probability Pane");
+        Self::draw_toolbar_separator(ui);
+
+        ui.label("Highlight Presets");
+        ui.horizontal_wrapped(|ui| {
+            for (name, color) in PRESET_HIGHLIGHT_COLORS {
+                let swatch = egui::RichText::new("   ").background_color(color);
+                if ui
+                    .add(egui::Button::new(swatch))
+                    .on_hover_text(name)
+                    .clicked()
+                {
+                    self.highlight_color = color;
+                    self.custom_rgb = [color.r(), color.g(), color.b()];
+                    push_recent_color(&mut self.recent_highlight_hex, color);
+                }
+            }
+        });
+
+        Self::draw_toolbar_separator(ui);
+        ui.label("Custom RGB");
+        let mut rgb_changed = false;
+        rgb_changed |= ui
+            .add(egui::Slider::new(&mut self.custom_rgb[0], 0..=255).text("R"))
+            .changed();
+        rgb_changed |= ui
+            .add(egui::Slider::new(&mut self.custom_rgb[1], 0..=255).text("G"))
+            .changed();
+        rgb_changed |= ui
+            .add(egui::Slider::new(&mut self.custom_rgb[2], 0..=255).text("B"))
+            .changed();
+
+        if rgb_changed {
+            self.highlight_color =
+                egui::Color32::from_rgb(self.custom_rgb[0], self.custom_rgb[1], self.custom_rgb[2]);
+        }
+
+        ui.horizontal(|ui| {
+            ui.label(color_to_hex(self.highlight_color));
+            if ui.button("Save Color").clicked() {
+                push_recent_color(&mut self.recent_highlight_hex, self.highlight_color);
+            }
+        });
+
+        if !self.recent_highlight_hex.is_empty() {
+            ui.label("Recent Colors");
+            ui.horizontal_wrapped(|ui| {
+                for hex in self.recent_highlight_hex.clone() {
+                    if let Some(color) = parse_hex_color(&hex) {
+                        let swatch = egui::RichText::new("   ").background_color(color);
+                        if ui
+                            .add(egui::Button::new(swatch))
+                            .on_hover_text(hex.clone())
+                            .clicked()
+                        {
+                            self.highlight_color = color;
+                            self.custom_rgb = [color.r(), color.g(), color.b()];
+                        }
+                    }
+                }
+            });
+        }
+    }
+
+    #[cfg(not(feature = "desktop-ui"))]
+    pub(super) fn draw_settings_menu(&mut self, ui: &mut egui::Ui) {
+        ui.set_min_width(if self.is_touch_platform() {
+            280.0
+        } else {
+            TOOLBAR_MENU_MIN_WIDTH
+        });
+        self.draw_audio_settings_menu(ui);
+        Self::draw_toolbar_separator(ui);
+        self.draw_preferences_menu(ui);
+    }
+
+    #[cfg(feature = "desktop-ui")]
+    fn draw_desktop_menu_bar(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
+        let recent_files = self.recent_file_paths.clone();
+        let mut selected_recent_file: Option<PathBuf> = None;
+
+        egui::menu::bar(ui, |ui| {
+            ui.menu_button("File", |ui| {
+                ui.set_min_width(TOOLBAR_MENU_MIN_WIDTH);
+                if ui.button("Open Audio...").clicked() {
+                    self.import_audio_with_ctx(ctx);
+                    ui.close_menu();
+                }
+
+                ui.menu_button("Open Recent", |ui| {
+                    ui.set_min_width(TOOLBAR_MENU_MIN_WIDTH);
+                    if recent_files.is_empty() {
+                        ui.add_enabled(false, egui::Button::new("No recent files"));
+                        return;
+                    }
+
+                    for recent_path in recent_files.iter() {
+                        let label = recent_path
+                            .file_name()
+                            .and_then(|name| name.to_str())
+                            .unwrap_or("(unknown)");
+                        let response = ui
+                            .button(label)
+                            .on_hover_text(recent_path.display().to_string());
+                        if response.clicked() {
+                            selected_recent_file = Some(recent_path.clone());
+                            ui.close_menu();
+                        }
+                    }
+
+                    Self::draw_toolbar_separator(ui);
+                    if ui.button("Clear Recent").clicked() {
+                        self.recent_file_paths.clear();
+                        ui.close_menu();
+                    }
+                });
+            });
+
+            ui.menu_button("Settings", |ui| {
+                ui.set_min_width(TOOLBAR_MENU_MIN_WIDTH);
+                self.draw_audio_settings_menu(ui);
+            });
+
+            ui.menu_button("Preferences", |ui| {
+                ui.set_min_width(TOOLBAR_MENU_MIN_WIDTH);
+                self.draw_preferences_menu(ui);
+            });
+        });
+
+        if let Some(path) = selected_recent_file {
+            if let Err(err) = self.start_audio_loading_from_path(path, ctx) {
+                self.last_error = Some(err);
+            }
         }
     }
 
@@ -176,6 +256,9 @@ impl TranscriberApp {
         max_decimals: usize,
     ) -> bool {
         let mut changed = false;
+        let row_height = 22.0;
+        let slider_width = 142.0;
+        let input_width = 74.0;
 
         let dark = ui.visuals().dark_mode;
         let row_fill = if dark {
@@ -224,8 +307,10 @@ impl TranscriberApp {
                                 .x
                         })
                         .max(56.0);
-                    let (label_rect, _) =
-                        ui.allocate_exact_size(egui::vec2(label_width, 22.0), egui::Sense::hover());
+                    let (label_rect, _) = ui.allocate_exact_size(
+                        egui::vec2(label_width, row_height),
+                        egui::Sense::hover(),
+                    );
                     ui.painter().text(
                         label_rect.left_center(),
                         egui::Align2::LEFT_CENTER,
@@ -246,7 +331,7 @@ impl TranscriberApp {
 
                         changed |= ui
                             .add_sized(
-                                [142.0, 22.0],
+                                [slider_width, row_height],
                                 egui::Slider::new(value, min..=max)
                                     .show_value(false)
                                     .suffix(suffix),
@@ -255,7 +340,7 @@ impl TranscriberApp {
 
                         changed |= ui
                             .add_sized(
-                                [74.0, 22.0],
+                                [input_width, row_height],
                                 egui::DragValue::new(value)
                                     .clamp_range(min..=max)
                                     .speed(drag_speed)
@@ -275,10 +360,17 @@ impl TranscriberApp {
             egui::Frame::none()
                 .inner_margin(egui::Margin::symmetric(12.0, 10.0))
                 .show(ui, |ui| {
+                    #[cfg(feature = "desktop-ui")]
+                    {
+                        self.draw_desktop_menu_bar(ui, ctx);
+                        Self::draw_toolbar_separator(ui);
+                    }
+
                     ui.horizontal_wrapped(|ui| {
                         ui.spacing_mut().item_spacing.x = 12.0;
 
-                        if icon_button(ui, DOWNLOAD_SIMPLE, "Import Audio", true).clicked() {
+                        #[cfg(not(feature = "desktop-ui"))]
+                        if ui.button("Open Audio").clicked() {
                             self.import_audio_with_ctx(ctx);
                         }
 
@@ -309,11 +401,15 @@ impl TranscriberApp {
                             self.last_param_change_at = Some(Instant::now());
                         }
 
+                        #[cfg(not(feature = "desktop-ui"))]
                         let settings_popup_id = ui.make_persistent_id("settings_popup_menu");
+                        #[cfg(not(feature = "desktop-ui"))]
                         let settings_response = icon_button(ui, GEAR, "Settings", true);
+                        #[cfg(not(feature = "desktop-ui"))]
                         if settings_response.clicked() {
                             ui.memory_mut(|mem| mem.toggle_popup(settings_popup_id));
                         }
+                        #[cfg(not(feature = "desktop-ui"))]
                         egui::popup::popup_below_widget(
                             ui,
                             settings_popup_id,
@@ -325,6 +421,39 @@ impl TranscriberApp {
 
                         let pointer_down = ui.input(|i| i.pointer.primary_down());
                         self.maybe_commit_pending_param_change(pointer_down);
+                    });
+
+                    if self.is_touch_platform() {
+                        ui.horizontal_wrapped(|ui| {
+                            ui.label("Touch Navigation");
+                            if ui
+                                .selectable_label(!self.touch_loop_select_mode, "Pan")
+                                .clicked()
+                            {
+                                self.touch_loop_select_mode = false;
+                            }
+                            if ui
+                                .selectable_label(self.touch_loop_select_mode, "Loop Select")
+                                .clicked()
+                            {
+                                self.touch_loop_select_mode = true;
+                            }
+                            ui.label("Tap to seek, drag to pan, pinch to zoom.");
+                        });
+                    }
+
+                    #[cfg(not(feature = "desktop-ui"))]
+                    ui.horizontal_wrapped(|ui| {
+                        ui.label("Audio Path");
+                        let input_width = ui.available_width().clamp(180.0, 460.0);
+                        ui.add_sized(
+                            [input_width, 30.0],
+                            egui::TextEdit::singleline(&mut self.manual_import_path)
+                                .hint_text("/sdcard/Music/song.mp3"),
+                        );
+                        if ui.button("Open").clicked() {
+                            self.import_audio_from_manual_path(ctx);
+                        }
                     });
 
                     if let Some(err) = &self.last_error {

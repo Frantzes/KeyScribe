@@ -5,7 +5,7 @@
 
 #[cfg(feature = "desktop-ui")]
 use eframe::egui;
-#[cfg(feature = "desktop-ui")]
+#[cfg(feature = "native-ui")]
 use transcriber::app::TranscriberApp;
 
 #[cfg(feature = "desktop-ui")]
@@ -21,10 +21,10 @@ fn load_window_icon() -> Option<egui::IconData> {
     })
 }
 
-#[cfg(feature = "desktop-ui")]
-fn main() -> eframe::Result<()> {
-    let mut native_options = eframe::NativeOptions::default();
-    native_options.viewport = native_options.viewport.with_maximized(true);
+#[cfg(feature = "native-ui")]
+#[allow(unused_mut)]
+fn run_native_app(mut native_options: eframe::NativeOptions) -> eframe::Result<()> {
+    #[cfg(feature = "desktop-ui")]
     if let Some(icon) = load_window_icon() {
         native_options.viewport = native_options.viewport.with_icon(icon);
     }
@@ -36,7 +36,15 @@ fn main() -> eframe::Result<()> {
     )
 }
 
-#[cfg(not(feature = "desktop-ui"))]
+#[cfg(feature = "native-ui")]
+fn main() -> eframe::Result<()> {
+    let mut native_options = eframe::NativeOptions::default();
+    native_options.viewport = native_options.viewport.with_maximized(true);
+
+    run_native_app(native_options)
+}
+
+#[cfg(not(feature = "native-ui"))]
 fn main() {
-    eprintln!("Desktop UI is disabled. Enable the `desktop-ui` feature to run this binary.");
+    eprintln!("Native UI is disabled. Enable `desktop-ui` to run this binary.");
 }

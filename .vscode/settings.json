@@ -1,0 +1,8 @@
+{
+    "chat.tools.terminal.autoApprove": {
+        "/^rg -n \"not\\\\\\(feature = \\\\\"desktop-ui\\\\\"\\\\\\)\\|is_touch_platform\\\\\\(\\|touch_navigation\\|touch_loop_select_mode\\|manual_import_path\\|mobile_ui_tweaks_applied\" src/app\\.rs src/app/top_controls\\.rs src/ui/widgets\\.rs$/": {
+            "approve": true,
+            "matchCommandLine": true
+        }
+    }
+}

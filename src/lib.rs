@@ -9,11 +9,11 @@ pub mod preprocessing;
 pub mod ring_buffer;
 pub mod viterbi;
 
-#[cfg(feature = "desktop-ui")]
+#[cfg(feature = "native-ui")]
 pub mod app;
-#[cfg(feature = "desktop-ui")]
+#[cfg(feature = "native-ui")]
 pub mod playback;
-#[cfg(feature = "desktop-ui")]
+#[cfg(feature = "native-ui")]
 pub mod theme;
-#[cfg(feature = "desktop-ui")]
+#[cfg(feature = "native-ui")]
 pub mod ui;

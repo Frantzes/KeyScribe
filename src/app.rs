@@ -9,11 +9,14 @@ use std::time::{Duration, Instant};
 
 use bincode::Options;
 use eframe::egui;
-use egui_phosphor::regular::{DOWNLOAD_SIMPLE, GEAR};
+#[cfg(not(feature = "desktop-ui"))]
+use egui_phosphor::regular::GEAR;
 use egui_plot::{Line, Plot, PlotBounds, PlotPoints, Polygon, VLine};
 use rayon::prelude::*;
-use rfd::FileDialog;
 use serde::{Deserialize, Serialize};
+
+#[cfg(feature = "desktop-ui")]
+use rfd::FileDialog;
 
 use crate::analysis::{
     analyze_with_full_pipeline, detect_note_probabilities, detect_note_probabilities_cqt_preview,
@@ -29,6 +32,7 @@ use crate::ui::keyboard::{
     MIN_PROBABILITY_STRIP_HEIGHT, PIANO_ZOOM_MAX, PIANO_ZOOM_MIN, WHITE_KEY_LENGTH_TO_WIDTH,
 };
 use crate::ui::utils::{accent_soft, color_to_hex, parse_hex_color, push_recent_color};
+#[cfg(not(feature = "desktop-ui"))]
 use crate::ui::widgets::icon_button;
 
 mod cache;
@@ -61,6 +65,7 @@ const AUDIO_STREAM_CHUNK_SAMPLES: usize = 44_100;
 const AUDIO_LOADING_MAX_EVENTS_PER_FRAME: usize = 2;
 const TRANSCRIBE_PROGRESS_LOADING_WEIGHT: f32 = 0.35;
 const TRANSCRIBE_PROGRESS_MAX_BEFORE_DONE: f32 = 0.99;
+const MAX_RECENT_FILES: usize = 10;
 const PRESET_HIGHLIGHT_COLORS: [(&str, egui::Color32); 8] = [
     ("Orange", egui::Color32::from_rgb(255, 140, 45)),
     ("Sky", egui::Color32::from_rgb(72, 162, 255)),
@@ -142,9 +147,22 @@ fn default_highlight_hex() -> String {
     "#FF8C2D".to_string()
 }
 
+fn normalize_recent_file_key(path: &Path) -> String {
+    path.to_string_lossy().to_lowercase()
+}
+
+fn push_recent_file_path(recent_paths: &mut Vec<PathBuf>, path: &Path) {
+    let key = normalize_recent_file_key(path);
+    recent_paths.retain(|existing| normalize_recent_file_key(existing.as_path()) != key);
+    recent_paths.insert(0, path.to_path_buf());
+    recent_paths.truncate(MAX_RECENT_FILES);
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct PersistedState {
     last_file: Option<PathBuf>,
+    #[serde(default)]
+    recent_files: Vec<PathBuf>,
     selected_time_sec: f32,
     speed: f32,
     pitch_semitones: f32,
@@ -180,6 +198,7 @@ impl Default for PersistedState {
     fn default() -> Self {
         Self {
             last_file: None,
+            recent_files: Vec::new(),
             selected_time_sec: 0.0,
             speed: 1.0,
             pitch_semitones: 0.0,
@@ -589,6 +608,7 @@ pub struct TranscriberApp {
     piano_panel_height_needs_init: bool,
     piano_scroll_px: f32,
     piano_has_focus: bool,
+    piano_drag_last_x: Option<f32>,
     last_error: Option<String>,
     engine: Option<AudioEngine>,
     processing_rx: Option<Receiver<ProcessingResult>>,
@@ -619,6 +639,7 @@ pub struct TranscriberApp {
     dark_mode: bool,
     highlight_color: egui::Color32,
     custom_rgb: [u8; 3],
+    recent_file_paths: Vec<PathBuf>,
     recent_highlight_hex: Vec<String>,
     last_state_save_at: Instant,
     waveform_reset_view: bool,
@@ -641,6 +662,9 @@ pub struct TranscriberApp {
     loading_provisional_timeline: Vec<Vec<f32>>,
     loading_next_transcribe_time_sec: f32,
     loading_timeline_frames_pending_sync: usize,
+    touch_loop_select_mode: bool,
+    manual_import_path: String,
+    mobile_ui_tweaks_applied: bool,
 }
 
 struct ProcessingResult {
@@ -686,6 +710,13 @@ enum RebuildMode {
 impl TranscriberApp {
     pub fn new(_cc: &eframe::CreationContext<'_>) -> Self {
         let persisted = load_persisted_state();
+        let startup_path = persisted.last_file.clone();
+        let mut recent_file_paths = persisted.recent_files.clone();
+        if recent_file_paths.is_empty() {
+            if let Some(path) = startup_path.as_ref() {
+                push_recent_file_path(&mut recent_file_paths, path.as_path());
+            }
+        }
         let highlight_color = parse_hex_color(&persisted.highlight_hex).unwrap_or(ACCENT_ORANGE);
         apply_brand_theme(&_cc.egui_ctx, persisted.dark_mode, highlight_color);
 
@@ -715,6 +746,7 @@ impl TranscriberApp {
             piano_panel_height_needs_init: true,
             piano_scroll_px: 0.0,
             piano_has_focus: false,
+            piano_drag_last_x: None,
             last_error: None,
             engine: AudioEngine::new_with_output_device(
                 persisted.audio_output_device_id.as_deref(),
@@ -752,6 +784,7 @@ impl TranscriberApp {
                 highlight_color.g(),
                 highlight_color.b(),
             ],
+            recent_file_paths,
             recent_highlight_hex: persisted.recent_highlight_hex,
             last_state_save_at: Instant::now(),
             waveform_reset_view: true,
@@ -774,6 +807,12 @@ impl TranscriberApp {
             loading_provisional_timeline: Vec::new(),
             loading_next_transcribe_time_sec: 0.0,
             loading_timeline_frames_pending_sync: 0,
+            touch_loop_select_mode: false,
+            manual_import_path: startup_path
+                .as_ref()
+                .map(|path| path.to_string_lossy().to_string())
+                .unwrap_or_default(),
+            mobile_ui_tweaks_applied: false,
         };
 
         app.refresh_audio_output_devices();
@@ -789,7 +828,7 @@ impl TranscriberApp {
             engine.set_volume(app.playback_volume);
         }
 
-        if let Some(path) = persisted.last_file {
+        if let Some(path) = startup_path {
             if is_safe_startup_audio_path(path.as_path()) {
                 app.start_audio_loading(path, &_cc.egui_ctx);
             }
@@ -826,6 +865,33 @@ impl TranscriberApp {
             ctx.send_viewport_cmd(egui::ViewportCommand::MinInnerSize(size));
             self.startup_min_window_size_locked = true;
         }
+    }
+
+    pub(super) fn is_touch_platform(&self) -> bool {
+        false
+    }
+
+    fn apply_mobile_ui_tweaks_once(&mut self, ctx: &egui::Context) {
+        if !self.is_touch_platform() || self.mobile_ui_tweaks_applied {
+            return;
+        }
+
+        let mut style = (*ctx.style()).clone();
+        style.spacing.interact_size.x = style.spacing.interact_size.x.max(42.0);
+        style.spacing.interact_size.y = style.spacing.interact_size.y.max(42.0);
+        style.spacing.slider_width = style.spacing.slider_width.max(176.0);
+        style.spacing.item_spacing.x = style.spacing.item_spacing.x.max(10.0);
+        style.spacing.item_spacing.y = style.spacing.item_spacing.y.max(10.0);
+
+        style
+            .text_styles
+            .insert(egui::TextStyle::Button, egui::FontId::proportional(18.0));
+        style
+            .text_styles
+            .insert(egui::TextStyle::Body, egui::FontId::proportional(17.0));
+
+        ctx.set_style(style);
+        self.mobile_ui_tweaks_applied = true;
     }
 
     fn is_playing(&self) -> bool {
@@ -1202,14 +1268,66 @@ impl TranscriberApp {
         true
     }
 
+    fn start_audio_loading_from_path(
+        &mut self,
+        input_path: PathBuf,
+        ctx: &egui::Context,
+    ) -> Result<(), String> {
+        let path = if input_path.is_absolute() {
+            input_path
+        } else {
+            match std::env::current_dir() {
+                Ok(cwd) => cwd.join(&input_path),
+                Err(_) => input_path,
+            }
+        };
+
+        if !is_supported_audio_extension(path.as_path()) {
+            return Err("Unsupported audio format. Use wav, mp3, flac, ogg, m4a, or aac.".into());
+        }
+        if !path.is_file() {
+            return Err(format!("Audio file not found: {}", path.display()));
+        }
+
+        self.manual_import_path = path.to_string_lossy().to_string();
+        self.start_audio_loading(path, ctx);
+        Ok(())
+    }
+
+    #[cfg(not(feature = "desktop-ui"))]
+    pub(super) fn import_audio_from_manual_path(&mut self, ctx: &egui::Context) {
+        let path = self.manual_import_path.trim();
+        if path.is_empty() {
+            self.last_error = Some("Enter an audio file path before opening.".to_string());
+            return;
+        }
+
+        match self.start_audio_loading_from_path(PathBuf::from(path), ctx) {
+            Ok(()) => {
+                self.last_error = None;
+            }
+            Err(err) => {
+                self.last_error = Some(err);
+            }
+        }
+    }
+
+    #[cfg(feature = "desktop-ui")]
     fn import_audio_with_ctx(&mut self, ctx: &egui::Context) {
         let picked = FileDialog::new()
             .add_filter("Audio", &["wav", "mp3", "flac", "ogg", "m4a", "aac"])
             .pick_file();
 
         if let Some(path) = picked {
-            self.start_audio_loading(path.to_path_buf(), ctx);
+            if let Err(err) = self.start_audio_loading_from_path(path.to_path_buf(), ctx) {
+                self.last_error = Some(err);
+            }
         }
+    }
+
+    #[cfg(not(feature = "desktop-ui"))]
+    fn import_audio_with_ctx(&mut self, ctx: &egui::Context) {
+        self.import_audio_from_manual_path(ctx);
     }
 
     #[allow(dead_code)]
@@ -1586,6 +1704,7 @@ impl TranscriberApp {
     fn save_state_to_disk(&self) {
         let state = PersistedState {
             last_file: self.loaded_path.clone(),
+            recent_files: self.recent_file_paths.clone(),
             selected_time_sec: self.selected_time_sec,
             speed: self.speed,
             pitch_semitones: self.pitch_semitones,
@@ -1844,6 +1963,39 @@ impl TranscriberApp {
         }
     }
 
+    fn shift_loop_by_seconds(&mut self, delta_sec: f32) -> bool {
+        if !self.loop_enabled {
+            return false;
+        }
+
+        let Some((a, b)) = self.loop_selection else {
+            return false;
+        };
+
+        let start = a.min(b);
+        let end = a.max(b);
+        let loop_len = end - start;
+        if loop_len <= LOOP_MIN_DURATION_SEC {
+            return false;
+        }
+
+        let duration = self.source_duration();
+        let max_start = (duration - loop_len).max(0.0);
+        let new_start = (start + delta_sec).clamp(0.0, max_start);
+        let new_end = (new_start + loop_len).min(duration);
+
+        self.loop_selection = Some((new_start, new_end));
+        self.loop_playback_enabled = true;
+        self.selected_time_sec = (self.selected_time_sec + delta_sec).clamp(new_start, new_end);
+        self.update_note_probabilities(true);
+
+        if self.is_playing() {
+            self.play_range(self.selected_time_sec, Some(new_end));
+        }
+
+        true
+    }
+
     fn skip_by_seconds(&mut self, delta_sec: f32) {
         if self.audio_raw.is_none() || self.processed_samples.is_empty() {
             return;
@@ -1950,6 +2102,59 @@ impl TranscriberApp {
         }
     }
 
+    fn handle_toggle_play_pause(&mut self) {
+        if self.audio_raw.is_none() || self.processed_samples.is_empty() {
+            return;
+        }
+
+        if self.is_playing() {
+            if let Some(engine) = &mut self.engine {
+                engine.pause();
+            }
+            return;
+        }
+
+        let can_resume_existing = self
+            .engine
+            .as_ref()
+            .map(|engine| engine.has_active_sink())
+            .unwrap_or(false);
+
+        if self.loop_enabled {
+            if let Some((a, b)) = self.loop_selection {
+                let start = a.min(b);
+                let end = a.max(b);
+                if end - start > LOOP_MIN_DURATION_SEC {
+                    self.loop_playback_enabled = true;
+
+                    if can_resume_existing {
+                        if let Some(engine) = &mut self.engine {
+                            engine.resume();
+                        }
+                    } else {
+                        let current_pos = self.current_position_sec();
+                        let restart_from = if current_pos < start || current_pos >= end - 0.01 {
+                            start
+                        } else {
+                            current_pos.clamp(start, end)
+                        };
+                        self.selected_time_sec = restart_from;
+                        self.play_range(restart_from, Some(end));
+                    }
+                    return;
+                }
+            }
+        }
+
+        if can_resume_existing {
+            if let Some(engine) = &mut self.engine {
+                engine.resume();
+            }
+        } else {
+            self.play_from_selected();
+        }
+    }
+
     fn stop(&mut self) {
         if let Some(engine) = &mut self.engine {
             engine.stop();
@@ -1994,15 +2199,37 @@ impl eframe::App for TranscriberApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         apply_brand_theme(ctx, self.dark_mode, self.highlight_color);
         self.lock_startup_min_window_size_once(ctx);
+        self.apply_mobile_ui_tweaks_once(ctx);
 
-        if ctx.input(|i| i.key_pressed(egui::Key::Space)) {
+        let (space_pressed, k_pressed, left_pressed, right_pressed, ctrl_held) = ctx.input(|i| {
+            (
+                i.key_pressed(egui::Key::Space),
+                i.key_pressed(egui::Key::K),
+                i.key_pressed(egui::Key::ArrowLeft),
+                i.key_pressed(egui::Key::ArrowRight),
+                i.modifiers.ctrl,
+            )
+        });
+
+        if space_pressed {
             self.handle_space_replay();
         }
-        if ctx.input(|i| i.key_pressed(egui::Key::ArrowLeft)) {
-            self.skip_by_seconds(-SEEK_STEP_SEC);
+        if k_pressed {
+            self.handle_toggle_play_pause();
         }
-        if ctx.input(|i| i.key_pressed(egui::Key::ArrowRight)) {
-            self.skip_by_seconds(SEEK_STEP_SEC);
+        if left_pressed {
+            if ctrl_held && self.shift_loop_by_seconds(-SEEK_STEP_SEC) {
+                // Ctrl+Arrow shifts loop range when looping is active.
+            } else {
+                self.skip_by_seconds(-SEEK_STEP_SEC);
+            }
+        }
+        if right_pressed {
+            if ctrl_held && self.shift_loop_by_seconds(SEEK_STEP_SEC) {
+                // Ctrl+Arrow shifts loop range when looping is active.
+            } else {
+                self.skip_by_seconds(SEEK_STEP_SEC);
+            }
         }
 
         self.poll_audio_loading(ctx);
@@ -2092,14 +2319,18 @@ impl eframe::App for TranscriberApp {
                 self.piano_has_focus = true;
             }
 
-            let (raw, smooth, shift, ctrl) = ui.ctx().input(|i| {
-                (
-                    i.raw_scroll_delta,
-                    i.smooth_scroll_delta,
-                    i.modifiers.shift,
-                    i.modifiers.ctrl,
-                )
-            });
+            let (raw, smooth, shift, ctrl, zoom_delta, pointer_down, pointer_pos) =
+                ui.ctx().input(|i| {
+                    (
+                        i.raw_scroll_delta,
+                        i.smooth_scroll_delta,
+                        i.modifiers.shift,
+                        i.modifiers.ctrl,
+                        i.zoom_delta_2d(),
+                        i.pointer.primary_down(),
+                        i.pointer.interact_pos(),
+                    )
+                });
             let wheel_y = if raw.y.abs() > f32::EPSILON {
                 raw.y
             } else {
@@ -2107,13 +2338,37 @@ impl eframe::App for TranscriberApp {
             };
 
             if self.piano_has_focus && pane_hovered {
-                if ctrl && wheel_y.abs() > f32::EPSILON {
-                    let z = if wheel_y > 0.0 { 1.08 } else { 0.92 };
-                    self.piano_zoom = (self.piano_zoom * z).clamp(PIANO_ZOOM_MIN, PIANO_ZOOM_MAX);
-                } else if shift && wheel_y.abs() > f32::EPSILON {
-                    self.piano_scroll_px =
-                        (self.piano_scroll_px - wheel_y * 0.7).clamp(0.0, max_scroll_px);
+                if self.is_touch_platform() {
+                    if pointer_down {
+                        if let Some(pos) = pointer_pos {
+                            if let Some(last_x) = self.piano_drag_last_x {
+                                let delta_x = pos.x - last_x;
+                                self.piano_scroll_px =
+                                    (self.piano_scroll_px - delta_x).clamp(0.0, max_scroll_px);
+                            }
+                            self.piano_drag_last_x = Some(pos.x);
+                        }
+                    } else {
+                        self.piano_drag_last_x = None;
+                    }
+
+                    if (zoom_delta.y - 1.0).abs() > f32::EPSILON {
+                        self.piano_zoom =
+                            (self.piano_zoom * zoom_delta.y).clamp(PIANO_ZOOM_MIN, PIANO_ZOOM_MAX);
+                    }
+                } else {
+                    self.piano_drag_last_x = None;
+                    if ctrl && wheel_y.abs() > f32::EPSILON {
+                        let z = if wheel_y > 0.0 { 1.08 } else { 0.92 };
+                        self.piano_zoom =
+                            (self.piano_zoom * z).clamp(PIANO_ZOOM_MIN, PIANO_ZOOM_MAX);
+                    } else if shift && wheel_y.abs() > f32::EPSILON {
+                        self.piano_scroll_px =
+                            (self.piano_scroll_px - wheel_y * 0.7).clamp(0.0, max_scroll_px);
+                    }
                 }
+            } else {
+                self.piano_drag_last_x = None;
             }
 
             ui.separator();
@@ -2321,16 +2576,24 @@ impl eframe::App for TranscriberApp {
                     let dragged = plot_ui.response().dragged();
                     let drag_stopped = plot_ui.response().drag_stopped();
                     let clicked = plot_ui.response().clicked();
-                    let (raw_scroll, smooth_scroll, shift_held, ctrl_held, zoom_delta) =
-                        plot_ui.ctx().input(|i| {
-                            (
-                                i.raw_scroll_delta,
-                                i.smooth_scroll_delta,
-                                i.modifiers.shift,
-                                i.modifiers.ctrl,
-                                i.zoom_delta_2d(),
-                            )
-                        });
+                    let (
+                        raw_scroll,
+                        smooth_scroll,
+                        shift_held,
+                        ctrl_held,
+                        zoom_delta,
+                        pointer_delta,
+                    ) = plot_ui.ctx().input(|i| {
+                        (
+                            i.raw_scroll_delta,
+                            i.smooth_scroll_delta,
+                            i.modifiers.shift,
+                            i.modifiers.ctrl,
+                            i.zoom_delta_2d(),
+                            i.pointer.delta(),
+                        )
+                    });
+                    let touch_navigation = self.is_touch_platform();
 
                     let wheel_y = if raw_scroll.y.abs() > f32::EPSILON {
                         raw_scroll.y
@@ -2351,7 +2614,14 @@ impl eframe::App for TranscriberApp {
                     if hovered {
                         let span = (b.max()[0] - b.min()[0]).max(0.001);
 
-                        if shift_held
+                        if touch_navigation && !self.touch_loop_select_mode && dragged {
+                            let drag_width = plot_ui.response().rect.width().max(1.0) as f64;
+                            let shift_amount = -(pointer_delta.x as f64) * (span / drag_width);
+                            b = PlotBounds::from_min_max(
+                                [b.min()[0] + shift_amount, b.min()[1]],
+                                [b.max()[0] + shift_amount, b.max()[1]],
+                            );
+                        } else if shift_held
                             && (wheel_y.abs() > f32::EPSILON || wheel_x.abs() > f32::EPSILON)
                         {
                             let dominant_wheel = if wheel_x.abs() > wheel_y.abs() {
@@ -2364,8 +2634,12 @@ impl eframe::App for TranscriberApp {
                                 [b.min()[0] + shift_amount, b.min()[1]],
                                 [b.max()[0] + shift_amount, b.max()[1]],
                             );
-                        } else if ctrl_held {
-                            let zoom_from_wheel = if wheel_y.abs() > f32::EPSILON {
+                        }
+
+                        let touch_pinch =
+                            touch_navigation && (zoom_delta.y - 1.0).abs() > f32::EPSILON;
+                        if ctrl_held || touch_pinch {
+                            let zoom_from_wheel = if ctrl_held && wheel_y.abs() > f32::EPSILON {
                                 if wheel_y > 0.0 {
                                     0.88
                                 } else {
@@ -2420,13 +2694,18 @@ impl eframe::App for TranscriberApp {
                     plot_ui
                         .set_plot_bounds(PlotBounds::from_min_max([min_x, -1.05], [max_x, 1.05]));
 
-                    if analysis_ready && drag_started {
+                    let allow_loop_drag = !touch_navigation || self.touch_loop_select_mode;
+                    if !allow_loop_drag {
+                        self.drag_select_anchor_sec = None;
+                    }
+
+                    if analysis_ready && allow_loop_drag && drag_started {
                         self.drag_select_anchor_sec = pointer
                             .map(|p| p.x.clamp(0.0, source_duration as f64) as f32)
                             .or(Some(self.selected_time_sec));
                     }
 
-                    if analysis_ready && dragged {
+                    if analysis_ready && allow_loop_drag && dragged {
                         if let (Some(anchor), Some(p)) = (
                             self.drag_select_anchor_sec,
                             pointer.map(|p| p.x.clamp(0.0, source_duration as f64) as f32),
@@ -2435,7 +2714,7 @@ impl eframe::App for TranscriberApp {
                         }
                     }
 
-                    if analysis_ready && drag_stopped {
+                    if analysis_ready && allow_loop_drag && drag_stopped {
                         if let Some((a, b)) = self.loop_selection {
                             if (a - b).abs() < LOOP_MIN_DURATION_SEC {
                                 self.loop_selection = None;

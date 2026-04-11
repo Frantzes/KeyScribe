@@ -1,330 +1,121 @@
-# Audio Transcriber - Professional Polyphonic Note Detection
+# Transcriber
 
-A high-accuracy Rust-based audio transcriber with professional-grade polyphonic note detection. Features both instant FFT analysis and CQT Pro Mode with HPSS preprocessing and Viterbi smoothing for 15-20% accuracy improvement.
+Transcriber is desktop app for polyphonic note detection from recorded audio.
+Built in Rust. Optimized for accuracy, responsiveness, portable distribution.
 
-## Features
+## Product Overview
 
-### Core Capabilities
-- **Real-time Waveform Visualization**: Live audio display with frequency spectrum
-- **Multi-format Audio Support**: WAV, MP3, FLAC, OGG (via Symphonia)
-- **Piano Visualization**: 88-key piano showing detected notes
-- **Dual Analysis Modes**:
-  - **Standard Mode** (FFT): Instant frame-by-frame analysis
-  - **CQT Pro Mode**: Professional pipeline with HPSS + Viterbi smoothing
+- Real-time waveform and piano visualization.
+- Audio import support: wav, mp3, flac, ogg, m4a, aac.
+- Two analysis modes: Standard mode for fast feedback, CQT Pro mode for cleaner note stability and fewer ghost notes.
+- Cross-platform desktop bundles for Windows, macOS, Linux.
 
-### CQT Pro Mode (New!)
-Activate "Use CQT Analysis (Pro Mode)" for:
-- **95% Ghost Note Reduction**: False positive notes nearly eliminated
-- **Superior Chord Detection**: 95% accuracy on polyphonic music
-- **Harmonic-Percussive Separation**: Drums/percussion factored out
-- **HMM Smoothing**: Intelligently removes one-frame glitches
-- **Logarithmic Frequency Bins**: Musical note representation (1 bin per semitone)
+## How It Works
+
+Transcriber processes full audio file in deterministic DSP pipeline:
+
+1. Decode audio to mono sample stream.
+2. Optional preprocessing separates harmonic content from percussive noise.
+3. Compute spectral representation (FFT or CQT-based path).
+4. Estimate per-frame note probabilities across piano range (A0 to C8).
+5. Apply temporal smoothing (Viterbi-style decoding + duration filtering).
+6. Render timeline, waveform, and 88-key activity in UI.
+
+Result: stable note timeline better suited for transcription workflow than raw frame-by-frame peaks.
 
 ## Quick Start
 
-### Build
+Prerequisites:
+
+- Rust 1.70+
+- Windows, macOS, or Linux
+
+Build release:
+
 ```bash
 cargo build --release
 ```
 
-### Run
+Run app:
+
 ```bash
 cargo run --release
 ```
 
-### Build Portable Windows Bundle
+## Portable Builds
+
+### Windows
+
 ```powershell
 powershell -ExecutionPolicy Bypass -File scripts/build-windows.ps1
 ```
 
-Output artifacts are created under `build/windows/`:
-- `build/windows/transcriber-windows-x64/`
-- `build/windows/transcriber-windows-x64.zip`
+Outputs:
 
-### Enable Pro Mode
-1. Load an audio file
-2. Check "Use CQT Analysis (Pro Mode)" in settings
-3. Observe improved transcription accuracy
+- build/windows/transcriber-windows-x64/
+- build/windows/transcriber-windows-x64.zip
 
-## Documentation
+### macOS
 
-### User Guides
-- **[CQT_PRO_MODE.md](CQT_PRO_MODE.md)** - Quick start, tuning, troubleshooting, benchmarks
-- **[HFSFORMER_IMPLEMENTATION.md](HFSFORMER_IMPLEMENTATION.md)** - Technical deep dive, architecture, algorithm details
-
-### Key Technologies
-```
-Rust 2021 Edition
-├─ rustfft: Fast Fourier Transform
-├─ ndarray: N-dimensional arrays
-├─ crossbeam: Multi-threaded coordination
-├─ rayon: Parallel processing (HPSS)
-├─ egui: UI framework
-├─ symphonia: Audio decoding
-├─ rodio: Audio playback
-└─ ort: ONNX Runtime (for future model integration)
-```
-
----
-
-## Architecture
-
-### File-Based Pipeline
-```
-Input Audio (WAV/MP3/FLAC/OGG)
-    ↓
-Frame-by-frame STFT (2048 FFT, 512 hop)
-    ↓
-HPSS Separation (Median Filtering)
-    │  ├─ Harmonic stream (sustained notes)
-    │  └─ Percussive stream (discarded)
-    ↓
-Harmonic CQT Transform (88 piano keys)
-    ↓
-Note Probability Extraction (per-frame)
-    ↓
-Viterbi Decoding (HMM smoothing)
-    ├─ Forward pass: Compute state probabilities
-    ├─ Backward pass: Reconstruct optimal path
-    └─ Lookahead: 5-frame planning window
-    ↓
-Temporal Smoothing (Enforce 2+ frame duration)
-    ↓
-Final Binary Note Activations
-    ↓
-UI Piano Visualization & Playback Controls
-```
-
-### Module Breakdown
-
-| Module | Lines | Purpose |
-|--------|-------|---------|
-| `src/cqt.rs` | 254 | Constant-Q Transform engine |
-| `src/preprocessing.rs` | 332 | HPSS + STFT computation |
-| `src/viterbi.rs` | 318 | HMM-based smoothing |
-| `src/inference.rs` | 186 | ONNX model wrapper (framework) |
-| `src/pipeline.rs` | 200 | Pipeline orchestration |
-| `src/analysis.rs` | Extended | CQT bridge functions |
-| `src/app.rs` | Modified | UI toggle integration |
-
----
-
-## Configuration
-
-### Most Common Tuning
-
-**For better accuracy** (fewer false positives):
-```
-In src/viterbi.rs:
-confidence_threshold: 0.7 → 0.8
-transition_cost: 0.2 → 0.4
-```
-
-**For faster response** (more latency):
-```
-In src/pipeline.rs:
-lookahead_frames: 5 → 2
-```
-
-See [CQT_PRO_MODE.md](CQT_PRO_MODE.md#performance-tuning) for detailed tuning guide.
-
----
-
-## Performance
-
-### Build Time
-- Debug: ~15 seconds
-- Release: ~45 seconds
-
-### Runtime (Release Build)
-| Duration | CPU Time | Memory |
-|----------|----------|--------|
-| 1 min audio | ~250ms | ~100MB |
-| 5 min audio | ~1.2s | ~150MB |
-| 10 min audio | ~2.5s | ~200MB |
-
-*Benchmarks on Intel i7 (quad-core), CQT Pro Mode enabled*
-
-### Accuracy
-- **Standard FFT Mode**: ~70% chord accuracy
-- **CQT Pro Mode**: ~95% chord accuracy
-- **Ghost Note Reduction**: 95% fewer false positives
-
----
-
-## Project Structure
-
-```
-.
-├── Cargo.toml                      # Dependencies
-├── src/
-│   ├── main.rs                      # Entry point
-│   ├── app.rs                       # UI application (egui)
-│   ├── analysis.rs                  # Note detection (FFT + CQT)
-│   ├── audio_io.rs                  # Audio input/output
-│   ├── playback.rs                  # Playback control
-│   ├── dsp.rs                       # DSP primitives
-│   ├── theme.rs                     # UI styling
-│   │
-│   ├── cqt.rs                      # *NEW* Constant-Q Transform
-│   ├── preprocessing.rs             # *NEW* HPSS engine
-│   ├── viterbi.rs                   # *NEW* HMM smoothing
-│   ├── inference.rs                 # *NEW* ONNX wrapper
-│   ├── pipeline.rs                  # *NEW* Pipeline coordinator
-│   └── ring_buffer.rs               # *NEW* Thread-safe buffer
-│
-└── docs/
-    ├── README.md                    # This file
-    ├── HFSFORMER_IMPLEMENTATION.md   # Technical reference
-    └── CQT_PRO_MODE.md              # User guide
-```
-
----
-
-## Future Enhancements
-
-- [ ] MIDI output to DAW
-- [ ] Real-time microphone input (live transcription)
-- [ ] ONNX model integration (HFSFormer transformer)
-- [ ] Polyphonic MIDI generation
-- [ ] Drum transcription
-- [ ] Vocal detection
-- [ ] Export to MusicXML/ABC notation
-- [ ] Multi-language UI
-
----
-
-## Development
-
-### Prerequisites
-- Rust 1.70+
-- Windows 10+ or Linux (macOS untested)
-
-### Install Rust
 ```bash
-curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
+chmod +x scripts/build-macos.sh
+./scripts/build-macos.sh
 ```
 
-### Build Debug
+Outputs:
+
+- build/macos/transcriber-macos-arm64/ or build/macos/transcriber-macos-x64/
+- build/macos/transcriber-macos-arm64.zip or build/macos/transcriber-macos-x64.zip
+
+### Linux
+
 ```bash
-cargo build
+chmod +x scripts/build-linux.sh
+./scripts/build-linux.sh
 ```
 
-### Build Release (Recommended)
+Outputs:
+
+- build/linux/transcriber-linux-x64/ or build/linux/transcriber-linux-arm64/
+- build/linux/transcriber-linux-x64.zip or build/linux/transcriber-linux-arm64.zip
+
+## Automated Releases (Tags)
+
+Tag push triggers [.github/workflows/release-on-tag.yml](.github/workflows/release-on-tag.yml).
+Workflow builds Windows, macOS, Linux bundles and uploads zip artifacts to GitHub Release.
+
 ```bash
-cargo build --release
+git tag v0.1.0
+git push origin v0.1.0
 ```
 
-### Run Tests
-```bash
-cargo test --lib
-```
+## Usage Flow
 
-### Check for Warnings
-```bash
-cargo build --release 2>&1 | grep "warning:"
-```
+1. Open audio file.
+2. Pick analysis mode.
+3. Play, seek, inspect waveform and piano roll.
+4. Tune speed or pitch preview if needed.
+5. Use note activity timeline for transcription decisions.
 
----
+## Technical Notes
 
-## Known Limitations
+- UI: eframe/egui
+- Audio decode: Symphonia
+- Playback: rodio
+- DSP core: rustfft + custom CQT, preprocessing, viterbi modules
+- Optional model integration path: ONNX Runtime crate (ort)
 
-1. **File-based only** (for now): Processes complete audio files, not live streams
-2. **Piano range only**: A0 (27.5 Hz) to C8 (4186 Hz)
-3. **Polyphony limit**: 88 simultaneous notes max
-4. **No chord labeling**: Raw note output, no semantic interpretation
-5. **No lyrics/timing**: Transcription only, no lyrics sync
-6. **Latency**: CQT Pro Mode has 100-200ms intentional latency for better smoothing
+## Limitations
 
----
+- File-based workflow only, no live microphone transcription yet.
+- Outputs note activations, not chord names or notation export.
+- CQT Pro mode introduces intentional smoothing latency for stability.
 
-## Performance Tips
+## More Documentation
 
-### For Large Files (10+ minutes)
-```bash
-# Use release build (10x faster)
-cargo build --release
-cargo run --release
-
-# Reduce lookahead for faster processing
-# In src/pipeline.rs: lookahead_frames: 5 → 2
-```
-
-### For Real-Time Feedback
-```bash
-# Reduce confidence threshold
-# In src/viterbi.rs: confidence_threshold: 0.6 → 0.4
-```
-
-### For Production Use
-```bash
-# Increase confidence threshold for accuracy
-# In src/viterbi.rs: confidence_threshold: 0.6 → 0.8
-```
-
----
-
-## Troubleshooting
-
-### App won't start
-```bash
-cargo build --release
-cargo run --release
-```
-
-### Audio file won't load
-- Verify file format is WAV, MP3, FLAC, or OGG
-- Check file is not corrupted
-- Try with a different file
-
-### CQT Pro Mode missing
-- Rebuild: `cargo build --release`
-- Check "Use CQT Analysis (Pro Mode)" appears in settings
-- If missing, verify src/app.rs has CQT integration
-
-### Poor transcription accuracy
-- Try release build (better optimizations)
-- Adjust confidence threshold (see [CQT_PRO_MODE.md](CQT_PRO_MODE.md#performance-tuning))
-- Test with high-quality audio files
-- Try with simpler pieces (single instrument)
-
----
-
-## References
-
-### Algorithms
-- **HPSS**: Fitzgerald, D. (2014). "Simple Tools for Music Source Separation"
-- **Viterbi**: Rabiner, L. R. & Juang, B. H. (1993). "Fundamentals of Speech Recognition"
-- **CQT**: Ellis, D. (2005). "Constant-Q Transform"
-
-### Libraries
-- [Symphonia](https://github.com/pdeljanov/symphonia) - Audio decoding
-- [egui](https://github.com/emilk/egui) - UI framework
-- [rustfft](https://github.com/ejmg/RustFFT) - FFT computation
-- [ort](https://github.com/pykeio/ort) - ONNX Runtime
-
----
+- [CQT_PRO_MODE.md](CQT_PRO_MODE.md)
+- [HFSFORMER_IMPLEMENTATION.md](HFSFORMER_IMPLEMENTATION.md)
 
 ## License
 
-MIT License - See LICENSE file
-
----
-
-## Contributing
-
-Contributions welcome! Areas of interest:
-- ONNX model integration
-- Real-time audio producer thread
-- MIDI output dispatcher
-- Chord labeling/classification
-- Drum transcription
-- Test improvements
-
----
-
-**Status**: ✅ Production Ready
-
-Last updated: March 2026  
-Rust Edition: 2021  
-Minimum Rust: 1.70.0
+MIT. See LICENSE.

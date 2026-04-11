@@ -87,6 +87,7 @@ impl TranscriberApp {
         self.stop();
 
         self.loaded_path = Some(path.clone());
+        push_recent_file_path(&mut self.recent_file_paths, path.as_path());
         self.loaded_audio_hash = None;
         self.selected_time_sec = 0.0;
         self.audio_raw = None;
