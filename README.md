@@ -1,6 +1,6 @@
-# Transcriber
+# KeyScribe
 
-Transcriber is desktop app for polyphonic note detection from recorded audio.
+KeyScribe is desktop app for polyphonic note detection from recorded audio.
 Built in Rust. Optimized for accuracy, responsiveness, portable distribution.
 
 > Status: Beta (active development).
@@ -15,7 +15,7 @@ Built in Rust. Optimized for accuracy, responsiveness, portable distribution.
 
 ## How It Works
 
-Transcriber processes full audio file in deterministic DSP pipeline:
+KeyScribe processes full audio file in deterministic DSP pipeline:
 
 1. Decode audio to mono sample stream.
 2. Optional preprocessing separates harmonic content from percussive noise.
@@ -55,8 +55,8 @@ powershell -ExecutionPolicy Bypass -File scripts/build-windows.ps1
 
 Outputs:
 
-- build/windows/transcriber-windows-x64/
-- build/windows/transcriber-windows-x64.zip
+- build/windows/keyscribe-windows-x64/
+- build/windows/keyscribe-windows-x64.zip
 
 ### macOS
 
@@ -68,15 +68,15 @@ chmod +x scripts/build-macos.sh
 Outputs:
 
 - Portable:
-- build/macos/transcriber-macos-arm64/
-- build/macos/transcriber-macos-arm64.zip
+- build/macos/keyscribe-macos-arm64/
+- build/macos/keyscribe-macos-arm64.zip
 - App bundle archive:
-- build/macos/transcriber-macos-arm64-app/Transcriber.app
-- (disabled in current CI) build/macos/transcriber-macos-arm64-app.zip
+- build/macos/keyscribe-macos-arm64-app/KeyScribe.app
+- (disabled in current CI) build/macos/keyscribe-macos-arm64-app.zip
 - Drag-and-drop installer:
-- build/macos/transcriber-macos-arm64.dmg
+- build/macos/keyscribe-macos-arm64.dmg
 - Package installer:
-- (disabled in current CI) build/macos/transcriber-macos-arm64.pkg
+- (disabled in current CI) build/macos/keyscribe-macos-arm64.pkg
 
 For installed `.app` runs on macOS, app state and analysis cache are stored in user Library locations (not inside the app bundle), so installs under `/Applications` remain writable for cache updates.
 
@@ -89,8 +89,8 @@ chmod +x scripts/build-linux.sh
 
 Outputs:
 
-- build/linux/transcriber-linux-x64/ or build/linux/transcriber-linux-arm64/
-- build/linux/transcriber-linux-x64.zip or build/linux/transcriber-linux-arm64.zip
+- build/linux/keyscribe-linux-x64/ or build/linux/keyscribe-linux-arm64/
+- build/linux/keyscribe-linux-x64.zip or build/linux/keyscribe-linux-arm64.zip
 
 ## Automated Releases (Tags)
 

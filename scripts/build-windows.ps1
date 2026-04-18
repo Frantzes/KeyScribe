@@ -20,10 +20,10 @@ try {
         }
     }
 
-    $binaryName = "transcriber.exe"
+    $bundleBinaryName = "keyscribe.exe"
     $binaryCandidates = @(
-        (Join-Path $repoRoot "target/$Target/release/$binaryName"),
-        (Join-Path $repoRoot "target/release/$binaryName")
+        (Join-Path $repoRoot "target/$Target/release/$bundleBinaryName"),
+        (Join-Path $repoRoot "target/release/$bundleBinaryName")
     )
 
     $binaryPath = $null
@@ -35,10 +35,10 @@ try {
     }
 
     if (-not $binaryPath) {
-        throw "Could not find $binaryName in target/$Target/release or target/release"
+        throw "Could not find $bundleBinaryName in target/$Target/release or target/release"
     }
 
-    $bundleName = "transcriber-windows-x64"
+    $bundleName = "keyscribe-windows-x64"
     $bundleDir = Join-Path $repoRoot "$OutputRoot/$bundleName"
     $modelsDir = Join-Path $bundleDir "models"
 
@@ -47,7 +47,7 @@ try {
     }
     New-Item -ItemType Directory -Path $modelsDir -Force | Out-Null
 
-    Copy-Item -Path $binaryPath -Destination (Join-Path $bundleDir $binaryName) -Force
+    Copy-Item -Path $binaryPath -Destination (Join-Path $bundleDir $bundleBinaryName) -Force
 
     $modelPath = Join-Path $repoRoot "models/basic-pitch.onnx"
     if (-not (Test-Path $modelPath)) {
@@ -78,19 +78,19 @@ try {
         Copy-Item -Path $directMlPath -Destination (Join-Path $bundleDir "DirectML.dll") -Force
         Write-Host "Included DirectML.dll from: $directMlPath"
     } else {
-        Write-Warning "DirectML.dll not found. If the app fails to start on another machine, include DirectML.dll next to transcriber.exe."
+        Write-Warning "DirectML.dll not found. If the app fails to start on another machine, include DirectML.dll next to keyscribe.exe."
     }
 
     $bundleReadmePath = Join-Path $bundleDir "README-portable.txt"
     Set-Content -Path $bundleReadmePath -Encoding UTF8 -Value @"
-Audio Transcriber portable Windows bundle
+KeyScribe portable Windows bundle
 
 Contents:
-- transcriber.exe
+- keyscribe.exe
 - models/basic-pitch.onnx
 - DirectML.dll (if discovered)
 
-Run transcriber.exe from this folder so the relative model path works.
+Run keyscribe.exe from this folder so the relative model path works.
 "@
 
     $zipPath = Join-Path $repoRoot "$OutputRoot/$bundleName.zip"

@@ -3,9 +3,17 @@ use egui_phosphor::regular::{
     FAST_FORWARD, PAUSE, PLAY, REPEAT, REWIND, SPEAKER_HIGH, SPEAKER_NONE,
 };
 
-use super::{TranscriberApp, SEEK_STEP_SEC};
+use super::{KeyScribeApp, SEEK_STEP_SEC};
 use crate::ui::utils::format_time;
 use crate::ui::widgets::{icon_button, icon_font_id, icon_toggle_button};
+
+fn channel_label(channels: u16) -> String {
+    match channels.max(1) {
+        1 => "Mono".to_string(),
+        2 => "Stereo".to_string(),
+        n => format!("{n}ch"),
+    }
+}
 
 pub(super) fn setting_toggle_row(ui: &mut egui::Ui, value: &mut bool, label: &str) -> bool {
     let mut changed = false;
@@ -25,7 +33,7 @@ pub(super) fn setting_toggle_row(ui: &mut egui::Ui, value: &mut bool, label: &st
 }
 
 pub(super) fn draw_media_controls(
-    app: &mut TranscriberApp,
+    app: &mut KeyScribeApp,
     ui: &mut egui::Ui,
     analysis_ready: bool,
     duration: f32,
@@ -113,11 +121,34 @@ pub(super) fn draw_media_controls(
                                         .and_then(|a| a.metadata.album.as_deref())
                                         .unwrap_or("");
 
+                                    let source_channels = app
+                                        .audio_raw
+                                        .as_ref()
+                                        .map(|audio| audio.channels)
+                                        .unwrap_or(app.loading_source_channels)
+                                        .max(1);
+                                    let playback_channels = if app.processed_playback_samples.is_empty()
+                                    {
+                                        if source_channels <= 1 { 1 } else { 2 }
+                                    } else {
+                                        app.processed_playback_channels.max(1)
+                                    };
+                                    let channel_status = format!(
+                                        "Source: {} | Playback: {}",
+                                        channel_label(source_channels),
+                                        channel_label(playback_channels)
+                                    );
+
                                     let title_h = ui
                                         .fonts(|f| f.row_height(&egui::FontId::proportional(17.0)));
                                     let artist_h = ui
                                         .fonts(|f| f.row_height(&egui::FontId::proportional(14.0)));
-                                    let block_h = title_h + artist_h + ui.spacing().item_spacing.y;
+                                    let format_h = ui
+                                        .fonts(|f| f.row_height(&egui::FontId::proportional(12.0)));
+                                    let block_h = title_h
+                                        + artist_h
+                                        + format_h
+                                        + ui.spacing().item_spacing.y * 2.0;
                                     let top_pad = ((art_size - block_h) * 0.5).max(0.0);
                                     if top_pad > 0.0 {
                                         ui.add_space(top_pad);
@@ -135,6 +166,12 @@ pub(super) fn draw_media_controls(
                                                 .color(egui::Color32::from_rgb(166, 182, 202)),
                                         );
                                     }
+
+                                    ui.label(
+                                        egui::RichText::new(channel_status)
+                                            .size(12.0)
+                                            .color(egui::Color32::from_rgb(145, 160, 182)),
+                                    );
                                 });
                             },
                         );
@@ -177,7 +214,7 @@ pub(super) fn draw_media_controls(
                                         if is_playing {
                                             app.stop();
                                         } else if app.audio_raw.is_some() {
-                                            if app.processed_samples.is_empty() {
+                                            if app.processed_playback_samples.is_empty() {
                                                 app.request_rebuild(
                                                     false,
                                                     super::RebuildMode::Full,

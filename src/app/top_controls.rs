@@ -2,7 +2,7 @@ use super::*;
 
 const TOOLBAR_MENU_MIN_WIDTH: f32 = 360.0;
 
-impl TranscriberApp {
+impl KeyScribeApp {
     fn draw_toolbar_separator(ui: &mut egui::Ui) {
         let stroke = ui.visuals().widgets.noninteractive.bg_stroke;
         let width = ui.available_width().max(0.0);

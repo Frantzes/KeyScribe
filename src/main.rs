@@ -6,7 +6,7 @@
 #[cfg(feature = "desktop-ui")]
 use eframe::egui;
 #[cfg(feature = "native-ui")]
-use transcriber::app::TranscriberApp;
+use keyscribe::app::KeyScribeApp;
 
 #[cfg(feature = "desktop-ui")]
 fn load_window_icon() -> Option<egui::IconData> {
@@ -30,9 +30,9 @@ fn run_native_app(mut native_options: eframe::NativeOptions) -> eframe::Result<(
     }
 
     eframe::run_native(
-        "Audio Visual Transcriber",
+        "KeyScribe",
         native_options,
-        Box::new(|cc| Box::new(TranscriberApp::new(cc))),
+        Box::new(|cc| Box::new(KeyScribeApp::new(cc))),
     )
 }
 

@@ -1,7 +1,7 @@
 use super::*;
 use crate::core::processing::build_waveform_for_processed;
 
-impl TranscriberApp {
+impl KeyScribeApp {
     #[allow(clippy::too_many_arguments)]
     pub(super) fn load_cached_timeline_for_variant(
         song_hash: &str,
@@ -185,6 +185,8 @@ impl TranscriberApp {
         let sample_rate = audio.sample_rate;
         let raw_sample_len = audio.samples_mono.len();
         let raw_samples = Arc::clone(&audio.samples_mono);
+        let raw_playback_samples = Arc::clone(&audio.samples_interleaved);
+        let raw_playback_channels = audio.channels.max(1);
 
         let song_hash = if let Some(hash) = self.loaded_audio_hash.clone() {
             hash
@@ -230,6 +232,19 @@ impl TranscriberApp {
         };
 
         self.processed_samples = processed_samples;
+        self.processed_playback_channels = raw_playback_channels;
+        self.processed_playback_samples = if speed_pitch_is_identity(self.speed, self.pitch_semitones)
+        {
+            raw_playback_samples.as_ref().to_vec()
+        } else {
+            apply_speed_and_pitch_interleaved(
+                raw_playback_samples.as_slice(),
+                raw_playback_channels,
+                sample_rate,
+                self.speed,
+                self.pitch_semitones,
+            )
+        };
         self.waveform = build_waveform_for_processed(
             self.processed_samples.as_slice(),
             sample_rate,

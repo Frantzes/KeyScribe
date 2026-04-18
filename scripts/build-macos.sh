@@ -6,7 +6,7 @@ TARGET=""
 OUTPUT_ROOT="build/macos"
 SKIP_CARGO_BUILD=0
 PORTABLE_ONLY=0
-BUNDLE_ID="${BUNDLE_ID:-com.frantzes.visualtranscriber}"
+BUNDLE_ID="${BUNDLE_ID:-com.frantzes.keyscribe}"
 APP_VERSION_INPUT="${APP_VERSION:-}"
 APP_BUILD_INPUT="${APP_BUILD:-}"
 DMG_ONLY="${DMG_ONLY:-0}"
@@ -146,10 +146,10 @@ fi
 
 echo "Packaging app metadata: version=$APP_VERSION build=$APP_BUILD bundle_id=$BUNDLE_ID"
 
-BINARY_NAME="transcriber"
+BUNDLE_BINARY_NAME="keyscribe"
 BINARY_CANDIDATES=(
-    "$REPO_ROOT/target/$TARGET/release/$BINARY_NAME"
-    "$REPO_ROOT/target/release/$BINARY_NAME"
+    "$REPO_ROOT/target/$TARGET/release/$BUNDLE_BINARY_NAME"
+    "$REPO_ROOT/target/release/$BUNDLE_BINARY_NAME"
 )
 
 BINARY_PATH=""
@@ -161,7 +161,7 @@ for candidate in "${BINARY_CANDIDATES[@]}"; do
 done
 
 if [[ -z "$BINARY_PATH" ]]; then
-    echo "Could not find $BINARY_NAME in target/$TARGET/release or target/release" >&2
+    echo "Could not find $BUNDLE_BINARY_NAME in target/$TARGET/release or target/release" >&2
     exit 1
 fi
 
@@ -172,7 +172,7 @@ if [[ ! -f "$MODEL_PATH" ]]; then
 fi
 
 ARCH_LABEL="$(target_to_arch_label "$TARGET")"
-BUNDLE_NAME="transcriber-macos-$ARCH_LABEL"
+BUNDLE_NAME="keyscribe-macos-$ARCH_LABEL"
 if [[ "$DMG_ONLY" -eq 0 ]]; then
     BUNDLE_DIR="$REPO_ROOT/$OUTPUT_ROOT/$BUNDLE_NAME"
     MODELS_DIR="$BUNDLE_DIR/models"
@@ -180,20 +180,20 @@ if [[ "$DMG_ONLY" -eq 0 ]]; then
     rm -rf "$BUNDLE_DIR"
     mkdir -p "$MODELS_DIR"
 
-    cp "$BINARY_PATH" "$BUNDLE_DIR/$BINARY_NAME"
-    chmod +x "$BUNDLE_DIR/$BINARY_NAME"
+    cp "$BINARY_PATH" "$BUNDLE_DIR/$BUNDLE_BINARY_NAME"
+    chmod +x "$BUNDLE_DIR/$BUNDLE_BINARY_NAME"
     cp "$MODEL_PATH" "$MODELS_DIR/basic-pitch.onnx"
 
     cat > "$BUNDLE_DIR/README-portable.txt" <<'EOF'
-Audio Transcriber portable macOS bundle
+KeyScribe portable macOS bundle
 
 Contents:
-- transcriber
+- keyscribe
 - models/basic-pitch.onnx
 
-Run ./transcriber from this folder so relative model path works.
+Run ./keyscribe from this folder so relative model path works.
 If Gatekeeper blocks launch, run:
-xattr -dr com.apple.quarantine ./transcriber
+xattr -dr com.apple.quarantine ./keyscribe
 EOF
 
     mkdir -p "$REPO_ROOT/$OUTPUT_ROOT"
@@ -220,7 +220,7 @@ fi
 
 if [[ "$PORTABLE_ONLY" -eq 0 ]]; then
     APP_STAGE_DIR="$REPO_ROOT/$OUTPUT_ROOT/$BUNDLE_NAME-app"
-    APP_BUNDLE_DIR="$APP_STAGE_DIR/Transcriber.app"
+    APP_BUNDLE_DIR="$APP_STAGE_DIR/KeyScribe.app"
     APP_CONTENTS_DIR="$APP_BUNDLE_DIR/Contents"
     APP_MACOS_DIR="$APP_CONTENTS_DIR/MacOS"
     APP_RESOURCES_DIR="$APP_CONTENTS_DIR/Resources"
@@ -229,15 +229,15 @@ if [[ "$PORTABLE_ONLY" -eq 0 ]]; then
     rm -rf "$APP_STAGE_DIR"
     mkdir -p "$APP_MACOS_DIR" "$APP_MODELS_DIR"
 
-    cp "$BINARY_PATH" "$APP_MACOS_DIR/transcriber-bin"
-    chmod +x "$APP_MACOS_DIR/transcriber-bin"
+    cp "$BINARY_PATH" "$APP_MACOS_DIR/keyscribe-bin"
+    chmod +x "$APP_MACOS_DIR/keyscribe-bin"
     cp "$MODEL_PATH" "$APP_MODELS_DIR/basic-pitch.onnx"
 
     if [[ -f "$REPO_ROOT/icon.png" ]]; then
         cp "$REPO_ROOT/icon.png" "$APP_RESOURCES_DIR/AppIcon.png"
     fi
 
-    cat > "$APP_MACOS_DIR/Transcriber" <<'EOF'
+    cat > "$APP_MACOS_DIR/KeyScribe" <<'EOF'
 #!/usr/bin/env bash
 set -euo pipefail
 
@@ -245,9 +245,9 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 RESOURCES_DIR="$SCRIPT_DIR/../Resources"
 
 cd "$RESOURCES_DIR"
-exec "$SCRIPT_DIR/transcriber-bin" "$@"
+exec "$SCRIPT_DIR/keyscribe-bin" "$@"
 EOF
-    chmod +x "$APP_MACOS_DIR/Transcriber"
+    chmod +x "$APP_MACOS_DIR/KeyScribe"
 
     cat > "$APP_CONTENTS_DIR/Info.plist" <<EOF
 <?xml version="1.0" encoding="UTF-8"?>
@@ -257,17 +257,17 @@ EOF
     <key>CFBundleDevelopmentRegion</key>
     <string>en</string>
     <key>CFBundleDisplayName</key>
-    <string>Transcriber</string>
+    <string>KeyScribe</string>
     <key>CFBundleExecutable</key>
-    <string>Transcriber</string>
+    <string>KeyScribe</string>
     <key>CFBundleIconFile</key>
     <string>AppIcon</string>
     <key>CFBundleIdentifier</key>
-    <string>com.frantzes.visualtranscriber</string>
+    <string>$BUNDLE_ID</string>
     <key>CFBundleInfoDictionaryVersion</key>
     <string>6.0</string>
     <key>CFBundleName</key>
-    <string>Transcriber</string>
+    <string>KeyScribe</string>
     <key>CFBundlePackageType</key>
     <string>APPL</string>
     <key>CFBundleShortVersionString</key>
@@ -288,7 +288,7 @@ EOF
     # PKG_STAGE_DIR="$APP_STAGE_DIR/pkg-root"
     # rm -rf "$PKG_STAGE_DIR"
     # mkdir -p "$PKG_STAGE_DIR"
-    # cp -R "$APP_BUNDLE_DIR" "$PKG_STAGE_DIR/Transcriber.app"
+    # cp -R "$APP_BUNDLE_DIR" "$PKG_STAGE_DIR/KeyScribe.app"
 
     # PKG_PATH="$REPO_ROOT/$OUTPUT_ROOT/$BUNDLE_NAME.pkg"
     # rm -f "$PKG_PATH"
@@ -302,13 +302,13 @@ EOF
     DMG_STAGE_DIR="$APP_STAGE_DIR/dmg-root"
     rm -rf "$DMG_STAGE_DIR"
     mkdir -p "$DMG_STAGE_DIR"
-    cp -R "$APP_BUNDLE_DIR" "$DMG_STAGE_DIR/Transcriber.app"
+    cp -R "$APP_BUNDLE_DIR" "$DMG_STAGE_DIR/KeyScribe.app"
     ln -sfn /Applications "$DMG_STAGE_DIR/Applications"
 
     DMG_PATH="$REPO_ROOT/$OUTPUT_ROOT/$BUNDLE_NAME.dmg"
     rm -f "$DMG_PATH"
     hdiutil create \
-        -volname "Transcriber" \
+        -volname "KeyScribe" \
         -srcfolder "$DMG_STAGE_DIR" \
         -ov \
         -format UDZO \

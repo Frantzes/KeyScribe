@@ -96,10 +96,10 @@ if [[ "$SKIP_CARGO_BUILD" -eq 0 ]]; then
     cargo build --release --target "$TARGET"
 fi
 
-BINARY_NAME="transcriber"
+BUNDLE_BINARY_NAME="keyscribe"
 BINARY_CANDIDATES=(
-    "$REPO_ROOT/target/$TARGET/release/$BINARY_NAME"
-    "$REPO_ROOT/target/release/$BINARY_NAME"
+    "$REPO_ROOT/target/$TARGET/release/$BUNDLE_BINARY_NAME"
+    "$REPO_ROOT/target/release/$BUNDLE_BINARY_NAME"
 )
 
 BINARY_PATH=""
@@ -111,7 +111,7 @@ for candidate in "${BINARY_CANDIDATES[@]}"; do
 done
 
 if [[ -z "$BINARY_PATH" ]]; then
-    echo "Could not find $BINARY_NAME in target/$TARGET/release or target/release" >&2
+    echo "Could not find $BUNDLE_BINARY_NAME in target/$TARGET/release or target/release" >&2
     exit 1
 fi
 
@@ -122,25 +122,25 @@ if [[ ! -f "$MODEL_PATH" ]]; then
 fi
 
 ARCH_LABEL="$(target_to_arch_label "$TARGET")"
-BUNDLE_NAME="transcriber-linux-$ARCH_LABEL"
+BUNDLE_NAME="keyscribe-linux-$ARCH_LABEL"
 BUNDLE_DIR="$REPO_ROOT/$OUTPUT_ROOT/$BUNDLE_NAME"
 MODELS_DIR="$BUNDLE_DIR/models"
 
 rm -rf "$BUNDLE_DIR"
 mkdir -p "$MODELS_DIR"
 
-cp "$BINARY_PATH" "$BUNDLE_DIR/$BINARY_NAME"
-chmod +x "$BUNDLE_DIR/$BINARY_NAME"
+cp "$BINARY_PATH" "$BUNDLE_DIR/$BUNDLE_BINARY_NAME"
+chmod +x "$BUNDLE_DIR/$BUNDLE_BINARY_NAME"
 cp "$MODEL_PATH" "$MODELS_DIR/basic-pitch.onnx"
 
 cat > "$BUNDLE_DIR/README-portable.txt" <<'EOF'
-Audio Transcriber portable Linux bundle
+KeyScribe portable Linux bundle
 
 Contents:
-- transcriber
+- keyscribe
 - models/basic-pitch.onnx
 
-Run ./transcriber from this folder so relative model path works.
+Run ./keyscribe from this folder so relative model path works.
 EOF
 
 mkdir -p "$REPO_ROOT/$OUTPUT_ROOT"

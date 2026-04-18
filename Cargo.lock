@@ -2432,6 +2432,36 @@ dependencies = [
 ]
 
 [[package]]
+name = "keyscribe"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "bincode",
+ "blake3",
+ "crossbeam-channel",
+ "directories",
+ "eframe",
+ "egui-phosphor",
+ "egui_plot",
+ "image 0.25.10",
+ "ndarray 0.16.1",
+ "ndarray-stats",
+ "ort",
+ "parking_lot",
+ "rayon",
+ "rfd",
+ "rodio",
+ "rustfft",
+ "serde",
+ "serde_json",
+ "signalsmith-stretch",
+ "symphonia",
+ "thiserror 1.0.69",
+ "winresource",
+ "zstd",
+]
+
+[[package]]
 name = "khronos-egl"
 version = "6.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4474,36 +4504,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "db97caf9d906fbde555dd62fa95ddba9eecfd14cb388e4f491a66d74cd5fb79a"
 dependencies = [
  "once_cell",
-]
-
-[[package]]
-name = "transcriber"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "bincode",
- "blake3",
- "crossbeam-channel",
- "directories",
- "eframe",
- "egui-phosphor",
- "egui_plot",
- "image 0.25.10",
- "ndarray 0.16.1",
- "ndarray-stats",
- "ort",
- "parking_lot",
- "rayon",
- "rfd",
- "rodio",
- "rustfft",
- "serde",
- "serde_json",
- "signalsmith-stretch",
- "symphonia",
- "thiserror 1.0.69",
- "winresource",
- "zstd",
 ]
 
 [[package]]
