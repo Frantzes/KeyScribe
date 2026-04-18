@@ -45,13 +45,26 @@ pub struct CQTransform {
     config: CQTConfig,
     // Precomputed kernels for each bin
     kernels: Vec<Vec<Complex<f32>>>,
+    // 1 / sqrt(sum(kernel^2)) for each bin, precomputed once.
+    kernel_norm_inv: Vec<f32>,
 }
 
 impl CQTransform {
     /// Create a new CQT engine
     pub fn new(config: CQTConfig) -> Self {
         let kernels = Self::compute_kernels(&config);
-        Self { config, kernels }
+        let kernel_norm_inv = kernels
+            .iter()
+            .map(|kernel| {
+                let energy = kernel.iter().map(|c| c.norm_sqr()).sum::<f32>().sqrt();
+                1.0 / (energy + 1e-7)
+            })
+            .collect();
+        Self {
+            config,
+            kernels,
+            kernel_norm_inv,
+        }
     }
 
     /// Compute CQT kernels (precomputed Gabor wavelets)
@@ -104,6 +117,8 @@ impl CQTransform {
                 continue;
             }
 
+            let norm_inv = self.kernel_norm_inv[k];
+
             // Convolve samples with kernel
             for n in 0..(samples.len() - kernel_len) {
                 let mut sum = Complex::new(0.0, 0.0);
@@ -111,9 +126,7 @@ impl CQTransform {
                     sum += samples[n + m] * kernel[m];
                 }
 
-                // Normalize by kernel energy
-                let kernel_energy: f32 = kernel.iter().map(|c| c.norm_sqr()).sum::<f32>().sqrt();
-                let magnitude = sum.norm() / (kernel_energy + 1e-7);
+                let magnitude = sum.norm() * norm_inv;
                 result[k][n] = magnitude;
             }
         }
@@ -136,14 +149,12 @@ impl CQTransform {
 
             let mut sum = Complex::new(0.0, 0.0);
 
-            // Circular convolution: if kernel is longer than frame, use the frame repeatedly
+            // frame_len >= kernel.len() here, so use direct indexing without modulo.
             for m in 0..kernel.len() {
-                let sample_idx = m % frame_len;
-                sum += samples[sample_idx] * kernel[m];
+                sum += samples[m] * kernel[m];
             }
 
-            let kernel_energy: f32 = kernel.iter().map(|c| c.norm_sqr()).sum::<f32>().sqrt();
-            result[k] = sum.norm() / (kernel_energy + 1e-7);
+            result[k] = sum.norm() * self.kernel_norm_inv[k];
         }
 
         result

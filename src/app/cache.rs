@@ -12,7 +12,10 @@ impl KeyScribeApp {
         pitch_semitones: f32,
         use_cqt_analysis: bool,
         preprocess_audio: bool,
-    ) -> (Option<(Arc<Vec<Vec<f32>>>, f32)>, CachePrecheckDiagnostics) {
+    ) -> (
+        Option<(Arc<Vec<Vec<f32>>>, f32, Option<Vec<[f64; 2]>>)>,
+        CachePrecheckDiagnostics,
+    ) {
         let mut diag = CachePrecheckDiagnostics::default();
 
         let variant_key = analysis_cache_variant_key(
@@ -88,10 +91,17 @@ impl KeyScribeApp {
                 continue;
             }
 
+            let cached_waveform = cache
+                .waveform_points
+                .as_deref()
+                .filter(|points| validate_cached_waveform_points(points))
+                .map(unpack_waveform_points);
+
             return (
                 Some((
                     Arc::new(cache.base_note_timeline),
                     cache.base_note_timeline_step_sec,
+                    cached_waveform,
                 )),
                 diag,
             );
@@ -127,7 +137,7 @@ impl KeyScribeApp {
             self.preprocess_audio,
         );
 
-        if let Some((base_timeline, base_step_sec)) = cached_timeline {
+        if let Some((base_timeline, base_step_sec, cached_waveform)) = cached_timeline {
             self.base_note_timeline = Arc::clone(&base_timeline);
             self.base_note_timeline_step_sec = base_step_sec;
             let (note_timeline, note_step_sec) = Self::transform_note_timeline(
@@ -139,11 +149,18 @@ impl KeyScribeApp {
             self.note_timeline = note_timeline;
             self.note_timeline_step_sec = note_step_sec;
             self.loading_cache_timeline_preloaded = true;
+            if let Some(waveform) = cached_waveform {
+                self.set_waveform_data(waveform, true);
+                self.loading_cache_waveform_preloaded = true;
+            } else {
+                self.loading_cache_waveform_preloaded = false;
+            }
             self.update_note_probabilities(true);
             self.cache_status_message =
                 Some("Analysis cache: transcription loaded during render.".to_string());
         } else {
             self.loading_cache_timeline_preloaded = false;
+            self.loading_cache_waveform_preloaded = false;
             let hash_short = &song_hash[..song_hash.len().min(8)];
             let mismatch_total = precheck_diag.shared_param_mismatches
                 + precheck_diag.strict_len_mismatches
@@ -198,7 +215,12 @@ impl KeyScribeApp {
             hash
         };
 
-        let Some((processed_samples, base_note_timeline, base_note_timeline_step_sec)) =
+        let Some((
+            processed_samples,
+            base_note_timeline,
+            base_note_timeline_step_sec,
+            cached_waveform,
+        )) =
             Self::load_analysis_cache_for_variant(
                 song_hash.as_str(),
                 sample_rate,
@@ -245,17 +267,19 @@ impl KeyScribeApp {
                 self.pitch_semitones,
             )
         };
-        self.waveform = build_waveform_for_processed(
-            self.processed_samples.as_slice(),
-            sample_rate,
-            self.audio_quality_mode.waveform_points(),
-            self.speed,
-        );
+        let waveform = cached_waveform.unwrap_or_else(|| {
+            build_waveform_for_processed(
+                self.processed_samples.as_slice(),
+                sample_rate,
+                self.audio_quality_mode.waveform_points(),
+                self.speed,
+            )
+        });
+        self.set_waveform_data(waveform, true);
         self.note_timeline = note_timeline;
         self.note_timeline_step_sec = note_timeline_step_sec;
         self.base_note_timeline = base_note_timeline;
         self.base_note_timeline_step_sec = base_note_timeline_step_sec;
-        self.waveform_reset_view = true;
         self.selected_time_sec = self.selected_time_sec.min(self.source_duration());
         self.playing_preview_buffer = false;
         self.update_note_probabilities(true);
@@ -274,7 +298,7 @@ impl KeyScribeApp {
         pitch_semitones: f32,
         use_cqt_analysis: bool,
         preprocess_audio: bool,
-    ) -> Option<(Vec<f32>, Arc<Vec<Vec<f32>>>, f32)> {
+    ) -> Option<(Vec<f32>, Arc<Vec<Vec<f32>>>, f32, Option<Vec<[f64; 2]>>)> {
         let variant_key = analysis_cache_variant_key(
             sample_rate,
             raw_sample_len,
@@ -314,6 +338,12 @@ impl KeyScribeApp {
                 continue;
             }
 
+            let cached_waveform = cache
+                .waveform_points
+                .as_deref()
+                .filter(|points| validate_cached_waveform_points(points))
+                .map(unpack_waveform_points);
+
             let processed_samples = if let Some(shuffled) = cache.processed_samples_shuffled_bytes {
                 let max_processed_len = raw_sample_len.saturating_mul(8);
                 if cache.processed_samples_len == 0
@@ -348,6 +378,7 @@ impl KeyScribeApp {
                 processed_samples,
                 base_note_timeline,
                 base_note_timeline_step_sec,
+                cached_waveform,
             ));
         }
 
@@ -365,6 +396,7 @@ impl KeyScribeApp {
         use_cqt_analysis: bool,
         preprocess_audio: bool,
         processed_samples: &[f32],
+        waveform: &[[f64; 2]],
         base_note_timeline: &[Vec<f32>],
         base_note_timeline_step_sec: f32,
     ) {
@@ -400,6 +432,7 @@ impl KeyScribeApp {
         } else {
             (0usize, None)
         };
+        let packed_waveform = pack_waveform_points(waveform);
 
         let snapshot = AnalysisCacheSnapshot {
             cache_version: ANALYSIS_CACHE_VERSION,
@@ -412,6 +445,11 @@ impl KeyScribeApp {
             preprocess_audio,
             processed_samples_len,
             processed_samples_shuffled_bytes: processed_samples_shuffled_bytes.as_deref(),
+            waveform_points: if packed_waveform.is_empty() {
+                None
+            } else {
+                Some(packed_waveform.as_slice())
+            },
             base_note_timeline,
             base_note_timeline_step_sec,
         };

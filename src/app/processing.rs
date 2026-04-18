@@ -130,6 +130,7 @@ impl KeyScribeApp {
                         cached_processed_samples,
                         cached_base_note_timeline,
                         cached_base_step,
+                        cached_waveform,
                     )) = Self::load_analysis_cache_for_variant(
                         song_hash,
                         sample_rate,
@@ -152,12 +153,15 @@ impl KeyScribeApp {
                             pitch_semitones,
                         );
 
-                        let waveform = build_waveform_for_processed(
-                            &cached_processed_samples,
-                            sample_rate,
-                            audio_quality_mode.waveform_points(),
-                            speed,
-                        );
+                        let had_cached_waveform = cached_waveform.is_some();
+                        let waveform = cached_waveform.unwrap_or_else(|| {
+                            build_waveform_for_processed(
+                                &cached_processed_samples,
+                                sample_rate,
+                                audio_quality_mode.waveform_points(),
+                                speed,
+                            )
+                        });
 
                         let processed_playback_samples = if speed_pitch_is_identity(
                             speed,
@@ -178,6 +182,23 @@ impl KeyScribeApp {
                             return;
                         }
 
+                        if !had_cached_waveform {
+                            Self::persist_analysis_cache(
+                                song_hash,
+                                sample_rate,
+                                raw_samples.len(),
+                                audio_quality_mode,
+                                speed,
+                                pitch_semitones,
+                                use_cqt,
+                                preprocess_audio,
+                                cached_processed_samples.as_slice(),
+                                waveform.as_slice(),
+                                cached_base_note_timeline.as_ref(),
+                                cached_base_step,
+                            );
+                        }
+
                         for candidate_hash in &cache_hash_candidates {
                             if candidate_hash == song_hash {
                                 continue;
@@ -192,6 +213,7 @@ impl KeyScribeApp {
                                 use_cqt,
                                 preprocess_audio,
                                 cached_processed_samples.as_slice(),
+                                waveform.as_slice(),
                                 cached_base_note_timeline.as_ref(),
                                 cached_base_step,
                             );
@@ -296,6 +318,7 @@ impl KeyScribeApp {
                     use_cqt,
                     preprocess_audio,
                     processed_samples.as_slice(),
+                    waveform.as_slice(),
                     base_note_timeline.as_ref(),
                     base_note_timeline_step_sec,
                 );
@@ -315,6 +338,7 @@ impl KeyScribeApp {
                             use_cqt,
                             preprocess_audio,
                             processed_samples.as_slice(),
+                            waveform.as_slice(),
                             base_note_timeline.as_ref(),
                             base_note_timeline_step_sec,
                         );
@@ -464,23 +488,32 @@ impl KeyScribeApp {
             return Vec::new();
         }
 
-        let mut timeline = Vec::new();
         let total_sec = samples.len() as f32 / sample_rate as f32;
-        let mut t = 0.0f32;
+        let frame_count = ((total_sec / step_sec).floor() as usize).saturating_add(1);
 
-        while t <= total_sec {
-            let center = (t * sample_rate as f32) as usize;
-            timeline.push(detect_note_probabilities(
-                samples,
-                sample_rate,
-                center,
-                fft_window_size,
-            ));
-            t += step_sec;
-        }
+        let timeline: Vec<Vec<f32>> = if frame_count >= 256 {
+            (0..frame_count)
+                .into_par_iter()
+                .map(|idx| {
+                    let t = idx as f32 * step_sec;
+                    let center = ((t * sample_rate as f32) as usize)
+                        .min(samples.len().saturating_sub(1));
+                    detect_note_probabilities(samples, sample_rate, center, fft_window_size)
+                })
+                .collect()
+        } else {
+            (0..frame_count)
+                .map(|idx| {
+                    let t = idx as f32 * step_sec;
+                    let center = ((t * sample_rate as f32) as usize)
+                        .min(samples.len().saturating_sub(1));
+                    detect_note_probabilities(samples, sample_rate, center, fft_window_size)
+                })
+                .collect()
+        };
 
         if timeline.is_empty() {
-            timeline.push(vec![0.0; (PIANO_HIGH_MIDI - PIANO_LOW_MIDI + 1) as usize]);
+            return vec![vec![0.0; (PIANO_HIGH_MIDI - PIANO_LOW_MIDI + 1) as usize]];
         }
 
         timeline

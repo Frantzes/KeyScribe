@@ -5,9 +5,15 @@ use crate::inference::{BasicPitchInference, InferenceConfig};
 use crate::pipeline::{AudioPipeline, PipelineConfig};
 use rustfft::num_complex::Complex;
 use rustfft::FftPlanner;
+use std::collections::HashMap;
+use std::sync::Arc;
 use std::sync::{Mutex, OnceLock};
 
 static BASIC_PITCH_ENGINE: OnceLock<Mutex<Option<BasicPitchInference>>> = OnceLock::new();
+static CQT_PREVIEW_ENGINE: OnceLock<Mutex<Option<(u32, Arc<CQTransform>)>>> = OnceLock::new();
+static FFT_PLAN_CACHE: OnceLock<Mutex<HashMap<usize, Arc<dyn rustfft::Fft<f32>>>>> =
+    OnceLock::new();
+static HANN_WINDOW_CACHE: OnceLock<Mutex<HashMap<usize, Arc<Vec<f32>>>>> = OnceLock::new();
 
 pub const PIANO_LOW_MIDI: u8 = 21;
 pub const PIANO_HIGH_MIDI: u8 = 108;
@@ -49,22 +55,17 @@ pub fn detect_note_probabilities(
         .min(samples.len() - fft_size);
     let slice = &samples[start..start + fft_size];
 
-    let mut planner = FftPlanner::<f32>::new();
-    let fft = planner.plan_fft_forward(fft_size);
+    let fft = get_cached_fft_plan(fft_size);
+    let window = get_cached_hann_window(fft_size);
 
     let mut buffer: Vec<Complex<f32>> = slice
         .iter()
         .enumerate()
-        .map(|(i, &s)| {
-            let w =
-                0.5 - 0.5 * (2.0 * std::f32::consts::PI * i as f32 / (fft_size - 1) as f32).cos();
-            Complex::new(s * w, 0.0)
-        })
+        .map(|(i, &s)| Complex::new(s * window[i], 0.0))
         .collect();
 
-    fft.process(&mut buffer);
-    let mags: Vec<f32> = buffer.iter().take(fft_size / 2).map(|c| c.norm()).collect();
-    let power: Vec<f32> = mags.iter().map(|m| m * m).collect();
+    fft.as_ref().process(&mut buffer);
+    let power: Vec<f32> = buffer.iter().take(fft_size / 2).map(|c| c.norm_sqr()).collect();
 
     let bin_hz = sample_rate as f32 / fft_size as f32;
     let nyquist_hz = sample_rate as f32 * 0.5;
@@ -163,6 +164,53 @@ pub fn detect_note_probabilities(
     }
 
     probs
+}
+
+fn get_cached_fft_plan(fft_size: usize) -> Arc<dyn rustfft::Fft<f32>> {
+    let cache = FFT_PLAN_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    let Ok(mut guard) = cache.lock() else {
+        let mut planner = FftPlanner::<f32>::new();
+        return planner.plan_fft_forward(fft_size);
+    };
+
+    if let Some(plan) = guard.get(&fft_size) {
+        return Arc::clone(plan);
+    }
+
+    let mut planner = FftPlanner::<f32>::new();
+    let plan = planner.plan_fft_forward(fft_size);
+    guard.insert(fft_size, Arc::clone(&plan));
+    plan
+}
+
+fn get_cached_hann_window(fft_size: usize) -> Arc<Vec<f32>> {
+    let cache = HANN_WINDOW_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    let Ok(mut guard) = cache.lock() else {
+        return Arc::new(
+            (0..fft_size)
+                .map(|i| {
+                    0.5 - 0.5
+                        * (2.0 * std::f32::consts::PI * i as f32 / (fft_size - 1) as f32).cos()
+                })
+                .collect(),
+        );
+    };
+
+    if let Some(window) = guard.get(&fft_size) {
+        return Arc::clone(window);
+    }
+
+    let window = Arc::new(
+        (0..fft_size)
+            .map(|i| {
+                0.5
+                    - 0.5
+                        * (2.0 * std::f32::consts::PI * i as f32 / (fft_size - 1) as f32).cos()
+            })
+            .collect(),
+    );
+    guard.insert(fft_size, Arc::clone(&window));
+    window
 }
 
 pub fn pitch_track(samples: &[f32], sample_rate: u32, points: usize) -> Vec<[f64; 2]> {
@@ -285,6 +333,32 @@ pub fn detect_note_probabilities_cqt_preview(
     detect_note_probabilities_cqt_fallback(samples, sample_rate, center_sample, fft_size)
 }
 
+fn compute_cached_cqt_preview_frame(
+    sample_rate: u32,
+    frame_slice: &[f32],
+) -> Option<(Vec<f32>, usize)> {
+    let cache = CQT_PREVIEW_ENGINE.get_or_init(|| Mutex::new(None));
+    let cqt = {
+        let mut guard = cache.lock().ok()?;
+
+        let rebuild = guard
+            .as_ref()
+            .map(|(cached_rate, _)| *cached_rate != sample_rate)
+            .unwrap_or(true);
+        if rebuild {
+            let cqt_config = crate::cqt::CQTConfig::piano_range(sample_rate);
+            *guard = Some((sample_rate, Arc::new(CQTransform::new(cqt_config))));
+        }
+
+        guard.as_ref().map(|(_, cqt)| Arc::clone(cqt))?
+    };
+
+    Some((
+        cqt.compute_frame(frame_slice),
+        cqt.config().bins_per_semitone.max(1),
+    ))
+}
+
 fn detect_note_probabilities_basic_pitch(
     samples: &[f32],
     sample_rate: u32,
@@ -352,12 +426,17 @@ fn detect_note_probabilities_cqt_fallback(
         .min(samples.len().saturating_sub(window_size));
     let end = start + window_size;
 
-    // Use CQT instead of linear FFT
-    let cqt_config = crate::cqt::CQTConfig::piano_range(sample_rate);
-    let cqt = CQTransform::new(cqt_config.clone());
-
     let frame_slice = &samples[start..end];
-    let cqt_frame = cqt.compute_frame(frame_slice);
+    let (cqt_frame, bins_per_semitone) = if let Some(cached) =
+        compute_cached_cqt_preview_frame(sample_rate, frame_slice)
+    {
+        cached
+    } else {
+        let cqt_config = crate::cqt::CQTConfig::piano_range(sample_rate);
+        let bins = cqt_config.bins_per_semitone.max(1);
+        let cqt = CQTransform::new(cqt_config);
+        (cqt.compute_frame(frame_slice), bins)
+    };
 
     if cqt_frame.is_empty() {
         return probs;
@@ -380,7 +459,6 @@ fn detect_note_probabilities_cqt_fallback(
 
     // Map CQT bins to MIDI notes. Since CQT is already in semitone units,
     // map each bin directly into the note bucket and accumulate energy.
-    let bins_per_semitone = cqt_config.bins_per_semitone.max(1);
     for (cqt_idx, &mag) in cqt_frame.iter().enumerate() {
         let note_idx = (cqt_idx / bins_per_semitone).min(note_count - 1);
         probs[note_idx] += mag * mag;

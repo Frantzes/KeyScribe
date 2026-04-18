@@ -229,9 +229,20 @@ impl eframe::App for KeyScribeApp {
 
             let source_duration = self.source_duration().max(0.01);
             let plot_duration = self.waveform_view_duration().max(source_duration).max(0.01);
+            let interaction_duration = if self.is_audio_loading
+                && (self.loading_cache_waveform_preloaded || self.loading_cache_timeline_preloaded)
+            {
+                plot_duration
+            } else {
+                source_duration
+            };
             let waveform_height = (ui.available_height() - 112.0).max(40.0);
             let analysis_ready =
                 !self.is_blocking_processing() && !self.processed_samples.is_empty();
+            let interaction_ready = analysis_ready
+                || (self.is_audio_loading
+                    && (self.loading_cache_waveform_preloaded
+                        || self.loading_cache_timeline_preloaded));
 
             Plot::new("waveform_plot")
                 .height(waveform_height)
@@ -284,39 +295,33 @@ impl eframe::App for KeyScribeApp {
                         plot_ui.polygon(highlight);
                     }
 
-                    let mut wave_pre = Vec::<[f64; 2]>::new();
-                    let mut wave_loop = Vec::<[f64; 2]>::new();
-                    let mut wave_post = Vec::<[f64; 2]>::new();
-
                     if let Some((a, b)) = self.loop_selection {
-                        let start = a.min(b) as f64;
-                        let end = a.max(b) as f64;
-                        for &pt in &self.waveform {
-                            if pt[0] < start {
-                                wave_pre.push(pt);
-                            } else if pt[0] <= end {
-                                wave_loop.push(pt);
-                            } else {
-                                wave_post.push(pt);
-                            }
-                        }
+                        let start = a.min(b);
+                        let end = a.max(b);
+                        self.refresh_loop_waveform_cache(start, end);
 
-                        if !wave_pre.is_empty() {
+                        if !self.loop_waveform_cache_pre.is_empty() {
                             plot_ui.line(
-                                Line::new(PlotPoints::from_iter(wave_pre.into_iter()))
-                                    .color(loop_wave_dim),
+                                Line::new(PlotPoints::from_iter(
+                                    self.loop_waveform_cache_pre.iter().copied(),
+                                ))
+                                .color(loop_wave_dim),
                             );
                         }
-                        if !wave_loop.is_empty() {
+                        if !self.loop_waveform_cache_mid.is_empty() {
                             plot_ui.line(
-                                Line::new(PlotPoints::from_iter(wave_loop.into_iter()))
-                                    .color(loop_wave_active),
+                                Line::new(PlotPoints::from_iter(
+                                    self.loop_waveform_cache_mid.iter().copied(),
+                                ))
+                                .color(loop_wave_active),
                             );
                         }
-                        if !wave_post.is_empty() {
+                        if !self.loop_waveform_cache_post.is_empty() {
                             plot_ui.line(
-                                Line::new(PlotPoints::from_iter(wave_post.into_iter()))
-                                    .color(loop_wave_dim),
+                                Line::new(PlotPoints::from_iter(
+                                    self.loop_waveform_cache_post.iter().copied(),
+                                ))
+                                .color(loop_wave_dim),
                             );
                         }
                     } else {
@@ -334,36 +339,6 @@ impl eframe::App for KeyScribeApp {
                         let end = a.max(b);
                         plot_ui.vline(VLine::new(start as f64).color(loop_edge));
                         plot_ui.vline(VLine::new(end as f64).color(loop_edge));
-                    }
-
-                    if self.is_audio_loading && self.loading_sample_rate > 0 {
-                        let rendered_sec =
-                            self.loading_decoded_samples as f32 / self.loading_sample_rate as f32;
-                        let rendered_edge = egui::Color32::from_rgb(
-                            self.highlight_color.r().saturating_add(30),
-                            self.highlight_color.g().saturating_add(30),
-                            self.highlight_color.b().saturating_add(30),
-                        );
-                        plot_ui.vline(VLine::new(rendered_sec as f64).color(rendered_edge));
-
-                        let transcribed_sec = if !self.preprocess_audio {
-                            rendered_sec
-                        } else if self.note_timeline_step_sec > 0.0 {
-                            self.note_timeline.len() as f32 * self.note_timeline_step_sec
-                        } else {
-                            self.loading_next_transcribe_time_sec.max(0.0)
-                        };
-
-                        if transcribed_sec > 0.0 {
-                            let transcribed_edge = egui::Color32::from_rgba_unmultiplied(
-                                rendered_edge.r(),
-                                rendered_edge.g(),
-                                rendered_edge.b(),
-                                170,
-                            );
-                            plot_ui
-                                .vline(VLine::new(transcribed_sec as f64).color(transcribed_edge));
-                        }
                     }
 
                     // Keep Y scale fixed and clamp X so navigation stays within audio bounds.
@@ -504,22 +479,22 @@ impl eframe::App for KeyScribeApp {
                         self.drag_select_anchor_sec = None;
                     }
 
-                    if analysis_ready && allow_loop_drag && drag_started {
+                    if interaction_ready && allow_loop_drag && drag_started {
                         self.drag_select_anchor_sec = pointer
-                            .map(|p| p.x.clamp(0.0, source_duration as f64) as f32)
+                            .map(|p| p.x.clamp(0.0, interaction_duration as f64) as f32)
                             .or(Some(self.selected_time_sec));
                     }
 
-                    if analysis_ready && allow_loop_drag && dragged {
+                    if interaction_ready && allow_loop_drag && dragged {
                         if let (Some(anchor), Some(p)) = (
                             self.drag_select_anchor_sec,
-                            pointer.map(|p| p.x.clamp(0.0, source_duration as f64) as f32),
+                            pointer.map(|p| p.x.clamp(0.0, interaction_duration as f64) as f32),
                         ) {
                             self.loop_selection = Some((anchor, p));
                         }
                     }
 
-                    if analysis_ready && allow_loop_drag && drag_stopped {
+                    if interaction_ready && allow_loop_drag && drag_stopped {
                         if let Some((a, b)) = self.loop_selection {
                             if (a - b).abs() < LOOP_MIN_DURATION_SEC {
                                 self.loop_selection = None;
@@ -536,10 +511,10 @@ impl eframe::App for KeyScribeApp {
                         self.drag_select_anchor_sec = None;
                     }
 
-                    if analysis_ready && clicked {
+                    if interaction_ready && clicked {
                         if let Some(pointer) = pointer {
                             self.selected_time_sec =
-                                pointer.x.clamp(0.0, source_duration as f64) as f32;
+                                pointer.x.clamp(0.0, interaction_duration as f64) as f32;
                             self.loop_selection = None;
                             self.loop_playback_enabled = false;
                             self.update_note_probabilities(true);
@@ -560,13 +535,23 @@ impl eframe::App for KeyScribeApp {
 
             let available_w = ui.available_width();
             ui.allocate_ui(egui::vec2(available_w, media_height), |ui| {
-                draw_media_controls(self, ui, analysis_ready, source_duration);
+                draw_media_controls(self, ui, interaction_ready, interaction_duration);
             });
         });
         self.waveform_panel_height = waveform_central.response.rect.height().clamp(120.0, 5000.0);
 
-        // Keep UI responsive while playing.
-        ctx.request_repaint_after(std::time::Duration::from_millis(16));
+        // Keep high refresh only when motion or background work is active.
+        let pointer_active = ctx.input(|i| i.pointer.any_down());
+        let needs_fast_repaint = self.is_playing()
+            || self.is_audio_loading
+            || self.is_processing
+            || self.pending_param_change
+            || pointer_active;
+        ctx.request_repaint_after(if needs_fast_repaint {
+            ACTIVE_REPAINT_INTERVAL
+        } else {
+            IDLE_REPAINT_INTERVAL
+        });
 
         if self.last_state_save_at.elapsed() >= Duration::from_secs(2) {
             self.save_state_to_disk();

@@ -72,6 +72,77 @@ impl KeyScribeApp {
             .unwrap_or(0.0)
     }
 
+    pub(super) fn invalidate_waveform_cache(&mut self) {
+        self.waveform_version = self.waveform_version.wrapping_add(1);
+        self.loop_waveform_cache_version = u64::MAX;
+        self.loop_waveform_cache_selection = None;
+        self.loop_waveform_cache_pre.clear();
+        self.loop_waveform_cache_mid.clear();
+        self.loop_waveform_cache_post.clear();
+    }
+
+    pub(super) fn set_waveform_data(&mut self, waveform: Vec<[f64; 2]>, reset_view: bool) {
+        self.waveform = waveform;
+        self.invalidate_waveform_cache();
+        if reset_view {
+            self.waveform_reset_view = true;
+        }
+    }
+
+    pub(super) fn clear_waveform_data(&mut self) {
+        self.waveform.clear();
+        self.invalidate_waveform_cache();
+    }
+
+    pub(super) fn should_rebuild_streaming_waveform(&self, processed_sample_len: usize) -> bool {
+        if self.waveform.is_empty() {
+            return true;
+        }
+
+        if processed_sample_len.saturating_sub(self.loading_last_waveform_rebuild_samples)
+            >= STREAMING_WAVEFORM_REBUILD_SAMPLE_DELTA
+        {
+            return true;
+        }
+
+        self.loading_last_waveform_rebuild_at
+            .map(|at| at.elapsed() >= STREAMING_WAVEFORM_REBUILD_INTERVAL)
+            .unwrap_or(true)
+    }
+
+    pub(super) fn mark_streaming_waveform_rebuild(&mut self, processed_sample_len: usize) {
+        self.loading_last_waveform_rebuild_at = Some(Instant::now());
+        self.loading_last_waveform_rebuild_samples = processed_sample_len;
+    }
+
+    pub(super) fn refresh_loop_waveform_cache(&mut self, start_sec: f32, end_sec: f32) {
+        let cache_key = Some((start_sec, end_sec));
+        if self.loop_waveform_cache_version == self.waveform_version
+            && self.loop_waveform_cache_selection == cache_key
+        {
+            return;
+        }
+
+        self.loop_waveform_cache_pre.clear();
+        self.loop_waveform_cache_mid.clear();
+        self.loop_waveform_cache_post.clear();
+
+        let start = start_sec as f64;
+        let end = end_sec as f64;
+        for &pt in &self.waveform {
+            if pt[0] < start {
+                self.loop_waveform_cache_pre.push(pt);
+            } else if pt[0] <= end {
+                self.loop_waveform_cache_mid.push(pt);
+            } else {
+                self.loop_waveform_cache_post.push(pt);
+            }
+        }
+
+        self.loop_waveform_cache_selection = cache_key;
+        self.loop_waveform_cache_version = self.waveform_version;
+    }
+
     pub(super) fn stop_if_playing(&mut self) -> bool {
         let was_playing = self.is_playing();
         if was_playing {
@@ -301,12 +372,11 @@ impl KeyScribeApp {
         self.processed_samples = result.processed_samples;
         self.processed_playback_samples = result.processed_playback_samples;
         self.processed_playback_channels = result.processed_playback_channels;
-        self.waveform = result.waveform;
+        self.set_waveform_data(result.waveform, true);
         self.note_timeline = result.note_timeline;
         self.note_timeline_step_sec = result.note_timeline_step_sec;
         self.base_note_timeline = result.base_note_timeline;
         self.base_note_timeline_step_sec = result.base_note_timeline_step_sec;
-        self.waveform_reset_view = true;
         self.clear_processing_job();
         self.selected_time_sec = self.selected_time_sec.min(self.source_duration());
 
@@ -415,6 +485,16 @@ impl KeyScribeApp {
         source_sec / self.playback_rate()
     }
 
+    pub(super) fn timeline_duration_sec(&self) -> f32 {
+        if self.is_audio_loading
+            && (self.loading_cache_waveform_preloaded || self.loading_cache_timeline_preloaded)
+        {
+            self.waveform_view_duration().max(0.0)
+        } else {
+            self.source_duration().max(0.0)
+        }
+    }
+
     pub(super) fn play_preview_at(&mut self, start_sec: f32, end_sec: Option<f32>) -> bool {
         if !self.is_param_render_in_progress() {
             return false;
@@ -498,10 +578,16 @@ impl KeyScribeApp {
     }
 
     #[allow(dead_code)]
-    pub(super) fn apply_loaded_audio(&mut self, path: PathBuf, audio: AudioData, ctx: &egui::Context) {
+    pub(super) fn apply_loaded_audio(
+        &mut self,
+        path: PathBuf,
+        audio: AudioData,
+        ctx: &egui::Context,
+    ) {
         self.cancel_active_processing();
         self.loaded_audio_hash = None;
         self.loaded_path = Some(path);
+        self.loading_preview_cache.clear();
         self.selected_time_sec = 0.0;
         self.audio_raw = Some(audio);
         self.note_timeline = Arc::new(Vec::new());
@@ -513,16 +599,17 @@ impl KeyScribeApp {
             if speed_pitch_is_identity(self.speed, self.pitch_semitones) {
                 self.processed_samples = raw.samples_mono.as_ref().to_vec();
                 self.processed_playback_samples = raw.samples_interleaved.as_ref().to_vec();
-                self.waveform = build_waveform_for_processed(
+                let waveform = build_waveform_for_processed(
                     self.processed_samples.as_slice(),
                     raw.sample_rate,
                     self.audio_quality_mode.waveform_points(),
                     1.0,
                 );
+                self.set_waveform_data(waveform, false);
             } else {
                 self.processed_samples.clear();
                 self.processed_playback_samples.clear();
-                self.waveform.clear();
+                self.clear_waveform_data();
             }
         }
         self.waveform_reset_view = true;
@@ -532,7 +619,10 @@ impl KeyScribeApp {
         self.update_note_probabilities(true);
     }
 
-    pub(super) fn create_album_art_texture(&self, ctx: &egui::Context) -> Option<egui::TextureHandle> {
+    pub(super) fn create_album_art_texture(
+        &self,
+        ctx: &egui::Context,
+    ) -> Option<egui::TextureHandle> {
         let bytes = self
             .audio_raw
             .as_ref()

@@ -12,6 +12,8 @@ impl KeyScribeApp {
         self.is_audio_loading = false;
         self.live_stream_playback = false;
         self.loading_cache_timeline_preloaded = false;
+        self.loading_cache_waveform_preloaded = false;
+        self.loading_preview_cache.clear();
     }
 
     pub(super) fn clear_note_visuals(&mut self) {
@@ -94,7 +96,7 @@ impl KeyScribeApp {
         self.processed_samples.clear();
         self.processed_playback_samples.clear();
         self.processed_playback_channels = 1;
-        self.waveform.clear();
+        self.clear_waveform_data();
         self.note_timeline = Arc::new(Vec::new());
         self.note_timeline_step_sec = 0.0;
         self.base_note_timeline = Arc::new(Vec::new());
@@ -105,6 +107,8 @@ impl KeyScribeApp {
         self.loading_sample_rate = 0;
         self.loading_total_samples = None;
         self.loading_decoded_samples = 0;
+        self.loading_last_waveform_rebuild_at = None;
+        self.loading_last_waveform_rebuild_samples = 0;
         self.loading_provisional_timeline.clear();
         self.loading_next_transcribe_time_sec = 0.0;
         self.loading_timeline_frames_pending_sync = 0;
@@ -117,6 +121,8 @@ impl KeyScribeApp {
         self.cache_status_message_at = None;
         self.cache_precheck_done = false;
         self.loading_cache_timeline_preloaded = false;
+        self.loading_cache_waveform_preloaded = false;
+        self.loading_preview_cache.clear();
         if self.preprocess_audio {
             self.cache_status_message = Some("Analysis cache: precheck pending...".to_string());
             self.cache_status_message_at = Some(Instant::now());
@@ -170,6 +176,7 @@ impl KeyScribeApp {
                     self.cache_status_message_at = Some(Instant::now());
                     self.cache_precheck_done = true;
                     self.loading_cache_timeline_preloaded = false;
+                    self.loading_cache_waveform_preloaded = false;
                 }
                 self.maybe_precheck_analysis_cache();
             }
@@ -222,34 +229,37 @@ impl KeyScribeApp {
                     );
                 }
 
-                let processed_chunk_playback = if speed_pitch_is_identity(
-                    self.speed,
-                    self.pitch_semitones,
-                ) {
-                    samples_interleaved
-                } else {
-                    apply_speed_and_pitch_interleaved(
-                        &samples_interleaved,
-                        playback_channels,
-                        self.loading_sample_rate,
-                        self.speed,
-                        self.pitch_semitones,
-                    )
-                };
+                let processed_chunk_playback =
+                    if speed_pitch_is_identity(self.speed, self.pitch_semitones) {
+                        samples_interleaved
+                    } else {
+                        apply_speed_and_pitch_interleaved(
+                            &samples_interleaved,
+                            playback_channels,
+                            self.loading_sample_rate,
+                            self.speed,
+                            self.pitch_semitones,
+                        )
+                    };
 
                 let was_empty = self.processed_samples.is_empty();
                 self.processed_samples.extend_from_slice(&processed_chunk);
                 self.processed_playback_samples
                     .extend_from_slice(&processed_chunk_playback);
                 self.processed_playback_channels = playback_channels;
-                self.waveform = build_waveform_for_processed(
-                    &self.processed_samples,
-                    self.loading_sample_rate,
-                    self.audio_quality_mode.waveform_points(),
-                    self.speed,
-                );
-                if was_empty && !self.waveform.is_empty() {
-                    self.waveform_reset_view = true;
+                let processed_len = self.processed_samples.len();
+                if !self.loading_cache_waveform_preloaded
+                    && self.should_rebuild_streaming_waveform(processed_len)
+                {
+                    let waveform = build_waveform_for_processed(
+                        &self.processed_samples,
+                        self.loading_sample_rate,
+                        self.audio_quality_mode.waveform_points(),
+                        self.speed,
+                    );
+                    let should_reset_view = was_empty && !waveform.is_empty();
+                    self.set_waveform_data(waveform, should_reset_view);
+                    self.mark_streaming_waveform_rebuild(processed_len);
                 }
 
                 if self.live_stream_playback
@@ -302,6 +312,8 @@ impl KeyScribeApp {
                 self.audio_loading_rx = None;
                 self.audio_loading_cancel = None;
                 self.live_stream_playback = false;
+                self.loading_cache_waveform_preloaded = false;
+                self.loading_preview_cache.clear();
 
                 let rebuild_mode = if self.preprocess_audio {
                     if self.loading_cache_timeline_preloaded {
@@ -320,6 +332,8 @@ impl KeyScribeApp {
                 self.audio_loading_cancel = None;
                 self.live_stream_playback = false;
                 self.loading_cache_timeline_preloaded = false;
+                self.loading_cache_waveform_preloaded = false;
+                self.loading_preview_cache.clear();
                 self.loading_raw_samples.clear();
                 self.loading_raw_samples_interleaved.clear();
                 self.last_error = Some(message);

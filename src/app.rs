@@ -23,7 +23,10 @@ use crate::analysis::{
     analyze_with_full_pipeline, detect_note_probabilities, detect_note_probabilities_cqt_preview,
     PIANO_HIGH_MIDI, PIANO_LOW_MIDI,
 };
-use crate::audio_io::{load_audio_file_streaming, AudioData, StreamingAudioEvent};
+use crate::audio_io::{
+    load_audio_file_streaming, load_audio_preview_chunk, AudioData, AudioPreviewChunk,
+    StreamingAudioEvent,
+};
 use crate::core::processing::build_waveform_for_processed;
 use crate::dsp::{apply_speed_and_pitch, apply_speed_and_pitch_interleaved};
 use crate::playback::{available_output_devices, AudioEngine, AudioOutputDeviceOption};
@@ -39,10 +42,10 @@ use crate::ui::widgets::icon_button;
 mod cache;
 mod loading;
 mod media_controls;
-mod top_controls;
-mod runtime;
-mod processing;
 mod playback;
+mod processing;
+mod runtime;
+mod top_controls;
 mod update;
 use media_controls::{draw_media_controls, setting_toggle_row};
 
@@ -65,11 +68,19 @@ const ANALYSIS_CACHE_MAX_COMPRESSED_BYTES: usize = 128 * 1024 * 1024;
 const ANALYSIS_CACHE_MAX_DECOMPRESSED_BYTES: usize = 1024 * 1024 * 1024;
 const ANALYSIS_CACHE_MAX_DECOMPRESS_RATIO: usize = 64;
 const ANALYSIS_CACHE_MAX_TIMELINE_FRAMES: usize = 120_000;
+const ANALYSIS_CACHE_MAX_WAVEFORM_POINTS: usize = 64_000;
 const STARTUP_MAX_AUDIO_FILE_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 const ALBUM_ART_MAX_BYTES: usize = 32 * 1024 * 1024;
 const ALBUM_ART_MAX_DIMENSION: usize = 4096;
 const AUDIO_STREAM_CHUNK_SAMPLES: usize = 44_100;
 const AUDIO_LOADING_MAX_EVENTS_PER_FRAME: usize = 2;
+const STREAMING_WAVEFORM_REBUILD_INTERVAL: Duration = Duration::from_millis(220);
+const STREAMING_WAVEFORM_REBUILD_SAMPLE_DELTA: usize = AUDIO_STREAM_CHUNK_SAMPLES * 2;
+const LOADING_PREVIEW_CACHE_CHUNK_SEC: f32 = 16.0;
+const LOADING_PREVIEW_CACHE_STRIDE_SEC: f32 = 8.0;
+const LOADING_PREVIEW_CACHE_MAX_ENTRIES: usize = 8;
+const ACTIVE_REPAINT_INTERVAL: Duration = Duration::from_millis(16);
+const IDLE_REPAINT_INTERVAL: Duration = Duration::from_millis(80);
 const TRANSCRIBE_PROGRESS_LOADING_WEIGHT: f32 = 0.35;
 const TRANSCRIBE_PROGRESS_MAX_BEFORE_DONE: f32 = 0.99;
 const MAX_RECENT_FILES: usize = 10;
@@ -241,6 +252,8 @@ struct AnalysisCacheBlob {
     preprocess_audio: bool,
     processed_samples_len: usize,
     processed_samples_shuffled_bytes: Option<Vec<u8>>,
+    #[serde(default)]
+    waveform_points: Option<Vec<[f32; 2]>>,
     base_note_timeline: Vec<Vec<f32>>,
     base_note_timeline_step_sec: f32,
 }
@@ -257,6 +270,7 @@ struct AnalysisCacheSnapshot<'a> {
     preprocess_audio: bool,
     processed_samples_len: usize,
     processed_samples_shuffled_bytes: Option<&'a [u8]>,
+    waveform_points: Option<&'a [[f32; 2]]>,
     base_note_timeline: &'a [Vec<f32>],
     base_note_timeline_step_sec: f32,
 }
@@ -372,6 +386,48 @@ fn validate_cached_note_timeline(note_timeline: &[Vec<f32>]) -> bool {
     note_timeline
         .iter()
         .all(|frame| frame.len() == note_count && frame.iter().all(|value| value.is_finite()))
+}
+
+fn validate_cached_waveform_points(points: &[[f32; 2]]) -> bool {
+    if points.is_empty() {
+        return false;
+    }
+    if points.len() > ANALYSIS_CACHE_MAX_WAVEFORM_POINTS {
+        return false;
+    }
+
+    let mut prev_x = f64::NEG_INFINITY;
+    for &[x, y] in points {
+        if !x.is_finite() || !y.is_finite() {
+            return false;
+        }
+
+        let x64 = x as f64;
+        if x64 < prev_x {
+            return false;
+        }
+        prev_x = x64;
+    }
+
+    true
+}
+
+fn pack_waveform_points(points: &[[f64; 2]]) -> Vec<[f32; 2]> {
+    points
+        .iter()
+        .filter_map(|&[x, y]| {
+            if !x.is_finite() || !y.is_finite() {
+                return None;
+            }
+
+            Some([x as f32, y as f32])
+        })
+        .take(ANALYSIS_CACHE_MAX_WAVEFORM_POINTS)
+        .collect()
+}
+
+fn unpack_waveform_points(points: &[[f32; 2]]) -> Vec<[f64; 2]> {
+    points.iter().map(|&[x, y]| [x as f64, y as f64]).collect()
 }
 
 fn analysis_cache_dir() -> PathBuf {
@@ -654,6 +710,12 @@ pub struct KeyScribeApp {
     processed_playback_samples: Vec<f32>,
     processed_playback_channels: u16,
     waveform: Vec<[f64; 2]>,
+    waveform_version: u64,
+    loop_waveform_cache_version: u64,
+    loop_waveform_cache_selection: Option<(f32, f32)>,
+    loop_waveform_cache_pre: Vec<[f64; 2]>,
+    loop_waveform_cache_mid: Vec<[f64; 2]>,
+    loop_waveform_cache_post: Vec<[f64; 2]>,
     note_timeline: Arc<Vec<Vec<f32>>>,
     note_timeline_step_sec: f32,
     base_note_timeline: Arc<Vec<Vec<f32>>>,
@@ -689,6 +751,7 @@ pub struct KeyScribeApp {
     cache_status_message_at: Option<Instant>,
     cache_precheck_done: bool,
     loading_cache_timeline_preloaded: bool,
+    loading_cache_waveform_preloaded: bool,
     pending_param_change: bool,
     last_param_change_at: Option<Instant>,
     queued_param_update: bool,
@@ -722,12 +785,15 @@ pub struct KeyScribeApp {
     loading_sample_rate: u32,
     loading_total_samples: Option<usize>,
     loading_decoded_samples: usize,
+    loading_last_waveform_rebuild_at: Option<Instant>,
+    loading_last_waveform_rebuild_samples: usize,
     loading_raw_samples: Vec<f32>,
     loading_raw_samples_interleaved: Vec<f32>,
     loading_source_channels: u16,
     loading_provisional_timeline: Vec<Vec<f32>>,
     loading_next_transcribe_time_sec: f32,
     loading_timeline_frames_pending_sync: usize,
+    loading_preview_cache: Vec<LoadingPreviewCacheEntry>,
     touch_loop_select_mode: bool,
     manual_import_path: String,
     mobile_ui_tweaks_applied: bool,
@@ -754,6 +820,15 @@ struct PreviewPlayback {
     samples: Vec<f32>,
     channels: u16,
     timeline_start_sec: f32,
+}
+
+struct LoadingPreviewCacheEntry {
+    source_key: String,
+    chunk_start_sec: f32,
+    sample_rate: u32,
+    channels: u16,
+    samples_interleaved: Arc<Vec<f32>>,
+    last_used_at: Instant,
 }
 
 #[derive(Default)]
@@ -797,6 +872,12 @@ impl KeyScribeApp {
             processed_playback_samples: Vec::new(),
             processed_playback_channels: 1,
             waveform: Vec::new(),
+            waveform_version: 0,
+            loop_waveform_cache_version: u64::MAX,
+            loop_waveform_cache_selection: None,
+            loop_waveform_cache_pre: Vec::new(),
+            loop_waveform_cache_mid: Vec::new(),
+            loop_waveform_cache_post: Vec::new(),
             note_timeline: Arc::new(Vec::new()),
             note_timeline_step_sec: 0.0,
             base_note_timeline: Arc::new(Vec::new()),
@@ -837,6 +918,7 @@ impl KeyScribeApp {
             cache_status_message_at: None,
             cache_precheck_done: false,
             loading_cache_timeline_preloaded: false,
+            loading_cache_waveform_preloaded: false,
             pending_param_change: false,
             last_param_change_at: None,
             queued_param_update: false,
@@ -874,12 +956,15 @@ impl KeyScribeApp {
             loading_sample_rate: 0,
             loading_total_samples: None,
             loading_decoded_samples: 0,
+            loading_last_waveform_rebuild_at: None,
+            loading_last_waveform_rebuild_samples: 0,
             loading_raw_samples: Vec::new(),
             loading_raw_samples_interleaved: Vec::new(),
             loading_source_channels: 1,
             loading_provisional_timeline: Vec::new(),
             loading_next_transcribe_time_sec: 0.0,
             loading_timeline_frames_pending_sync: 0,
+            loading_preview_cache: Vec::new(),
             touch_loop_select_mode: false,
             manual_import_path: startup_path
                 .as_ref()
@@ -909,5 +994,4 @@ impl KeyScribeApp {
 
         app
     }
-
 }

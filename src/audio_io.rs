@@ -8,9 +8,10 @@ use anyhow::{Context, Result};
 use symphonia::core::audio::SampleBuffer;
 use symphonia::core::codecs::DecoderOptions;
 use symphonia::core::errors::Error as SymphoniaError;
-use symphonia::core::formats::FormatOptions;
+use symphonia::core::formats::{FormatOptions, SeekMode, SeekTo};
 use symphonia::core::io::MediaSourceStream;
 use symphonia::core::meta::{MetadataOptions, MetadataRevision, StandardTagKey, StandardVisualKey};
+use symphonia::core::units::Time;
 use symphonia::default::{get_codecs, get_probe};
 
 #[derive(Clone, Default)]
@@ -28,6 +29,12 @@ pub struct AudioData {
     pub samples_interleaved: Arc<Vec<f32>>,
     pub samples_mono: Arc<Vec<f32>>,
     pub metadata: AudioMetadata,
+}
+
+pub struct AudioPreviewChunk {
+    pub sample_rate: u32,
+    pub channels: u16,
+    pub samples_interleaved: Vec<f32>,
 }
 
 pub enum StreamingAudioEvent {
@@ -421,4 +428,115 @@ pub fn load_audio_file_streaming(
     });
 
     Ok(())
+}
+
+pub fn load_audio_preview_chunk(
+    path: &Path,
+    start_sec: f32,
+    duration_sec: f32,
+) -> Result<AudioPreviewChunk> {
+    let file = File::open(path).with_context(|| format!("Cannot open file: {}", path.display()))?;
+    let mss = MediaSourceStream::new(Box::new(file), Default::default());
+
+    let mut probed = get_probe()
+        .format(
+            &Default::default(),
+            mss,
+            &FormatOptions::default(),
+            &MetadataOptions::default(),
+        )
+        .context("Failed to probe audio format")?;
+
+    let format = &mut probed.format;
+    let (track_id, codec_params) = {
+        let track = format
+            .default_track()
+            .context("No default audio track found")?;
+        (track.id, track.codec_params.clone())
+    };
+
+    let mut decoder = get_codecs()
+        .make(&codec_params, &DecoderOptions::default())
+        .context("Failed to create decoder")?;
+
+    let sample_rate = codec_params
+        .sample_rate
+        .context("Missing sample rate in codec params")?;
+    let source_channels = codec_params
+        .channels
+        .map(|channels| channels.count())
+        .unwrap_or(1)
+        .max(1);
+    let playback_channels = normalize_playback_channels(source_channels);
+
+    let duration_sec = duration_sec.clamp(0.25, 30.0);
+    let target_frames = (duration_sec * sample_rate as f32).ceil().max(1.0) as usize;
+    let start_sec = start_sec.max(0.0);
+
+    if start_sec > 0.0 {
+        let seek_seconds = start_sec.floor() as u64;
+        let seek_frac = (start_sec - seek_seconds as f32) as f64;
+        let seek_target = SeekTo::Time {
+            time: Time::new(seek_seconds, seek_frac),
+            track_id: Some(track_id),
+        };
+
+        let _ = format.seek(SeekMode::Accurate, seek_target);
+    }
+
+    let mut out = Vec::<f32>::with_capacity(target_frames * playback_channels as usize);
+    let mut decoded_frames = 0usize;
+
+    while decoded_frames < target_frames {
+        let packet = match format.next_packet() {
+            Ok(packet) => packet,
+            Err(SymphoniaError::IoError(_)) => break,
+            Err(SymphoniaError::ResetRequired) => {
+                return Err(anyhow::anyhow!(
+                    "Decoder reset required; unsupported in preview flow"
+                ));
+            }
+            Err(err) => return Err(anyhow::anyhow!("Packet read error: {err}")),
+        };
+
+        if packet.track_id() != track_id {
+            continue;
+        }
+
+        let decoded = match decoder.decode(&packet) {
+            Ok(decoded) => decoded,
+            Err(SymphoniaError::DecodeError(_)) => continue,
+            Err(err) => return Err(anyhow::anyhow!("Decode error: {err}")),
+        };
+
+        let channels = decoded.spec().channels.count().max(1);
+        let mut sample_buffer =
+            SampleBuffer::<f32>::new(decoded.capacity() as u64, *decoded.spec());
+        sample_buffer.copy_interleaved_ref(decoded);
+        let data = sample_buffer.samples();
+
+        if channels <= 1 {
+            let available = data.len().min(target_frames.saturating_sub(decoded_frames));
+            out.extend_from_slice(&data[..available]);
+            decoded_frames = decoded_frames.saturating_add(available);
+        } else if channels == 2 {
+            let available_frames = (data.len() / 2).min(target_frames.saturating_sub(decoded_frames));
+            out.extend_from_slice(&data[..available_frames * 2]);
+            decoded_frames = decoded_frames.saturating_add(available_frames);
+        } else {
+            let remaining = target_frames.saturating_sub(decoded_frames);
+            for frame in data.chunks(channels).take(remaining) {
+                let (left, right) = fold_multichannel_frame_to_stereo(frame);
+                out.push(left);
+                out.push(right);
+                decoded_frames += 1;
+            }
+        }
+    }
+
+    Ok(AudioPreviewChunk {
+        sample_rate,
+        channels: playback_channels,
+        samples_interleaved: out,
+    })
 }
