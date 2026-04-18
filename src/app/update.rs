@@ -37,6 +37,46 @@ impl eframe::App for KeyScribeApp {
             }
         }
 
+        #[cfg(feature = "desktop-ui")]
+        let (hovered_valid_drop, dropped_valid_drop, dropped_any_count) = ctx.input(|i| {
+            let hovered_valid_drop = i
+                .raw
+                .hovered_files
+                .iter()
+                .filter_map(|file| file.path.as_ref())
+                .find(|path| is_supported_audio_extension(path.as_path()))
+                .cloned();
+
+            let dropped_valid_drop = i
+                .raw
+                .dropped_files
+                .iter()
+                .filter_map(|file| file.path.as_ref())
+                .find(|path| is_supported_audio_extension(path.as_path()))
+                .cloned();
+
+            (
+                hovered_valid_drop,
+                dropped_valid_drop,
+                i.raw.dropped_files.len(),
+            )
+        });
+
+        #[cfg(feature = "desktop-ui")]
+        if let Some(path) = dropped_valid_drop {
+            match self.start_audio_loading_from_path(path, ctx) {
+                Ok(()) => {
+                    self.last_error = None;
+                }
+                Err(err) => {
+                    self.last_error = Some(err);
+                }
+            }
+        } else if dropped_any_count > 0 {
+            self.last_error =
+                Some("Drop a supported audio file (wav, mp3, flac, ogg, m4a, aac).".to_string());
+        }
+
         self.poll_audio_loading(ctx);
         self.poll_processing_result();
         self.sync_playhead_from_engine();
@@ -539,6 +579,45 @@ impl eframe::App for KeyScribeApp {
             });
         });
         self.waveform_panel_height = waveform_central.response.rect.height().clamp(120.0, 5000.0);
+
+        #[cfg(feature = "desktop-ui")]
+        if hovered_valid_drop.is_some() {
+            let screen_rect = ctx.input(|i| i.screen_rect());
+            let overlay_layer = egui::LayerId::new(
+                egui::Order::Foreground,
+                egui::Id::new("audio_file_drag_drop_overlay"),
+            );
+            let painter = ctx.layer_painter(overlay_layer);
+
+            painter.rect_filled(
+                screen_rect,
+                0.0,
+                egui::Color32::from_rgba_unmultiplied(6, 10, 16, 168),
+            );
+
+            let border_color = egui::Color32::from_rgb(
+                self.highlight_color.r().saturating_add(20),
+                self.highlight_color.g().saturating_add(20),
+                self.highlight_color.b().saturating_add(20),
+            );
+            let frame_rect = screen_rect.shrink(22.0);
+            painter.rect_stroke(frame_rect, 12.0, egui::Stroke::new(2.0, border_color));
+
+            painter.text(
+                frame_rect.center() + egui::vec2(0.0, -10.0),
+                egui::Align2::CENTER_CENTER,
+                "Drop Audio File To Import",
+                egui::FontId::proportional(26.0),
+                egui::Color32::WHITE,
+            );
+            painter.text(
+                frame_rect.center() + egui::vec2(0.0, 22.0),
+                egui::Align2::CENTER_CENTER,
+                "Supports wav, mp3, flac, ogg, m4a, aac",
+                egui::FontId::proportional(16.0),
+                egui::Color32::from_gray(216),
+            );
+        }
 
         // Keep high refresh only when motion or background work is active.
         let pointer_active = ctx.input(|i| i.pointer.any_down());
