@@ -26,13 +26,6 @@ jobs:
               # build/macos/transcriber-macos-arm64*.zip
               build/macos/transcriber-macos-arm64*.dmg
               # build/macos/transcriber-macos-arm64*.pkg
-          - os: macos-14
-            name: macos-x64
-            target: x86_64-apple-darwin
-            artifact_glob: |
-              # build/macos/transcriber-macos-x64*.zip
-              build/macos/transcriber-macos-x64*.dmg
-              # build/macos/transcriber-macos-x64*.pkg
           - os: ubuntu-latest
             name: linux
             artifact_glob: build/linux/*.zip
