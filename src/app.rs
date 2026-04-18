@@ -8,6 +8,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use bincode::Options;
+use directories::ProjectDirs;
 use eframe::egui;
 #[cfg(not(feature = "desktop-ui"))]
 use egui_phosphor::regular::GEAR;
@@ -269,11 +270,40 @@ fn app_portable_base_dir() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from("."))
 }
 
+fn app_project_dirs() -> Option<ProjectDirs> {
+    ProjectDirs::from("com", "Frantzes", "VisualTranscriber")
+}
+
+#[cfg(target_os = "macos")]
+fn is_running_from_macos_app_bundle() -> bool {
+    std::env::current_exe()
+        .ok()
+        .map(|exe| exe.to_string_lossy().contains(".app/Contents/MacOS/"))
+        .unwrap_or(false)
+}
+
+#[cfg(not(target_os = "macos"))]
+fn is_running_from_macos_app_bundle() -> bool {
+    false
+}
+
 fn app_data_dir() -> PathBuf {
+    if is_running_from_macos_app_bundle() {
+        if let Some(project_dirs) = app_project_dirs() {
+            return project_dirs.data_local_dir().to_path_buf();
+        }
+    }
+
     app_portable_base_dir()
 }
 
 fn app_cache_base_dir() -> PathBuf {
+    if is_running_from_macos_app_bundle() {
+        if let Some(project_dirs) = app_project_dirs() {
+            return project_dirs.cache_dir().to_path_buf();
+        }
+    }
+
     app_portable_base_dir()
 }
 

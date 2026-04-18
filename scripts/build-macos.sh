@@ -6,6 +6,10 @@ TARGET=""
 OUTPUT_ROOT="build/macos"
 SKIP_CARGO_BUILD=0
 PORTABLE_ONLY=0
+BUNDLE_ID="${BUNDLE_ID:-com.frantzes.visualtranscriber}"
+APP_VERSION_INPUT="${APP_VERSION:-}"
+APP_BUILD_INPUT="${APP_BUILD:-}"
+DMG_ONLY="${DMG_ONLY:-0}"
 
 usage() {
     cat <<'EOF'
@@ -15,8 +19,14 @@ Options:
   --target <triple>     Rust target triple (default: host macOS target)
   --output-root <path>  Output folder root (default: build/macos)
   --skip-cargo-build    Skip cargo build step
-    --portable-only       Build only portable zip (skip .app bundle archive)
+    --portable-only       Build only portable zip (skip .app/.pkg/.dmg artifacts)
   -h, --help            Show this help
+
+Environment overrides:
+    APP_VERSION           App version (default: tag name or Cargo.toml version)
+    APP_BUILD             CFBundleVersion build string (default: APP_VERSION)
+    BUNDLE_ID             macOS bundle/package identifier
+    DMG_ONLY              Set to 1 to skip portable zip and only build dmg app installer
 EOF
 }
 
@@ -58,6 +68,23 @@ target_to_arch_label() {
     esac
 }
 
+normalize_version_string() {
+    local raw="${1:-}"
+    raw="${raw#refs/tags/}"
+    raw="${raw#v}"
+    raw="$(echo "$raw" | sed -E 's/[^0-9.]+/./g; s/[.]+/./g; s/^\.//; s/\.$//')"
+
+    if [[ -z "$raw" ]]; then
+        raw="0.1.0"
+    fi
+
+    echo "$raw"
+}
+
+read_cargo_version() {
+    awk -F'"' '/^version[[:space:]]*=/{print $2; exit}' "$REPO_ROOT/Cargo.toml" 2>/dev/null || true
+}
+
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --target)
@@ -97,10 +124,27 @@ fi
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 
+if [[ -z "$APP_VERSION_INPUT" ]]; then
+    APP_VERSION_INPUT="${GITHUB_REF_NAME:-}"
+fi
+if [[ -z "$APP_VERSION_INPUT" ]]; then
+    APP_VERSION_INPUT="$(read_cargo_version)"
+fi
+
+APP_VERSION="$(normalize_version_string "$APP_VERSION_INPUT")"
+
+if [[ -z "$APP_BUILD_INPUT" ]]; then
+    APP_BUILD_INPUT="$APP_VERSION"
+fi
+
+APP_BUILD="$(normalize_version_string "$APP_BUILD_INPUT")"
+
 if [[ "$SKIP_CARGO_BUILD" -eq 0 ]]; then
     echo "Building release binary for $TARGET..."
     cargo build --release --target "$TARGET"
 fi
+
+echo "Packaging app metadata: version=$APP_VERSION build=$APP_BUILD bundle_id=$BUNDLE_ID"
 
 BINARY_NAME="transcriber"
 BINARY_CANDIDATES=(
@@ -129,17 +173,18 @@ fi
 
 ARCH_LABEL="$(target_to_arch_label "$TARGET")"
 BUNDLE_NAME="transcriber-macos-$ARCH_LABEL"
-BUNDLE_DIR="$REPO_ROOT/$OUTPUT_ROOT/$BUNDLE_NAME"
-MODELS_DIR="$BUNDLE_DIR/models"
+if [[ "$DMG_ONLY" -eq 0 ]]; then
+    BUNDLE_DIR="$REPO_ROOT/$OUTPUT_ROOT/$BUNDLE_NAME"
+    MODELS_DIR="$BUNDLE_DIR/models"
 
-rm -rf "$BUNDLE_DIR"
-mkdir -p "$MODELS_DIR"
+    rm -rf "$BUNDLE_DIR"
+    mkdir -p "$MODELS_DIR"
 
-cp "$BINARY_PATH" "$BUNDLE_DIR/$BINARY_NAME"
-chmod +x "$BUNDLE_DIR/$BINARY_NAME"
-cp "$MODEL_PATH" "$MODELS_DIR/basic-pitch.onnx"
+    cp "$BINARY_PATH" "$BUNDLE_DIR/$BINARY_NAME"
+    chmod +x "$BUNDLE_DIR/$BINARY_NAME"
+    cp "$MODEL_PATH" "$MODELS_DIR/basic-pitch.onnx"
 
-cat > "$BUNDLE_DIR/README-portable.txt" <<'EOF'
+    cat > "$BUNDLE_DIR/README-portable.txt" <<'EOF'
 Audio Transcriber portable macOS bundle
 
 Contents:
@@ -151,11 +196,11 @@ If Gatekeeper blocks launch, run:
 xattr -dr com.apple.quarantine ./transcriber
 EOF
 
-mkdir -p "$REPO_ROOT/$OUTPUT_ROOT"
-ARCHIVE_PATH="$REPO_ROOT/$OUTPUT_ROOT/$BUNDLE_NAME.zip"
-rm -f "$ARCHIVE_PATH"
+    mkdir -p "$REPO_ROOT/$OUTPUT_ROOT"
+    ARCHIVE_PATH="$REPO_ROOT/$OUTPUT_ROOT/$BUNDLE_NAME.zip"
+    rm -f "$ARCHIVE_PATH"
 
-python3 - "$BUNDLE_DIR" "$ARCHIVE_PATH" <<'PY'
+    python3 - "$BUNDLE_DIR" "$ARCHIVE_PATH" <<'PY'
 import pathlib
 import sys
 import zipfile
@@ -169,8 +214,9 @@ with zipfile.ZipFile(archive_path, mode="w", compression=zipfile.ZIP_DEFLATED) a
             archive.write(item, item.relative_to(bundle_dir))
 PY
 
-echo "Portable bundle directory: $BUNDLE_DIR"
-echo "Portable bundle archive:   $ARCHIVE_PATH"
+    echo "Portable bundle directory: $BUNDLE_DIR"
+    echo "Portable bundle archive:   $ARCHIVE_PATH"
+fi
 
 if [[ "$PORTABLE_ONLY" -eq 0 ]]; then
     APP_STAGE_DIR="$REPO_ROOT/$OUTPUT_ROOT/$BUNDLE_NAME-app"
@@ -203,7 +249,7 @@ exec "$SCRIPT_DIR/transcriber-bin" "$@"
 EOF
     chmod +x "$APP_MACOS_DIR/Transcriber"
 
-    cat > "$APP_CONTENTS_DIR/Info.plist" <<'EOF'
+    cat > "$APP_CONTENTS_DIR/Info.plist" <<EOF
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
@@ -225,20 +271,52 @@ EOF
     <key>CFBundlePackageType</key>
     <string>APPL</string>
     <key>CFBundleShortVersionString</key>
-    <string>0.1.0</string>
+    <string>$APP_VERSION</string>
     <key>CFBundleVersion</key>
-    <string>1</string>
+    <string>$APP_BUILD</string>
     <key>LSMinimumSystemVersion</key>
     <string>11.0</string>
 </dict>
 </plist>
 EOF
 
-    APP_ARCHIVE_PATH="$REPO_ROOT/$OUTPUT_ROOT/$BUNDLE_NAME-app.zip"
-    rm -f "$APP_ARCHIVE_PATH"
-    ditto -c -k --sequesterRsrc --keepParent "$APP_BUNDLE_DIR" "$APP_ARCHIVE_PATH"
+    # DMG-only mode: keep legacy app-zip/package install paths commented for quick restore.
+    # APP_ARCHIVE_PATH="$REPO_ROOT/$OUTPUT_ROOT/$BUNDLE_NAME-app.zip"
+    # rm -f "$APP_ARCHIVE_PATH"
+    # ditto -c -k --sequesterRsrc --keepParent "$APP_BUNDLE_DIR" "$APP_ARCHIVE_PATH"
+
+    # PKG_STAGE_DIR="$APP_STAGE_DIR/pkg-root"
+    # rm -rf "$PKG_STAGE_DIR"
+    # mkdir -p "$PKG_STAGE_DIR"
+    # cp -R "$APP_BUNDLE_DIR" "$PKG_STAGE_DIR/Transcriber.app"
+
+    # PKG_PATH="$REPO_ROOT/$OUTPUT_ROOT/$BUNDLE_NAME.pkg"
+    # rm -f "$PKG_PATH"
+    # pkgbuild \
+    #     --root "$PKG_STAGE_DIR" \
+    #     --identifier "$BUNDLE_ID" \
+    #     --version "$APP_VERSION" \
+    #     --install-location "/Applications" \
+    #     "$PKG_PATH"
+
+    DMG_STAGE_DIR="$APP_STAGE_DIR/dmg-root"
+    rm -rf "$DMG_STAGE_DIR"
+    mkdir -p "$DMG_STAGE_DIR"
+    cp -R "$APP_BUNDLE_DIR" "$DMG_STAGE_DIR/Transcriber.app"
+    ln -sfn /Applications "$DMG_STAGE_DIR/Applications"
+
+    DMG_PATH="$REPO_ROOT/$OUTPUT_ROOT/$BUNDLE_NAME.dmg"
+    rm -f "$DMG_PATH"
+    hdiutil create \
+        -volname "Transcriber" \
+        -srcfolder "$DMG_STAGE_DIR" \
+        -ov \
+        -format UDZO \
+        "$DMG_PATH"
 
     echo "App bundle directory:      $APP_BUNDLE_DIR"
-    echo "App bundle archive:        $APP_ARCHIVE_PATH"
+    # echo "App bundle archive:        $APP_ARCHIVE_PATH"
+    # echo "Installer package:         $PKG_PATH"
+    echo "Drag-and-drop disk image:  $DMG_PATH"
 fi
 

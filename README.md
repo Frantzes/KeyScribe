@@ -67,9 +67,15 @@ Outputs:
 - Portable:
 - build/macos/transcriber-macos-arm64/ or build/macos/transcriber-macos-x64/
 - build/macos/transcriber-macos-arm64.zip or build/macos/transcriber-macos-x64.zip
-- Typical app experience:
+- App bundle archive:
 - build/macos/transcriber-macos-arm64-app/Transcriber.app or build/macos/transcriber-macos-x64-app/Transcriber.app
-- build/macos/transcriber-macos-arm64-app.zip or build/macos/transcriber-macos-x64-app.zip
+- (disabled in current CI) build/macos/transcriber-macos-arm64-app.zip or build/macos/transcriber-macos-x64-app.zip
+- Drag-and-drop installer:
+- build/macos/transcriber-macos-arm64.dmg or build/macos/transcriber-macos-x64.dmg
+- Package installer:
+- (disabled in current CI) build/macos/transcriber-macos-arm64.pkg or build/macos/transcriber-macos-x64.pkg
+
+For installed `.app` runs on macOS, app state and analysis cache are stored in user Library locations (not inside the app bundle), so installs under `/Applications` remain writable for cache updates.
 
 ### Linux
 
@@ -86,7 +92,7 @@ Outputs:
 ## Automated Releases (Tags)
 
 Tag push triggers [.github/workflows/release-on-tag.yml](.github/workflows/release-on-tag.yml).
-Workflow builds Windows, macOS (arm64 and Intel x64), Linux bundles and uploads zip artifacts to GitHub Release.
+Workflow builds Windows and Linux portable zips, plus macOS arm64/x64 DMG installer artifacts and uploads assets to GitHub Release.
 
 ```bash
 git tag v0.1.0
