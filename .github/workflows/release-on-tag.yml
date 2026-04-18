@@ -8,9 +8,6 @@ on:
 permissions:
   contents: write
 
-env:
-  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
-
 jobs:
   build:
     name: Build ${{ matrix.name }} bundle
@@ -24,12 +21,14 @@ jobs:
             artifact_glob: build/windows/*.zip
           - os: macos-14
             name: macos-arm64
+            target: aarch64-apple-darwin
             artifact_glob: |
               # build/macos/transcriber-macos-arm64*.zip
               build/macos/transcriber-macos-arm64*.dmg
               # build/macos/transcriber-macos-arm64*.pkg
-          - os: macos-13
+          - os: macos-14
             name: macos-x64
+            target: x86_64-apple-darwin
             artifact_glob: |
               # build/macos/transcriber-macos-x64*.zip
               build/macos/transcriber-macos-x64*.dmg
@@ -78,8 +77,9 @@ jobs:
           APP_VERSION: ${{ github.ref_name }}
           DMG_ONLY: "1"
         run: |
+          rustup target add ${{ matrix.target }}
           chmod +x scripts/build-macos.sh
-          ./scripts/build-macos.sh
+          ./scripts/build-macos.sh --target ${{ matrix.target }}
 
       - name: Build Linux bundle
         if: matrix.name == 'linux'
@@ -107,8 +107,25 @@ jobs:
           merge-multiple: true
 
       - name: Publish release assets
-        uses: softprops/action-gh-release@v2
-        with:
-          tag_name: ${{ github.ref_name }}
-          generate_release_notes: true
-          files: release-assets/*
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG_NAME: ${{ github.ref_name }}
+        run: |
+          if ! command -v gh >/dev/null 2>&1; then
+            sudo apt-get update
+            sudo apt-get install -y gh
+          fi
+
+          shopt -s nullglob
+          assets=(release-assets/*)
+          if [[ ${#assets[@]} -eq 0 ]]; then
+            echo "No release assets found in release-assets/."
+            exit 1
+          fi
+
+          if gh release view "$TAG_NAME" >/dev/null 2>&1; then
+            gh release upload "$TAG_NAME" "${assets[@]}" --clobber
+          else
+            gh release create "$TAG_NAME" "${assets[@]}" --generate-notes
+          fi

@@ -3,6 +3,9 @@
 Transcriber is desktop app for polyphonic note detection from recorded audio.
 Built in Rust. Optimized for accuracy, responsiveness, portable distribution.
 
+> Status: Beta (active development).
+> The app is still evolving quickly and behavior, UI, and outputs may change between releases.
+
 ## Product Overview
 
 - Real-time waveform and piano visualization.
