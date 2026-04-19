@@ -97,16 +97,25 @@ impl AudioEngine {
     pub fn play_from(
         &mut self,
         samples: &[f32],
+        channels: u16,
         sample_rate: u32,
         start_pos_sec: f32,
         timeline_rate: f32,
     ) -> Result<()> {
-        self.play_range(samples, sample_rate, start_pos_sec, None, timeline_rate)
+        self.play_range(
+            samples,
+            channels,
+            sample_rate,
+            start_pos_sec,
+            None,
+            timeline_rate,
+        )
     }
 
     pub fn play_range(
         &mut self,
         samples: &[f32],
+        channels: u16,
         sample_rate: u32,
         start_pos_sec: f32,
         end_pos_sec: Option<f32>,
@@ -118,18 +127,27 @@ impl AudioEngine {
             return Ok(());
         }
 
-        let timeline_rate = timeline_rate.clamp(0.25, 4.0);
-
-        let start_idx = ((start_pos_sec.max(0.0) / timeline_rate) * sample_rate as f32) as usize;
-        if start_idx >= samples.len() {
+        let channels = channels.max(1);
+        let channels_usize = channels as usize;
+        let frame_count = samples.len() / channels_usize;
+        if frame_count == 0 {
             return Ok(());
         }
 
-        let mut end_idx = samples.len();
-        if let Some(end) = end_pos_sec {
-            end_idx = (((end.max(start_pos_sec) / timeline_rate) * sample_rate as f32) as usize)
-                .min(samples.len());
+        let timeline_rate = timeline_rate.clamp(0.25, 4.0);
+
+        let start_frame = ((start_pos_sec.max(0.0) / timeline_rate) * sample_rate as f32) as usize;
+        if start_frame >= frame_count {
+            return Ok(());
         }
+        let start_idx = start_frame * channels_usize;
+
+        let mut end_frame = frame_count;
+        if let Some(end) = end_pos_sec {
+            end_frame = (((end.max(start_pos_sec) / timeline_rate) * sample_rate as f32) as usize)
+                .min(frame_count);
+        }
+        let end_idx = end_frame * channels_usize;
 
         if end_idx <= start_idx {
             return Ok(());
@@ -138,7 +156,7 @@ impl AudioEngine {
         let sink = Sink::try_new(&self.stream_handle).context("Failed to create playback sink")?;
         sink.set_volume(self.volume.clamp(0.0, 1.5));
         let data = samples[start_idx..end_idx].to_vec();
-        let source = SamplesBuffer::new(1, sample_rate, data);
+        let source = SamplesBuffer::new(channels, sample_rate, data);
 
         sink.append(source);
         sink.play();
@@ -146,7 +164,8 @@ impl AudioEngine {
         self.duration_sec = if let Some(end) = end_pos_sec {
             end.max(start_pos_sec)
         } else {
-            start_pos_sec + ((end_idx - start_idx) as f32 / sample_rate as f32) * timeline_rate
+            let played_frames = end_frame.saturating_sub(start_frame);
+            start_pos_sec + (played_frames as f32 / sample_rate as f32) * timeline_rate
         };
         self.start_pos_sec = start_pos_sec;
         self.timeline_rate = timeline_rate;
@@ -160,6 +179,7 @@ impl AudioEngine {
     pub fn play_chunk_at_timeline(
         &mut self,
         samples: &[f32],
+        channels: u16,
         sample_rate: u32,
         timeline_start_sec: f32,
         timeline_rate: f32,
@@ -170,16 +190,23 @@ impl AudioEngine {
             return Ok(());
         }
 
+        let channels = channels.max(1);
+        let channels_usize = channels as usize;
+        let frame_count = samples.len() / channels_usize;
+        if frame_count == 0 {
+            return Ok(());
+        }
+
         let timeline_rate = timeline_rate.clamp(0.25, 4.0);
         let sink = Sink::try_new(&self.stream_handle).context("Failed to create playback sink")?;
         sink.set_volume(self.volume.clamp(0.0, 1.5));
-        let data = samples.to_vec();
-        let source = SamplesBuffer::new(1, sample_rate, data);
+        let data = samples[..frame_count * channels_usize].to_vec();
+        let source = SamplesBuffer::new(channels, sample_rate, data);
 
         sink.append(source);
         sink.play();
 
-        let duration = samples.len() as f32 / sample_rate as f32;
+        let duration = frame_count as f32 / sample_rate as f32;
         self.start_pos_sec = timeline_start_sec.max(0.0);
         self.duration_sec = self.start_pos_sec + duration * timeline_rate;
         self.timeline_rate = timeline_rate;
@@ -197,10 +224,18 @@ impl AudioEngine {
     pub fn append_samples(
         &mut self,
         samples: &[f32],
+        channels: u16,
         sample_rate: u32,
         timeline_rate: f32,
     ) -> Result<()> {
         if samples.is_empty() || sample_rate == 0 {
+            return Ok(());
+        }
+
+        let channels = channels.max(1);
+        let channels_usize = channels as usize;
+        let frame_count = samples.len() / channels_usize;
+        if frame_count == 0 {
             return Ok(());
         }
 
@@ -209,8 +244,12 @@ impl AudioEngine {
         };
 
         let timeline_rate = timeline_rate.clamp(0.25, 4.0);
-        sink.append(SamplesBuffer::new(1, sample_rate, samples.to_vec()));
-        self.duration_sec += (samples.len() as f32 / sample_rate as f32) * timeline_rate;
+        sink.append(SamplesBuffer::new(
+            channels,
+            sample_rate,
+            samples[..frame_count * channels_usize].to_vec(),
+        ));
+        self.duration_sec += (frame_count as f32 / sample_rate as f32) * timeline_rate;
         self.timeline_rate = timeline_rate;
 
         // If playback reached queue end and new audio arrives, resume timeline tracking.

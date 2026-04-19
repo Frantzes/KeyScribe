@@ -1,7 +1,7 @@
 use super::*;
 use crate::core::processing::build_waveform_for_processed;
 
-impl TranscriberApp {
+impl KeyScribeApp {
     #[allow(clippy::too_many_arguments)]
     pub(super) fn load_cached_timeline_for_variant(
         song_hash: &str,
@@ -12,7 +12,10 @@ impl TranscriberApp {
         pitch_semitones: f32,
         use_cqt_analysis: bool,
         preprocess_audio: bool,
-    ) -> (Option<(Arc<Vec<Vec<f32>>>, f32)>, CachePrecheckDiagnostics) {
+    ) -> (
+        Option<(Arc<Vec<Vec<f32>>>, f32, Option<Vec<[f64; 2]>>)>,
+        CachePrecheckDiagnostics,
+    ) {
         let mut diag = CachePrecheckDiagnostics::default();
 
         let variant_key = analysis_cache_variant_key(
@@ -88,10 +91,17 @@ impl TranscriberApp {
                 continue;
             }
 
+            let cached_waveform = cache
+                .waveform_points
+                .as_deref()
+                .filter(|points| validate_cached_waveform_points(points))
+                .map(unpack_waveform_points);
+
             return (
                 Some((
                     Arc::new(cache.base_note_timeline),
                     cache.base_note_timeline_step_sec,
+                    cached_waveform,
                 )),
                 diag,
             );
@@ -127,7 +137,7 @@ impl TranscriberApp {
             self.preprocess_audio,
         );
 
-        if let Some((base_timeline, base_step_sec)) = cached_timeline {
+        if let Some((base_timeline, base_step_sec, cached_waveform)) = cached_timeline {
             self.base_note_timeline = Arc::clone(&base_timeline);
             self.base_note_timeline_step_sec = base_step_sec;
             let (note_timeline, note_step_sec) = Self::transform_note_timeline(
@@ -139,11 +149,18 @@ impl TranscriberApp {
             self.note_timeline = note_timeline;
             self.note_timeline_step_sec = note_step_sec;
             self.loading_cache_timeline_preloaded = true;
+            if let Some(waveform) = cached_waveform {
+                self.set_waveform_data(waveform, true);
+                self.loading_cache_waveform_preloaded = true;
+            } else {
+                self.loading_cache_waveform_preloaded = false;
+            }
             self.update_note_probabilities(true);
             self.cache_status_message =
                 Some("Analysis cache: transcription loaded during render.".to_string());
         } else {
             self.loading_cache_timeline_preloaded = false;
+            self.loading_cache_waveform_preloaded = false;
             let hash_short = &song_hash[..song_hash.len().min(8)];
             let mismatch_total = precheck_diag.shared_param_mismatches
                 + precheck_diag.strict_len_mismatches
@@ -185,6 +202,8 @@ impl TranscriberApp {
         let sample_rate = audio.sample_rate;
         let raw_sample_len = audio.samples_mono.len();
         let raw_samples = Arc::clone(&audio.samples_mono);
+        let raw_playback_samples = Arc::clone(&audio.samples_interleaved);
+        let raw_playback_channels = audio.channels.max(1);
 
         let song_hash = if let Some(hash) = self.loaded_audio_hash.clone() {
             hash
@@ -196,7 +215,12 @@ impl TranscriberApp {
             hash
         };
 
-        let Some((processed_samples, base_note_timeline, base_note_timeline_step_sec)) =
+        let Some((
+            processed_samples,
+            base_note_timeline,
+            base_note_timeline_step_sec,
+            cached_waveform,
+        )) =
             Self::load_analysis_cache_for_variant(
                 song_hash.as_str(),
                 sample_rate,
@@ -230,17 +254,32 @@ impl TranscriberApp {
         };
 
         self.processed_samples = processed_samples;
-        self.waveform = build_waveform_for_processed(
-            self.processed_samples.as_slice(),
-            sample_rate,
-            self.audio_quality_mode.waveform_points(),
-            self.speed,
-        );
+        self.processed_playback_channels = raw_playback_channels;
+        self.processed_playback_samples = if speed_pitch_is_identity(self.speed, self.pitch_semitones)
+        {
+            raw_playback_samples.as_ref().to_vec()
+        } else {
+            apply_speed_and_pitch_interleaved(
+                raw_playback_samples.as_slice(),
+                raw_playback_channels,
+                sample_rate,
+                self.speed,
+                self.pitch_semitones,
+            )
+        };
+        let waveform = cached_waveform.unwrap_or_else(|| {
+            build_waveform_for_processed(
+                self.processed_samples.as_slice(),
+                sample_rate,
+                self.audio_quality_mode.waveform_points(),
+                self.speed,
+            )
+        });
+        self.set_waveform_data(waveform, true);
         self.note_timeline = note_timeline;
         self.note_timeline_step_sec = note_timeline_step_sec;
         self.base_note_timeline = base_note_timeline;
         self.base_note_timeline_step_sec = base_note_timeline_step_sec;
-        self.waveform_reset_view = true;
         self.selected_time_sec = self.selected_time_sec.min(self.source_duration());
         self.playing_preview_buffer = false;
         self.update_note_probabilities(true);
@@ -259,7 +298,7 @@ impl TranscriberApp {
         pitch_semitones: f32,
         use_cqt_analysis: bool,
         preprocess_audio: bool,
-    ) -> Option<(Vec<f32>, Arc<Vec<Vec<f32>>>, f32)> {
+    ) -> Option<(Vec<f32>, Arc<Vec<Vec<f32>>>, f32, Option<Vec<[f64; 2]>>)> {
         let variant_key = analysis_cache_variant_key(
             sample_rate,
             raw_sample_len,
@@ -299,6 +338,12 @@ impl TranscriberApp {
                 continue;
             }
 
+            let cached_waveform = cache
+                .waveform_points
+                .as_deref()
+                .filter(|points| validate_cached_waveform_points(points))
+                .map(unpack_waveform_points);
+
             let processed_samples = if let Some(shuffled) = cache.processed_samples_shuffled_bytes {
                 let max_processed_len = raw_sample_len.saturating_mul(8);
                 if cache.processed_samples_len == 0
@@ -333,6 +378,7 @@ impl TranscriberApp {
                 processed_samples,
                 base_note_timeline,
                 base_note_timeline_step_sec,
+                cached_waveform,
             ));
         }
 
@@ -350,6 +396,7 @@ impl TranscriberApp {
         use_cqt_analysis: bool,
         preprocess_audio: bool,
         processed_samples: &[f32],
+        waveform: &[[f64; 2]],
         base_note_timeline: &[Vec<f32>],
         base_note_timeline_step_sec: f32,
     ) {
@@ -385,6 +432,7 @@ impl TranscriberApp {
         } else {
             (0usize, None)
         };
+        let packed_waveform = pack_waveform_points(waveform);
 
         let snapshot = AnalysisCacheSnapshot {
             cache_version: ANALYSIS_CACHE_VERSION,
@@ -397,6 +445,11 @@ impl TranscriberApp {
             preprocess_audio,
             processed_samples_len,
             processed_samples_shuffled_bytes: processed_samples_shuffled_bytes.as_deref(),
+            waveform_points: if packed_waveform.is_empty() {
+                None
+            } else {
+                Some(packed_waveform.as_slice())
+            },
             base_note_timeline,
             base_note_timeline_step_sec,
         };

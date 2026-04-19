@@ -1,6 +1,11 @@
 use eframe::egui;
 
 use crate::analysis::{PIANO_HIGH_MIDI, PIANO_LOW_MIDI};
+use crate::theme::{
+    PIANO_BLACK_KEY_BG, PIANO_BLACK_KEY_STROKE, PIANO_C4_MARKER, PIANO_WHITE_KEY_BG,
+    PIANO_WHITE_KEY_STROKE, PROBABILITY_PANE_BG, PROBABILITY_PANE_BLACK_KEY_BG,
+    PROBABILITY_PANE_BLACK_KEY_STROKE, PROBABILITY_PANE_WHITE_KEY_STROKE,
+};
 
 pub const PIANO_ZOOM_MIN: f32 = 0.35;
 pub const PIANO_ZOOM_MAX: f32 = 1.0;
@@ -67,11 +72,11 @@ pub fn draw_piano_view(
         let key_rect =
             egui::Rect::from_min_max(egui::pos2(x0, rect.top()), egui::pos2(x1, rect.bottom()));
 
-        painter.rect_filled(key_rect, 0.0, egui::Color32::from_gray(238));
+        painter.rect_filled(key_rect, 0.0, PIANO_WHITE_KEY_BG);
         painter.rect_stroke(
             key_rect,
             0.0,
-            egui::Stroke::new(1.0, egui::Color32::from_gray(90)),
+            egui::Stroke::new(1.0, PIANO_WHITE_KEY_STROKE),
         );
 
         let idx = (midi - PIANO_LOW_MIDI) as usize;
@@ -85,7 +90,7 @@ pub fn draw_piano_view(
             painter.rect_stroke(
                 key_rect,
                 0.0,
-                egui::Stroke::new(1.0, egui::Color32::from_gray(90)),
+                egui::Stroke::new(1.0, PIANO_WHITE_KEY_STROKE),
             );
         }
 
@@ -110,11 +115,11 @@ pub fn draw_piano_view(
             egui::pos2(x1, rect.top() + black_h),
         );
 
-        painter.rect_filled(key_rect, 2.0, egui::Color32::from_gray(55));
+        painter.rect_filled(key_rect, 2.0, PIANO_BLACK_KEY_BG);
         painter.rect_stroke(
             key_rect,
             2.0,
-            egui::Stroke::new(1.0, egui::Color32::from_gray(65)),
+            egui::Stroke::new(1.0, PIANO_BLACK_KEY_STROKE),
         );
 
         let idx = (midi - PIANO_LOW_MIDI) as usize;
@@ -128,7 +133,7 @@ pub fn draw_piano_view(
             painter.rect_stroke(
                 key_rect,
                 2.0,
-                egui::Stroke::new(1.0, egui::Color32::from_gray(65)),
+                egui::Stroke::new(1.0, PIANO_BLACK_KEY_STROKE),
             );
         }
     }
@@ -139,11 +144,7 @@ pub fn draw_piano_view(
         if cx >= rect.left() && cx <= rect.right() {
             let marker_radius = 4.0;
             let marker_y = (rect.bottom() - marker_radius - 2.0).max(rect.top() + marker_radius);
-            painter.circle_filled(
-                egui::pos2(cx, marker_y),
-                marker_radius,
-                egui::Color32::from_gray(155),
-            );
+            painter.circle_filled(egui::pos2(cx, marker_y), marker_radius, PIANO_C4_MARKER);
         }
     }
 
@@ -168,7 +169,7 @@ pub fn draw_probability_pane(
     );
     let (rect, response) = ui.allocate_exact_size(desired_size, egui::Sense::click());
     let painter = ui.painter_at(rect);
-    painter.rect_filled(rect, 4.0, egui::Color32::from_rgb(33, 38, 46));
+    painter.rect_filled(rect, 4.0, PROBABILITY_PANE_BG);
 
     let white_count = (PIANO_LOW_MIDI..=PIANO_HIGH_MIDI)
         .filter(|midi| !is_black_key(*midi))
@@ -198,10 +199,7 @@ pub fn draw_probability_pane(
         painter.rect_stroke(
             key_rect,
             0.0,
-            egui::Stroke::new(
-                1.0,
-                egui::Color32::from_rgba_unmultiplied(120, 120, 120, 60),
-            ),
+            egui::Stroke::new(1.0, PROBABILITY_PANE_WHITE_KEY_STROKE),
         );
 
         let idx = (midi - PIANO_LOW_MIDI) as usize;
@@ -258,14 +256,11 @@ pub fn draw_probability_pane(
             egui::pos2(x0, rect.top()),
             egui::pos2(x1, rect.top() + black_h),
         );
-        painter.rect_filled(key_rect, 2.0, egui::Color32::from_rgb(28, 31, 38));
+        painter.rect_filled(key_rect, 2.0, PROBABILITY_PANE_BLACK_KEY_BG);
         painter.rect_stroke(
             key_rect,
             2.0,
-            egui::Stroke::new(
-                1.0,
-                egui::Color32::from_rgba_unmultiplied(160, 160, 170, 80),
-            ),
+            egui::Stroke::new(1.0, PROBABILITY_PANE_BLACK_KEY_STROKE),
         );
 
         let idx = (midi - PIANO_LOW_MIDI) as usize;

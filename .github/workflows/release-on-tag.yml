@@ -22,10 +22,7 @@ jobs:
           - os: macos-14
             name: macos-arm64
             target: aarch64-apple-darwin
-            artifact_glob: |
-              # build/macos/transcriber-macos-arm64*.zip
-              build/macos/transcriber-macos-arm64*.dmg
-              # build/macos/transcriber-macos-arm64*.pkg
+            artifact_glob: build/macos/keyscribe-macos-arm64*.dmg
           - os: ubuntu-latest
             name: linux
             artifact_glob: build/linux/*.zip
@@ -104,6 +101,7 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           TAG_NAME: ${{ github.ref_name }}
+          REPO_NAME: ${{ github.repository }}
         run: |
           if ! command -v gh >/dev/null 2>&1; then
             sudo apt-get update
@@ -117,8 +115,8 @@ jobs:
             exit 1
           fi
 
-          if gh release view "$TAG_NAME" >/dev/null 2>&1; then
-            gh release upload "$TAG_NAME" "${assets[@]}" --clobber
+          if gh release view "$TAG_NAME" --repo "$REPO_NAME" >/dev/null 2>&1; then
+            gh release upload "$TAG_NAME" "${assets[@]}" --clobber --repo "$REPO_NAME"
           else
-            gh release create "$TAG_NAME" "${assets[@]}" --generate-notes
+            gh release create "$TAG_NAME" "${assets[@]}" --generate-notes --repo "$REPO_NAME"
           fi

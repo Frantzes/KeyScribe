@@ -3,9 +3,37 @@ use std::sync::OnceLock;
 use eframe::egui;
 use egui_phosphor::Variant;
 
-pub const ACCENT_ORANGE: egui::Color32 = egui::Color32::from_rgb(255, 140, 45);
-pub const BG_MAIN: egui::Color32 = egui::Color32::from_rgb(20, 24, 30);
-pub const BG_PANEL: egui::Color32 = egui::Color32::from_rgb(28, 33, 42);
+pub const ACCENT_PURPLE: egui::Color32 = egui::Color32::from_rgb(148, 106, 255);
+pub const BG_DARK_GREY: egui::Color32 = egui::Color32::from_rgb(16, 16, 19); // #101013
+pub const BG_MAIN: egui::Color32 = BG_DARK_GREY;
+pub const BG_PANEL: egui::Color32 = BG_DARK_GREY;
+pub const MEDIA_PANEL_BG_DARK: egui::Color32 = BG_DARK_GREY;
+pub const MEDIA_PANEL_BG_LIGHT: egui::Color32 = BG_DARK_GREY;
+pub const SLIDER_BG_DARK: egui::Color32 = BG_DARK_GREY;
+pub const SLIDER_BG_LIGHT: egui::Color32 = BG_DARK_GREY;
+pub const SLIDER_BG_HOVERED_DARK: egui::Color32 = BG_DARK_GREY;
+pub const SLIDER_BG_HOVERED_LIGHT: egui::Color32 = BG_DARK_GREY;
+pub const SLIDER_BG_ACTIVE_DARK: egui::Color32 = BG_DARK_GREY;
+pub const SLIDER_BG_ACTIVE_LIGHT: egui::Color32 = BG_DARK_GREY;
+pub const SLIDER_ROW_BG_DARK: egui::Color32 = BG_DARK_GREY;
+pub const SLIDER_ROW_BG_LIGHT: egui::Color32 = BG_DARK_GREY;
+pub const SLIDER_ROW_STROKE_DARK: egui::Color32 = egui::Color32::from_rgb(82, 93, 108);
+pub const SLIDER_ROW_STROKE_LIGHT: egui::Color32 = egui::Color32::from_rgb(34, 38, 44);
+pub const SLIDER_RAIL_BG_DARK: egui::Color32 = egui::Color32::from_rgb(22, 24, 28);
+pub const SLIDER_RAIL_BG_LIGHT: egui::Color32 = egui::Color32::from_rgb(22, 24, 28);
+pub const SLIDER_RAIL_BG_HOVER_DARK: egui::Color32 = egui::Color32::from_rgb(28, 31, 36);
+pub const SLIDER_RAIL_BG_HOVER_LIGHT: egui::Color32 = egui::Color32::from_rgb(28, 31, 36);
+pub const SLIDER_RAIL_BG_ACTIVE_DARK: egui::Color32 = egui::Color32::from_rgb(34, 38, 44);
+pub const SLIDER_RAIL_BG_ACTIVE_LIGHT: egui::Color32 = egui::Color32::from_rgb(34, 38, 44);
+pub const PIANO_WHITE_KEY_BG: egui::Color32 = egui::Color32::from_gray(238);
+pub const PIANO_WHITE_KEY_STROKE: egui::Color32 = egui::Color32::from_gray(90);
+pub const PIANO_BLACK_KEY_BG: egui::Color32 = egui::Color32::from_rgb(10, 10, 12);
+pub const PIANO_BLACK_KEY_STROKE: egui::Color32 = egui::Color32::from_rgb(26, 28, 34);
+pub const PIANO_C4_MARKER: egui::Color32 = egui::Color32::from_gray(155);
+pub const PROBABILITY_PANE_BG: egui::Color32 = BG_DARK_GREY;
+pub const PROBABILITY_PANE_WHITE_KEY_STROKE: egui::Color32 = egui::Color32::from_rgb(74, 74, 74);
+pub const PROBABILITY_PANE_BLACK_KEY_BG: egui::Color32 = PIANO_BLACK_KEY_BG;
+pub const PROBABILITY_PANE_BLACK_KEY_STROKE: egui::Color32 = egui::Color32::from_rgb(96, 96, 102);
 pub const TEXT_MAIN: egui::Color32 = egui::Color32::from_rgb(236, 236, 236);
 pub const ERROR_RED: egui::Color32 = egui::Color32::from_rgb(220, 70, 70);
 
@@ -86,17 +114,25 @@ pub fn apply_brand_theme(ctx: &egui::Context, dark_mode: bool, accent: egui::Col
     if dark_mode {
         visuals.override_text_color = Some(TEXT_MAIN);
         visuals.widgets.noninteractive.bg_fill = BG_PANEL;
-        visuals.widgets.inactive.bg_fill = egui::Color32::from_rgb(36, 42, 52);
-        visuals.widgets.hovered.bg_fill = egui::Color32::from_rgb(50, 58, 72);
-        visuals.widgets.active.bg_fill = egui::Color32::from_rgb(60, 70, 86);
+        visuals.widgets.inactive.bg_fill = SLIDER_BG_DARK;
+        visuals.widgets.hovered.bg_fill = SLIDER_BG_HOVERED_DARK;
+        visuals.widgets.active.bg_fill = SLIDER_BG_ACTIVE_DARK;
+        visuals.widgets.inactive.weak_bg_fill = SLIDER_RAIL_BG_DARK;
+        visuals.widgets.hovered.weak_bg_fill = SLIDER_RAIL_BG_HOVER_DARK;
+        visuals.widgets.active.weak_bg_fill = SLIDER_RAIL_BG_ACTIVE_DARK;
         visuals.panel_fill = BG_MAIN;
         visuals.window_fill = BG_PANEL;
     } else {
-        visuals.widgets.inactive.bg_fill = egui::Color32::from_rgb(238, 239, 242);
-        visuals.widgets.hovered.bg_fill = egui::Color32::from_rgb(225, 228, 234);
-        visuals.widgets.active.bg_fill = egui::Color32::from_rgb(215, 220, 227);
-        visuals.panel_fill = egui::Color32::from_rgb(247, 248, 251);
-        visuals.window_fill = egui::Color32::from_rgb(241, 244, 248);
+        visuals.override_text_color = Some(TEXT_MAIN);
+        visuals.widgets.noninteractive.bg_fill = BG_PANEL;
+        visuals.widgets.inactive.bg_fill = SLIDER_BG_LIGHT;
+        visuals.widgets.hovered.bg_fill = SLIDER_BG_HOVERED_LIGHT;
+        visuals.widgets.active.bg_fill = SLIDER_BG_ACTIVE_LIGHT;
+        visuals.widgets.inactive.weak_bg_fill = SLIDER_RAIL_BG_LIGHT;
+        visuals.widgets.hovered.weak_bg_fill = SLIDER_RAIL_BG_HOVER_LIGHT;
+        visuals.widgets.active.weak_bg_fill = SLIDER_RAIL_BG_ACTIVE_LIGHT;
+        visuals.panel_fill = BG_MAIN;
+        visuals.window_fill = BG_PANEL;
     }
 
     visuals.selection.bg_fill = accent;

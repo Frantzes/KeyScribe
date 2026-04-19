@@ -6,6 +6,15 @@ pub fn apply_speed_and_pitch(
     speed: f32,
     pitch_semitones: f32,
 ) -> Vec<f32> {
+    apply_speed_and_pitch_interleaved(samples, 1, sample_rate, speed, pitch_semitones)
+}
+
+fn apply_speed_and_pitch_mono(
+    samples: &[f32],
+    sample_rate: u32,
+    speed: f32,
+    pitch_semitones: f32,
+) -> Vec<f32> {
     if samples.is_empty() {
         return Vec::new();
     }
@@ -114,4 +123,61 @@ pub fn apply_speed_and_pitch(
     }
 
     output
+}
+
+pub fn apply_speed_and_pitch_interleaved(
+    samples: &[f32],
+    channels: u16,
+    sample_rate: u32,
+    speed: f32,
+    pitch_semitones: f32,
+) -> Vec<f32> {
+    let channels = channels.max(1) as usize;
+    if channels == 1 {
+        return apply_speed_and_pitch_mono(samples, sample_rate, speed, pitch_semitones);
+    }
+
+    if samples.is_empty() {
+        return Vec::new();
+    }
+
+    let frame_count = samples.len() / channels;
+    if frame_count == 0 {
+        return Vec::new();
+    }
+
+    let trimmed_len = frame_count * channels;
+    let mut separated = vec![vec![0.0f32; frame_count]; channels];
+    for frame_idx in 0..frame_count {
+        let base = frame_idx * channels;
+        for ch in 0..channels {
+            separated[ch][frame_idx] = samples[base + ch];
+        }
+    }
+
+    let mut processed_channels = Vec::with_capacity(channels);
+    for channel in separated {
+        processed_channels.push(apply_speed_and_pitch_mono(
+            &channel,
+            sample_rate,
+            speed,
+            pitch_semitones,
+        ));
+    }
+
+    let out_frames = processed_channels.iter().map(Vec::len).min().unwrap_or(0);
+    if out_frames == 0 {
+        return Vec::new();
+    }
+
+    let mut out = Vec::with_capacity(out_frames * channels);
+    for frame_idx in 0..out_frames {
+        for ch in 0..channels {
+            out.push(processed_channels[ch][frame_idx]);
+        }
+    }
+
+    // Keep output aligned to whole frames, even if input had a partial tail.
+    let _ = trimmed_len;
+    out
 }

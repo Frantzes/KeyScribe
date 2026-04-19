@@ -60,31 +60,52 @@ impl ViterbiDecoder {
             return vec![];
         }
 
+        let log_likelihoods: Vec<Vec<f32>> = note_probs_sequence
+            .iter()
+            .map(|frame| {
+                frame
+                    .iter()
+                    .map(|&p| {
+                        let scaled = p * self.config.likelihood_scale;
+                        if scaled > 0.0 {
+                            scaled.ln()
+                        } else {
+                            f32::NEG_INFINITY
+                        }
+                    })
+                    .collect()
+            })
+            .collect();
+
+        let mut transition_penalties = vec![vec![0.0f32; num_notes]; num_notes];
+        for current_note in 0..num_notes {
+            for prev_note in 0..num_notes {
+                let note_distance = ((current_note as i32 - prev_note as i32).abs()) as f32;
+                transition_penalties[current_note][prev_note] =
+                    self.config.transition_cost * note_distance;
+            }
+        }
+
         // Compute forward pass with Viterbi algorithm
         let mut viterbi_matrices = vec![vec![f32::NEG_INFINITY; num_notes]; num_frames];
         let mut backpointers = vec![vec![0usize; num_notes]; num_frames];
 
         // Initialize first frame
         for note in 0..num_notes {
-            viterbi_matrices[0][note] =
-                (note_probs_sequence[0][note] * self.config.likelihood_scale).ln();
+            viterbi_matrices[0][note] = log_likelihoods[0][note];
         }
 
         // Forward pass
         for frame in 1..num_frames {
             for current_note in 0..num_notes {
+                let observation = log_likelihoods[frame][current_note];
                 let mut best_prev_score = f32::NEG_INFINITY;
                 let mut best_prev_note = 0;
 
                 for prev_note in 0..num_notes {
-                    // Transition cost (penalize large note jumps)
-                    let note_distance = ((current_note as i32 - prev_note as i32).abs()) as f32;
-                    let transition_penalty = self.config.transition_cost * note_distance;
-
-                    let score =
-                        viterbi_matrices[frame - 1][prev_note] -
-                        transition_penalty +
-                        (note_probs_sequence[frame][current_note] * self.config.likelihood_scale).ln();
+                    let score = viterbi_matrices[frame - 1][prev_note]
+                        - transition_penalties[current_note][prev_note]
+                        + observation;
 
                     if score > best_prev_score {
                         best_prev_score = score;

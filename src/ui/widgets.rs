@@ -1,5 +1,13 @@
 use eframe::egui;
 
+pub fn responsive_icon_button_size(ui: &egui::Ui) -> f32 {
+    ui.spacing().interact_size.y.clamp(30.0, 42.0)
+}
+
+fn responsive_icon_font_size(button_size: f32) -> f32 {
+    (button_size * 0.52).clamp(16.0, 22.0)
+}
+
 pub fn icon_button(ui: &mut egui::Ui, icon: &str, tooltip: &str, enabled: bool) -> egui::Response {
     icon_button_with_fill(ui, icon, tooltip, enabled, None, None)
 }
@@ -35,8 +43,8 @@ fn icon_button_with_fill(
     fill_override: Option<egui::Color32>,
     text_color_override: Option<egui::Color32>,
 ) -> egui::Response {
-    let button_size = 34.0;
-    let icon_size = 18.0;
+    let button_size = responsive_icon_button_size(ui);
+    let icon_size = responsive_icon_font_size(button_size);
     let desired = egui::vec2(button_size, button_size);
     let sense = if enabled {
         egui::Sense::click()

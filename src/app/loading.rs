@@ -3,7 +3,7 @@ use crate::core::processing::{
     build_waveform_for_processed, estimate_processing_duration_sec, CoreRebuildMode,
 };
 
-impl TranscriberApp {
+impl KeyScribeApp {
     pub(super) fn cancel_audio_loading(&mut self) {
         if let Some(flag) = self.audio_loading_cancel.take() {
             flag.store(true, Ordering::Release);
@@ -12,6 +12,8 @@ impl TranscriberApp {
         self.is_audio_loading = false;
         self.live_stream_playback = false;
         self.loading_cache_timeline_preloaded = false;
+        self.loading_cache_waveform_preloaded = false;
+        self.loading_preview_cache.clear();
     }
 
     pub(super) fn clear_note_visuals(&mut self) {
@@ -24,17 +26,18 @@ impl TranscriberApp {
     }
 
     pub(super) fn note_visuals_ready(&self) -> bool {
+        let has_preprocessed_timeline =
+            !self.note_timeline.is_empty() && self.note_timeline_step_sec > 0.0;
+
         if self.is_audio_loading {
             return self.preprocess_audio
                 && self.loading_cache_timeline_preloaded
-                && !self.note_timeline.is_empty()
-                && self.note_timeline_step_sec > 0.0;
+                && has_preprocessed_timeline;
         }
 
         if self.preprocess_audio {
-            !self.is_processing
-                && !self.note_timeline.is_empty()
-                && self.note_timeline_step_sec > 0.0
+            has_preprocessed_timeline
+                && (!self.is_processing || self.loading_cache_timeline_preloaded)
         } else {
             !self.is_processing && !self.processed_samples.is_empty()
         }
@@ -92,15 +95,21 @@ impl TranscriberApp {
         self.selected_time_sec = 0.0;
         self.audio_raw = None;
         self.processed_samples.clear();
-        self.waveform.clear();
+        self.processed_playback_samples.clear();
+        self.processed_playback_channels = 1;
+        self.clear_waveform_data();
         self.note_timeline = Arc::new(Vec::new());
         self.note_timeline_step_sec = 0.0;
         self.base_note_timeline = Arc::new(Vec::new());
         self.base_note_timeline_step_sec = 0.0;
         self.loading_raw_samples.clear();
+        self.loading_raw_samples_interleaved.clear();
+        self.loading_source_channels = 1;
         self.loading_sample_rate = 0;
         self.loading_total_samples = None;
         self.loading_decoded_samples = 0;
+        self.loading_last_waveform_rebuild_at = None;
+        self.loading_last_waveform_rebuild_samples = 0;
         self.loading_provisional_timeline.clear();
         self.loading_next_transcribe_time_sec = 0.0;
         self.loading_timeline_frames_pending_sync = 0;
@@ -113,6 +122,8 @@ impl TranscriberApp {
         self.cache_status_message_at = None;
         self.cache_precheck_done = false;
         self.loading_cache_timeline_preloaded = false;
+        self.loading_cache_waveform_preloaded = false;
+        self.loading_preview_cache.clear();
         if self.preprocess_audio {
             self.cache_status_message = Some("Analysis cache: precheck pending...".to_string());
             self.cache_status_message_at = Some(Instant::now());
@@ -166,18 +177,23 @@ impl TranscriberApp {
                     self.cache_status_message_at = Some(Instant::now());
                     self.cache_precheck_done = true;
                     self.loading_cache_timeline_preloaded = false;
+                    self.loading_cache_waveform_preloaded = false;
                 }
                 self.maybe_precheck_analysis_cache();
             }
             StreamingAudioEvent::Started {
                 sample_rate,
                 total_samples,
+                channels,
                 metadata,
             } => {
                 self.loading_sample_rate = sample_rate;
                 self.loading_total_samples = total_samples;
+                self.loading_source_channels = channels.max(1);
                 self.audio_raw = Some(AudioData {
                     sample_rate,
+                    channels: self.loading_source_channels,
+                    samples_interleaved: Arc::new(Vec::new()),
                     samples_mono: Arc::new(Vec::new()),
                     metadata,
                 });
@@ -186,6 +202,8 @@ impl TranscriberApp {
             }
             StreamingAudioEvent::Chunk {
                 samples_mono,
+                samples_interleaved,
+                channels,
                 decoded_samples,
                 total_samples,
             } => {
@@ -193,10 +211,14 @@ impl TranscriberApp {
                     return;
                 }
 
+                let playback_channels = channels.max(1);
                 self.loading_decoded_samples = decoded_samples;
                 self.loading_total_samples = total_samples.or(self.loading_total_samples);
+                self.loading_source_channels = playback_channels;
 
                 self.loading_raw_samples.extend_from_slice(&samples_mono);
+                self.loading_raw_samples_interleaved
+                    .extend_from_slice(&samples_interleaved);
 
                 let mut processed_chunk = samples_mono;
                 if !speed_pitch_is_identity(self.speed, self.pitch_semitones) {
@@ -208,16 +230,37 @@ impl TranscriberApp {
                     );
                 }
 
+                let processed_chunk_playback =
+                    if speed_pitch_is_identity(self.speed, self.pitch_semitones) {
+                        samples_interleaved
+                    } else {
+                        apply_speed_and_pitch_interleaved(
+                            &samples_interleaved,
+                            playback_channels,
+                            self.loading_sample_rate,
+                            self.speed,
+                            self.pitch_semitones,
+                        )
+                    };
+
                 let was_empty = self.processed_samples.is_empty();
                 self.processed_samples.extend_from_slice(&processed_chunk);
-                self.waveform = build_waveform_for_processed(
-                    &self.processed_samples,
-                    self.loading_sample_rate,
-                    self.audio_quality_mode.waveform_points(),
-                    self.speed,
-                );
-                if was_empty && !self.waveform.is_empty() {
-                    self.waveform_reset_view = true;
+                self.processed_playback_samples
+                    .extend_from_slice(&processed_chunk_playback);
+                self.processed_playback_channels = playback_channels;
+                let processed_len = self.processed_samples.len();
+                if !self.loading_cache_waveform_preloaded
+                    && self.should_rebuild_streaming_waveform(processed_len)
+                {
+                    let waveform = build_waveform_for_processed(
+                        &self.processed_samples,
+                        self.loading_sample_rate,
+                        self.audio_quality_mode.waveform_points(),
+                        self.speed,
+                    );
+                    let should_reset_view = was_empty && !waveform.is_empty();
+                    self.set_waveform_data(waveform, should_reset_view);
+                    self.mark_streaming_waveform_rebuild(processed_len);
                 }
 
                 if self.live_stream_playback
@@ -228,7 +271,8 @@ impl TranscriberApp {
                     if let Some(engine) = &mut self.engine {
                         if engine.has_active_sink() {
                             if let Err(err) = engine.append_samples(
-                                &processed_chunk,
+                                &processed_chunk_playback,
+                                playback_channels,
                                 self.loading_sample_rate,
                                 playback_rate,
                             ) {
@@ -244,6 +288,7 @@ impl TranscriberApp {
             }
             StreamingAudioEvent::Finished {
                 sample_rate,
+                channels,
                 decoded_samples,
                 total_samples,
                 metadata,
@@ -251,10 +296,14 @@ impl TranscriberApp {
                 self.loading_sample_rate = sample_rate;
                 self.loading_decoded_samples = decoded_samples;
                 self.loading_total_samples = total_samples.or(self.loading_total_samples);
+                self.loading_source_channels = channels.max(1);
 
                 let raw_samples = std::mem::take(&mut self.loading_raw_samples);
+                let raw_interleaved = std::mem::take(&mut self.loading_raw_samples_interleaved);
                 self.audio_raw = Some(AudioData {
                     sample_rate,
+                    channels: self.loading_source_channels,
+                    samples_interleaved: Arc::new(raw_interleaved),
                     samples_mono: Arc::new(raw_samples),
                     metadata,
                 });
@@ -264,6 +313,8 @@ impl TranscriberApp {
                 self.audio_loading_rx = None;
                 self.audio_loading_cancel = None;
                 self.live_stream_playback = false;
+                self.loading_cache_waveform_preloaded = false;
+                self.loading_preview_cache.clear();
 
                 let rebuild_mode = if self.preprocess_audio {
                     if self.loading_cache_timeline_preloaded {
@@ -282,7 +333,10 @@ impl TranscriberApp {
                 self.audio_loading_cancel = None;
                 self.live_stream_playback = false;
                 self.loading_cache_timeline_preloaded = false;
+                self.loading_cache_waveform_preloaded = false;
+                self.loading_preview_cache.clear();
                 self.loading_raw_samples.clear();
+                self.loading_raw_samples_interleaved.clear();
                 self.last_error = Some(message);
             }
         }
