@@ -30,7 +30,7 @@ use crate::audio_io::{
 use crate::core::processing::build_waveform_for_processed;
 use crate::dsp::{apply_speed_and_pitch, apply_speed_and_pitch_interleaved};
 use crate::playback::{available_output_devices, AudioEngine, AudioOutputDeviceOption};
-use crate::theme::{apply_brand_theme, ACCENT_ORANGE, ERROR_RED};
+use crate::theme::{apply_brand_theme, ACCENT_PURPLE, ERROR_RED};
 use crate::ui::keyboard::{
     draw_piano_view, draw_probability_pane, keyboard_white_key_width, MIN_PIANO_KEY_HEIGHT,
     MIN_PROBABILITY_STRIP_HEIGHT, PIANO_ZOOM_MAX, PIANO_ZOOM_MIN, WHITE_KEY_LENGTH_TO_WIDTH,
@@ -90,7 +90,7 @@ const UI_VSPACE_MEDIUM: f32 = 8.0;
 const UI_STACK_VSPACE: f32 = 4.0;
 const UI_SEPARATOR_STROKE_WIDTH: f32 = 1.0;
 const PRESET_HIGHLIGHT_COLORS: [(&str, egui::Color32); 8] = [
-    ("Orange", egui::Color32::from_rgb(255, 140, 45)),
+    ("Purple", egui::Color32::from_rgb(148, 106, 255)),
     ("Sky", egui::Color32::from_rgb(72, 162, 255)),
     ("Mint", egui::Color32::from_rgb(56, 204, 142)),
     ("Rose", egui::Color32::from_rgb(248, 112, 134)),
@@ -201,7 +201,7 @@ fn default_use_cqt_analysis() -> bool {
 }
 
 fn default_highlight_hex() -> String {
-    "#FF8C2D".to_string()
+    "#946AFF".to_string()
 }
 
 fn normalize_recent_file_key(path: &Path) -> String {
@@ -901,7 +901,7 @@ impl KeyScribeApp {
                 push_recent_file_path(&mut recent_file_paths, path.as_path());
             }
         }
-        let highlight_color = parse_hex_color(&persisted.highlight_hex).unwrap_or(ACCENT_ORANGE);
+        let highlight_color = parse_hex_color(&persisted.highlight_hex).unwrap_or(ACCENT_PURPLE);
         apply_brand_theme(&_cc.egui_ctx, persisted.dark_mode, highlight_color);
 
         let mut app = Self {

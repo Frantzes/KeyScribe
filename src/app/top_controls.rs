@@ -1,4 +1,9 @@
 use super::*;
+use crate::theme::{
+    SLIDER_RAIL_BG_ACTIVE_DARK, SLIDER_RAIL_BG_ACTIVE_LIGHT, SLIDER_RAIL_BG_DARK,
+    SLIDER_RAIL_BG_HOVER_DARK, SLIDER_RAIL_BG_HOVER_LIGHT, SLIDER_RAIL_BG_LIGHT,
+    SLIDER_ROW_BG_DARK, SLIDER_ROW_BG_LIGHT, SLIDER_ROW_STROKE_DARK, SLIDER_ROW_STROKE_LIGHT,
+};
 
 const TOOLBAR_MENU_MIN_WIDTH: f32 = 360.0;
 const SETTINGS_RGB_SLIDER_MAX_WIDTH: f32 = 220.0;
@@ -336,29 +341,29 @@ impl KeyScribeApp {
 
         let dark = ui.visuals().dark_mode;
         let row_fill = if dark {
-            egui::Color32::from_rgb(28, 34, 43)
+            SLIDER_ROW_BG_DARK
         } else {
-            egui::Color32::from_rgb(234, 238, 244)
+            SLIDER_ROW_BG_LIGHT
         };
         let row_stroke = if dark {
-            egui::Color32::from_rgb(82, 93, 108)
+            SLIDER_ROW_STROKE_DARK
         } else {
-            egui::Color32::from_rgb(166, 176, 191)
+            SLIDER_ROW_STROKE_LIGHT
         };
         let rail_fill = if dark {
-            egui::Color32::from_rgb(78, 89, 105)
+            SLIDER_RAIL_BG_DARK
         } else {
-            egui::Color32::from_rgb(184, 194, 210)
+            SLIDER_RAIL_BG_LIGHT
         };
         let rail_fill_hover = if dark {
-            egui::Color32::from_rgb(95, 108, 126)
+            SLIDER_RAIL_BG_HOVER_DARK
         } else {
-            egui::Color32::from_rgb(170, 182, 199)
+            SLIDER_RAIL_BG_HOVER_LIGHT
         };
         let rail_fill_active = if dark {
-            egui::Color32::from_rgb(108, 124, 145)
+            SLIDER_RAIL_BG_ACTIVE_DARK
         } else {
-            egui::Color32::from_rgb(156, 170, 190)
+            SLIDER_RAIL_BG_ACTIVE_LIGHT
         };
 
         ui.allocate_ui_with_layout(
@@ -399,6 +404,9 @@ impl KeyScribeApp {
                                     ui.scope(|ui| {
                                         let visuals = ui.visuals_mut();
                                         visuals.slider_trailing_fill = true;
+                                        visuals.widgets.inactive.bg_fill = rail_fill;
+                                        visuals.widgets.hovered.bg_fill = rail_fill_hover;
+                                        visuals.widgets.active.bg_fill = rail_fill_active;
                                         visuals.widgets.inactive.weak_bg_fill = rail_fill;
                                         visuals.widgets.hovered.weak_bg_fill = rail_fill_hover;
                                         visuals.widgets.active.weak_bg_fill = rail_fill_active;
@@ -437,15 +445,26 @@ impl KeyScribeApp {
                                                         egui::Align::Center,
                                                     ),
                                                     |ui| {
-                                                        ui.add_sized(
-                                                            [compact_input_width, row_height],
-                                                            egui::DragValue::new(value)
-                                                                .clamp_range(min..=max)
-                                                                .speed(drag_speed)
-                                                                .max_decimals(max_decimals)
-                                                                .suffix(suffix),
-                                                        )
-                                                        .changed()
+                                                        ui.scope(|ui| {
+                                                            let visuals = ui.visuals_mut();
+                                                            visuals.widgets.inactive.bg_stroke =
+                                                                egui::Stroke::NONE;
+                                                            visuals.widgets.hovered.bg_stroke =
+                                                                egui::Stroke::NONE;
+                                                            visuals.widgets.active.bg_stroke =
+                                                                egui::Stroke::NONE;
+
+                                                            ui.add_sized(
+                                                                [compact_input_width, row_height],
+                                                                egui::DragValue::new(value)
+                                                                    .clamp_range(min..=max)
+                                                                    .speed(drag_speed)
+                                                                    .max_decimals(max_decimals)
+                                                                    .suffix(suffix),
+                                                            )
+                                                            .changed()
+                                                        })
+                                                        .inner
                                                     },
                                                 )
                                                 .inner;
@@ -471,15 +490,26 @@ impl KeyScribeApp {
                                                 .changed();
 
                                             changed |= ui
-                                                .add_sized(
-                                                    [input_width, row_height],
-                                                    egui::DragValue::new(value)
-                                                        .clamp_range(min..=max)
-                                                        .speed(drag_speed)
-                                                        .max_decimals(max_decimals)
-                                                        .suffix(suffix),
-                                                )
-                                                .changed();
+                                                .scope(|ui| {
+                                                    let visuals = ui.visuals_mut();
+                                                    visuals.widgets.inactive.bg_stroke =
+                                                        egui::Stroke::NONE;
+                                                    visuals.widgets.hovered.bg_stroke =
+                                                        egui::Stroke::NONE;
+                                                    visuals.widgets.active.bg_stroke =
+                                                        egui::Stroke::NONE;
+
+                                                    ui.add_sized(
+                                                        [input_width, row_height],
+                                                        egui::DragValue::new(value)
+                                                            .clamp_range(min..=max)
+                                                            .speed(drag_speed)
+                                                            .max_decimals(max_decimals)
+                                                            .suffix(suffix),
+                                                    )
+                                                    .changed()
+                                                })
+                                                .inner;
                                         }
                                     });
                                 },

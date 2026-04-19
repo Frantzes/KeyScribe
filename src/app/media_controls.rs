@@ -4,6 +4,11 @@ use egui_phosphor::regular::{
 };
 
 use super::{KeyScribeApp, SEEK_STEP_SEC, UI_VSPACE_COMPACT, UI_VSPACE_MEDIUM};
+use crate::theme::{
+    MEDIA_PANEL_BG_DARK, MEDIA_PANEL_BG_LIGHT, SLIDER_RAIL_BG_ACTIVE_DARK,
+    SLIDER_RAIL_BG_ACTIVE_LIGHT, SLIDER_RAIL_BG_DARK, SLIDER_RAIL_BG_HOVER_DARK,
+    SLIDER_RAIL_BG_HOVER_LIGHT, SLIDER_RAIL_BG_LIGHT,
+};
 use crate::ui::utils::format_time;
 use crate::ui::widgets::{
     icon_button, icon_font_id, icon_toggle_button, responsive_icon_button_size,
@@ -142,12 +147,37 @@ fn draw_volume_time_row(
             };
 
             ui.spacing_mut().slider_width = volume_width;
-            let vol_changed = ui
-                .add_sized(
-                    [volume_width, row_h],
-                    egui::Slider::new(&mut app.playback_volume, 0.0..=1.5).show_value(false),
+            let (rail_fill, rail_fill_hover, rail_fill_active) = if app.dark_mode {
+                (
+                    SLIDER_RAIL_BG_DARK,
+                    SLIDER_RAIL_BG_HOVER_DARK,
+                    SLIDER_RAIL_BG_ACTIVE_DARK,
                 )
-                .changed();
+            } else {
+                (
+                    SLIDER_RAIL_BG_LIGHT,
+                    SLIDER_RAIL_BG_HOVER_LIGHT,
+                    SLIDER_RAIL_BG_ACTIVE_LIGHT,
+                )
+            };
+            let vol_changed = ui
+                .scope(|ui| {
+                    let visuals = ui.visuals_mut();
+                    visuals.slider_trailing_fill = true;
+                    visuals.widgets.inactive.bg_fill = rail_fill;
+                    visuals.widgets.hovered.bg_fill = rail_fill_hover;
+                    visuals.widgets.active.bg_fill = rail_fill_active;
+                    visuals.widgets.inactive.weak_bg_fill = rail_fill;
+                    visuals.widgets.hovered.weak_bg_fill = rail_fill_hover;
+                    visuals.widgets.active.weak_bg_fill = rail_fill_active;
+
+                    ui.add_sized(
+                        [volume_width, row_h],
+                        egui::Slider::new(&mut app.playback_volume, 0.0..=1.5).show_value(false),
+                    )
+                    .changed()
+                })
+                .inner;
             if vol_changed {
                 if let Some(engine) = &mut app.engine {
                     engine.set_volume(app.playback_volume);
@@ -205,9 +235,9 @@ pub(super) fn draw_media_controls(
     let button_size = responsive_icon_button_size(ui);
 
     let panel_fill = if app.dark_mode {
-        egui::Color32::from_rgb(19, 28, 38)
+        MEDIA_PANEL_BG_DARK
     } else {
-        egui::Color32::from_rgb(232, 236, 243)
+        MEDIA_PANEL_BG_LIGHT
     };
 
     let inner_w = (full_w - if compact_layout { 20.0 } else { 28.0 }).max(0.0);
