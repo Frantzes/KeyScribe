@@ -87,7 +87,7 @@ const MAX_RECENT_FILES: usize = 10;
 const UI_VSPACE_TIGHT: f32 = 2.0;
 const UI_VSPACE_COMPACT: f32 = 4.0;
 const UI_VSPACE_MEDIUM: f32 = 8.0;
-const UI_STACK_VSPACE: f32 = 6.0;
+const UI_STACK_VSPACE: f32 = 4.0;
 const UI_SEPARATOR_STROKE_WIDTH: f32 = 1.0;
 const PRESET_HIGHLIGHT_COLORS: [(&str, egui::Color32); 8] = [
     ("Orange", egui::Color32::from_rgb(255, 140, 45)),

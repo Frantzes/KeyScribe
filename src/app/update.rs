@@ -311,7 +311,6 @@ impl eframe::App for KeyScribeApp {
                     ui.spacing_mut().item_spacing.y = default_stack_spacing_y.min(UI_VSPACE_TIGHT);
                     self.draw_speed_pitch_controls(ui);
                 });
-                ui.add_space(waveform_visual_gap);
 
                 // Compute waveform/media heights from the remaining space after speed/pitch controls.
                 let remaining_stack_h = ui.available_height().max(0.0);

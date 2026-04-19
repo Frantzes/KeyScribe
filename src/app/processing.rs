@@ -69,9 +69,8 @@ impl KeyScribeApp {
                 let preview_start_frame =
                     (selected_time_sec.max(0.0) * sample_rate as f32) as usize;
                 let preview_len_frames = (PARAM_UPDATE_PREVIEW_SEC * sample_rate as f32) as usize;
-                let preview_end_frame =
-                    (preview_start_frame.saturating_add(preview_len_frames))
-                        .min(total_playback_frames);
+                let preview_end_frame = (preview_start_frame.saturating_add(preview_len_frames))
+                    .min(total_playback_frames);
 
                 let preview_samples = if preview_start_frame < preview_end_frame {
                     let preview_start_idx = preview_start_frame * playback_channels_usize;
@@ -170,20 +169,18 @@ impl KeyScribeApp {
                             )
                         });
 
-                        let processed_playback_samples = if speed_pitch_is_identity(
-                            speed,
-                            pitch_semitones,
-                        ) {
-                            raw_playback_samples.as_ref().to_vec()
-                        } else {
-                            apply_speed_and_pitch_interleaved(
-                                raw_playback_samples.as_slice(),
-                                raw_playback_channels,
-                                sample_rate,
-                                speed,
-                                pitch_semitones,
-                            )
-                        };
+                        let processed_playback_samples =
+                            if speed_pitch_is_identity(speed, pitch_semitones) {
+                                raw_playback_samples.as_ref().to_vec()
+                            } else {
+                                apply_speed_and_pitch_interleaved(
+                                    raw_playback_samples.as_slice(),
+                                    raw_playback_channels,
+                                    sample_rate,
+                                    speed,
+                                    pitch_semitones,
+                                )
+                            };
 
                         if processing_epoch.load(Ordering::Acquire) != job_id {
                             return;
@@ -503,8 +500,8 @@ impl KeyScribeApp {
                 .into_par_iter()
                 .map(|idx| {
                     let t = idx as f32 * step_sec;
-                    let center = ((t * sample_rate as f32) as usize)
-                        .min(samples.len().saturating_sub(1));
+                    let center =
+                        ((t * sample_rate as f32) as usize).min(samples.len().saturating_sub(1));
                     detect_note_probabilities(samples, sample_rate, center, fft_window_size)
                 })
                 .collect()
@@ -512,8 +509,8 @@ impl KeyScribeApp {
             (0..frame_count)
                 .map(|idx| {
                     let t = idx as f32 * step_sec;
-                    let center = ((t * sample_rate as f32) as usize)
-                        .min(samples.len().saturating_sub(1));
+                    let center =
+                        ((t * sample_rate as f32) as usize).min(samples.len().saturating_sub(1));
                     detect_note_probabilities(samples, sample_rate, center, fft_window_size)
                 })
                 .collect()
@@ -633,5 +630,4 @@ impl KeyScribeApp {
         let step_sec = base_step_sec;
         (transformed, step_sec)
     }
-
 }
