@@ -26,17 +26,18 @@ impl KeyScribeApp {
     }
 
     pub(super) fn note_visuals_ready(&self) -> bool {
+        let has_preprocessed_timeline =
+            !self.note_timeline.is_empty() && self.note_timeline_step_sec > 0.0;
+
         if self.is_audio_loading {
             return self.preprocess_audio
                 && self.loading_cache_timeline_preloaded
-                && !self.note_timeline.is_empty()
-                && self.note_timeline_step_sec > 0.0;
+                && has_preprocessed_timeline;
         }
 
         if self.preprocess_audio {
-            !self.is_processing
-                && !self.note_timeline.is_empty()
-                && self.note_timeline_step_sec > 0.0
+            has_preprocessed_timeline
+                && (!self.is_processing || self.loading_cache_timeline_preloaded)
         } else {
             !self.is_processing && !self.processed_samples.is_empty()
         }

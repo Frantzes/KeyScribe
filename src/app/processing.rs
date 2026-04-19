@@ -48,7 +48,14 @@ impl KeyScribeApp {
         }
         self.restart_playback_after_processing |= restart_playback;
         self.processing_epoch.store(job_id, Ordering::Release);
-        self.clear_note_visuals();
+        let keep_cache_preloaded_visuals = mode == RebuildMode::ParametersOnly
+            && self.preprocess_audio
+            && self.loading_cache_timeline_preloaded
+            && !self.note_timeline.is_empty()
+            && self.note_timeline_step_sec > 0.0;
+        if !keep_cache_preloaded_visuals {
+            self.clear_note_visuals();
+        }
 
         thread::spawn(move || {
             if mode == RebuildMode::ParametersPreview {
