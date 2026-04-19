@@ -22,10 +22,7 @@ jobs:
           - os: macos-14
             name: macos-arm64
             target: aarch64-apple-darwin
-            artifact_glob: |
-              # build/macos/transcriber-macos-arm64*.zip
-              build/macos/transcriber-macos-arm64*.dmg
-              # build/macos/transcriber-macos-arm64*.pkg
+            artifact_glob: build/macos/keyscribe-macos-arm64*.dmg
           - os: ubuntu-latest
             name: linux
             artifact_glob: build/linux/*.zip
