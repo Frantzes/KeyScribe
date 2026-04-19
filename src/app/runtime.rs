@@ -1,34 +1,14 @@
 use super::*;
 
 impl KeyScribeApp {
-    pub(super) fn lock_startup_min_window_size_once(&mut self, ctx: &egui::Context) {
+    pub(super) fn lock_startup_min_window_size_once(&mut self, _ctx: &egui::Context) {
         if self.startup_min_window_size_locked {
             return;
         }
 
-        let viewport = ctx.input(|i| i.viewport().clone());
-        let Some(inner_rect) = viewport.inner_rect else {
-            return;
-        };
-
-        let size = inner_rect.size();
-        if size.x <= 1.0 || size.y <= 1.0 {
-            return;
-        }
-
-        let sized_like_fullscreen = viewport
-            .monitor_size
-            .map(|monitor| size.x >= monitor.x * 0.9 && size.y >= monitor.y * 0.9)
-            .unwrap_or(false);
-
-        let should_lock = viewport.maximized.unwrap_or(false)
-            || viewport.fullscreen.unwrap_or(false)
-            || sized_like_fullscreen;
-
-        if should_lock {
-            ctx.send_viewport_cmd(egui::ViewportCommand::MinInnerSize(size));
-            self.startup_min_window_size_locked = true;
-        }
+        // Avoid locking min size to a maximized startup viewport.
+        // That made the app appear non-resizable after restore/unmaximize.
+        self.startup_min_window_size_locked = true;
     }
 
     pub(super) fn is_touch_platform(&self) -> bool {
@@ -45,7 +25,7 @@ impl KeyScribeApp {
         style.spacing.interact_size.y = style.spacing.interact_size.y.max(42.0);
         style.spacing.slider_width = style.spacing.slider_width.max(176.0);
         style.spacing.item_spacing.x = style.spacing.item_spacing.x.max(10.0);
-        style.spacing.item_spacing.y = style.spacing.item_spacing.y.max(10.0);
+        style.spacing.item_spacing.y = style.spacing.item_spacing.y.max(UI_VSPACE_MEDIUM);
 
         style
             .text_styles

@@ -47,7 +47,7 @@ mod processing;
 mod runtime;
 mod top_controls;
 mod update;
-use media_controls::{draw_media_controls, setting_toggle_row};
+use media_controls::{draw_media_controls, media_controls_height_for_width, setting_toggle_row};
 
 const STATE_FILE_NAME: &str = ".keyscribe_state.json";
 const LEGACY_STATE_FILE_NAME: &str = ".transcriber_state.json";
@@ -84,6 +84,11 @@ const IDLE_REPAINT_INTERVAL: Duration = Duration::from_millis(80);
 const TRANSCRIBE_PROGRESS_LOADING_WEIGHT: f32 = 0.35;
 const TRANSCRIBE_PROGRESS_MAX_BEFORE_DONE: f32 = 0.99;
 const MAX_RECENT_FILES: usize = 10;
+const UI_VSPACE_TIGHT: f32 = 2.0;
+const UI_VSPACE_COMPACT: f32 = 4.0;
+const UI_VSPACE_MEDIUM: f32 = 8.0;
+const UI_STACK_VSPACE: f32 = 6.0;
+const UI_SEPARATOR_STROKE_WIDTH: f32 = 1.0;
 const PRESET_HIGHLIGHT_COLORS: [(&str, egui::Color32); 8] = [
     ("Orange", egui::Color32::from_rgb(255, 140, 45)),
     ("Sky", egui::Color32::from_rgb(72, 162, 255)),
@@ -99,8 +104,42 @@ fn default_preprocess_audio() -> bool {
     true
 }
 
+fn ui_separator_stroke(ui: &egui::Ui) -> egui::Stroke {
+    egui::Stroke::new(
+        UI_SEPARATOR_STROKE_WIDTH,
+        ui.visuals().widgets.noninteractive.bg_stroke.color,
+    )
+}
+
+fn draw_horizontal_separator(ui: &mut egui::Ui, horizontal_bleed: f32) {
+    let width = ui.available_width().max(0.0);
+    let (rect, _) = ui.allocate_exact_size(egui::vec2(width, 1.0), egui::Sense::hover());
+    let bleed = horizontal_bleed.max(0.0);
+    let clip = if bleed > 0.0 {
+        ui.ctx().input(|i| i.screen_rect())
+    } else {
+        ui.clip_rect()
+    };
+    let painter = if bleed > 0.0 {
+        ui.painter().with_clip_rect(clip)
+    } else {
+        ui.painter().clone()
+    };
+    let x_range = if bleed > 0.0 {
+        egui::Rangef::new(clip.left(), clip.right())
+    } else {
+        egui::Rangef::new(
+            (rect.left() - bleed).max(clip.left()),
+            (rect.right() + bleed).min(clip.right()),
+        )
+    };
+    // Snap to full pixel to avoid anti-alias variance between panels.
+    let y = rect.center().y.round();
+    painter.hline(x_range, y, ui_separator_stroke(ui));
+}
+
 fn default_key_color_sensitivity() -> f32 {
-    0.4
+    0.46
 }
 
 fn default_playback_volume() -> f32 {
@@ -766,6 +805,7 @@ pub struct KeyScribeApp {
     dark_mode: bool,
     highlight_color: egui::Color32,
     custom_rgb: [u8; 3],
+    highlight_hex_input: String,
     recent_file_paths: Vec<PathBuf>,
     recent_highlight_hex: Vec<String>,
     last_state_save_at: Instant,
@@ -937,6 +977,7 @@ impl KeyScribeApp {
                 highlight_color.g(),
                 highlight_color.b(),
             ],
+            highlight_hex_input: color_to_hex(highlight_color),
             recent_file_paths,
             recent_highlight_hex: persisted.recent_highlight_hex,
             last_state_save_at: Instant::now(),
