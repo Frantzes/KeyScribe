@@ -83,207 +83,234 @@ impl eframe::App for KeyScribeApp {
 
         self.draw_top_controls_panel(ctx);
 
-        let piano_panel_builder = egui::TopBottomPanel::bottom("piano_panel")
-            .frame(egui::Frame::none().inner_margin(egui::Margin::symmetric(UI_VSPACE_MEDIUM, 0.0)))
-            .show_separator_line(false)
-            .resizable(false)
-            .min_height(120.0);
         self.piano_panel_height_needs_init = false;
-        let piano_panel = piano_panel_builder.show(ctx, |ui| {
-            if self.audio_raw.is_none() {
-                return;
-            }
+        if self.audio_raw.is_some() {
+            let piano_panel_builder = egui::TopBottomPanel::bottom("piano_panel")
+                .frame(
+                    egui::Frame::none()
+                        .inner_margin(egui::Margin::symmetric(UI_VSPACE_MEDIUM, 0.0)),
+                )
+                .show_separator_line(false)
+                .resizable(false)
+                .min_height(120.0);
+            let piano_panel = piano_panel_builder.show(ctx, |ui| {
+                let note_visuals_ready = self.note_visuals_ready();
+                if !note_visuals_ready {
+                    self.clear_note_visuals();
+                }
 
-            let note_visuals_ready = self.note_visuals_ready();
-            if !note_visuals_ready {
-                self.clear_note_visuals();
-            }
-
-            let pane_rect = ui.max_rect();
-            let pane_hovered = ui.rect_contains_pointer(pane_rect);
-            if pane_hovered && ui.input(|i| i.pointer.primary_clicked()) {
-                self.piano_has_focus = true;
-            }
-
-            let white_w_for_zoom = keyboard_white_key_width(ui.available_width(), self.piano_zoom);
-            let max_allowed_key_h =
-                (white_w_for_zoom * WHITE_KEY_LENGTH_TO_WIDTH).clamp(MIN_PIANO_KEY_HEIGHT, 220.0);
-            let key_h_for_frame = max_allowed_key_h;
-            let panel_visual_gap = UI_STACK_VSPACE;
-            let default_item_spacing_y = ui.spacing().item_spacing.y;
-            ui.spacing_mut().item_spacing.y = 0.0;
-
-            let prob_strip_height = if self.show_note_hist_window && note_visuals_ready {
-                (key_h_for_frame * 0.9).clamp(MIN_PROBABILITY_STRIP_HEIGHT, 120.0)
-            } else {
-                0.0
-            };
-
-            let mut max_scroll_px: f32 = 0.0;
-            if self.show_note_hist_window && note_visuals_ready {
-                let prob_draw = draw_probability_pane(
-                    ui,
-                    &self.note_probs_smoothed,
-                    self.note_probs.as_slice(),
-                    self.piano_zoom,
-                    self.piano_scroll_px,
-                    prob_strip_height,
-                    self.highlight_color,
-                );
-                max_scroll_px = max_scroll_px.max(prob_draw.max_scroll_px);
-                if prob_draw.clicked {
+                let pane_rect = ui.max_rect();
+                let pane_hovered = ui.rect_contains_pointer(pane_rect);
+                if pane_hovered && ui.input(|i| i.pointer.primary_clicked()) {
                     self.piano_has_focus = true;
                 }
-                ui.add_space(panel_visual_gap);
-            }
 
-            let piano_draw = draw_piano_view(
-                ui,
-                &self.note_probs_smoothed,
-                self.key_color_sensitivity,
-                self.piano_zoom,
-                key_h_for_frame,
-                self.piano_scroll_px,
-                self.highlight_color,
-            );
-            max_scroll_px = max_scroll_px.max(piano_draw.max_scroll_px);
+                let white_w_for_zoom =
+                    keyboard_white_key_width(ui.available_width(), self.piano_zoom);
+                let max_allowed_key_h = (white_w_for_zoom * WHITE_KEY_LENGTH_TO_WIDTH)
+                    .clamp(MIN_PIANO_KEY_HEIGHT, 220.0);
+                let key_h_for_frame = max_allowed_key_h;
+                let panel_visual_gap = UI_STACK_VSPACE;
+                let default_item_spacing_y = ui.spacing().item_spacing.y;
+                ui.spacing_mut().item_spacing.y = 0.0;
 
-            if piano_draw.clicked {
-                self.piano_has_focus = true;
-            }
+                let prob_strip_height = if self.show_note_hist_window && note_visuals_ready {
+                    (key_h_for_frame * 0.9).clamp(MIN_PROBABILITY_STRIP_HEIGHT, 120.0)
+                } else {
+                    0.0
+                };
 
-            let (raw, smooth, shift, ctrl, zoom_delta, pointer_down, pointer_pos) =
-                ui.ctx().input(|i| {
-                    (
-                        i.raw_scroll_delta,
-                        i.smooth_scroll_delta,
-                        i.modifiers.shift,
-                        i.modifiers.ctrl,
-                        i.zoom_delta_2d(),
-                        i.pointer.primary_down(),
-                        i.pointer.interact_pos(),
-                    )
-                });
-            let wheel_y = if raw.y.abs() > f32::EPSILON {
-                raw.y
-            } else {
-                smooth.y
-            };
+                let mut max_scroll_px: f32 = 0.0;
+                if self.show_note_hist_window && note_visuals_ready {
+                    let prob_draw = draw_probability_pane(
+                        ui,
+                        &self.note_probs_smoothed,
+                        self.note_probs.as_slice(),
+                        self.piano_zoom,
+                        self.piano_scroll_px,
+                        prob_strip_height,
+                        self.highlight_color,
+                    );
+                    max_scroll_px = max_scroll_px.max(prob_draw.max_scroll_px);
+                    if prob_draw.clicked {
+                        self.piano_has_focus = true;
+                    }
+                    ui.add_space(panel_visual_gap);
+                }
 
-            if self.piano_has_focus && pane_hovered {
-                if self.is_touch_platform() {
-                    if pointer_down {
-                        if let Some(pos) = pointer_pos {
-                            if let Some(last_x) = self.piano_drag_last_x {
-                                let delta_x = pos.x - last_x;
-                                self.piano_scroll_px =
-                                    (self.piano_scroll_px - delta_x).clamp(0.0, max_scroll_px);
+                let piano_draw = draw_piano_view(
+                    ui,
+                    &self.note_probs_smoothed,
+                    self.key_color_sensitivity,
+                    self.piano_zoom,
+                    key_h_for_frame,
+                    self.piano_scroll_px,
+                    self.highlight_color,
+                );
+                max_scroll_px = max_scroll_px.max(piano_draw.max_scroll_px);
+
+                if piano_draw.clicked {
+                    self.piano_has_focus = true;
+                }
+
+                let (raw, smooth, shift, ctrl, zoom_delta, pointer_down, pointer_pos) =
+                    ui.ctx().input(|i| {
+                        (
+                            i.raw_scroll_delta,
+                            i.smooth_scroll_delta,
+                            i.modifiers.shift,
+                            i.modifiers.ctrl,
+                            i.zoom_delta_2d(),
+                            i.pointer.primary_down(),
+                            i.pointer.interact_pos(),
+                        )
+                    });
+                let wheel_y = if raw.y.abs() > f32::EPSILON {
+                    raw.y
+                } else {
+                    smooth.y
+                };
+
+                if self.piano_has_focus && pane_hovered {
+                    if self.is_touch_platform() {
+                        if pointer_down {
+                            if let Some(pos) = pointer_pos {
+                                if let Some(last_x) = self.piano_drag_last_x {
+                                    let delta_x = pos.x - last_x;
+                                    self.piano_scroll_px =
+                                        (self.piano_scroll_px - delta_x).clamp(0.0, max_scroll_px);
+                                }
+                                self.piano_drag_last_x = Some(pos.x);
                             }
-                            self.piano_drag_last_x = Some(pos.x);
+                        } else {
+                            self.piano_drag_last_x = None;
+                        }
+
+                        if (zoom_delta.y - 1.0).abs() > f32::EPSILON {
+                            self.piano_zoom = (self.piano_zoom * zoom_delta.y)
+                                .clamp(PIANO_ZOOM_MIN, PIANO_ZOOM_MAX);
                         }
                     } else {
                         self.piano_drag_last_x = None;
-                    }
-
-                    if (zoom_delta.y - 1.0).abs() > f32::EPSILON {
-                        self.piano_zoom =
-                            (self.piano_zoom * zoom_delta.y).clamp(PIANO_ZOOM_MIN, PIANO_ZOOM_MAX);
+                        if ctrl && wheel_y.abs() > f32::EPSILON {
+                            let z = if wheel_y > 0.0 { 1.08 } else { 0.92 };
+                            self.piano_zoom =
+                                (self.piano_zoom * z).clamp(PIANO_ZOOM_MIN, PIANO_ZOOM_MAX);
+                        } else if shift && wheel_y.abs() > f32::EPSILON {
+                            self.piano_scroll_px =
+                                (self.piano_scroll_px - wheel_y * 0.7).clamp(0.0, max_scroll_px);
+                        }
                     }
                 } else {
                     self.piano_drag_last_x = None;
-                    if ctrl && wheel_y.abs() > f32::EPSILON {
-                        let z = if wheel_y > 0.0 { 1.08 } else { 0.92 };
-                        self.piano_zoom =
-                            (self.piano_zoom * z).clamp(PIANO_ZOOM_MIN, PIANO_ZOOM_MAX);
-                    } else if shift && wheel_y.abs() > f32::EPSILON {
-                        self.piano_scroll_px =
-                            (self.piano_scroll_px - wheel_y * 0.7).clamp(0.0, max_scroll_px);
-                    }
                 }
+
+                ui.add_space(UI_VSPACE_TIGHT);
+                ui.spacing_mut().item_spacing.y = default_item_spacing_y.min(UI_VSPACE_TIGHT);
+                egui::Frame::none()
+                    .inner_margin(egui::Margin::symmetric(12.0, UI_VSPACE_TIGHT))
+                    .show(ui, |ui| {
+                        let pair_gap = 12.0;
+                        let pair_w = ui.available_width().max(0.0);
+                        let col_w = ((pair_w - pair_gap).max(0.0)) * 0.5;
+                        let slider_row_h = ui.spacing().interact_size.y.clamp(22.0, 30.0)
+                            + UI_VSPACE_TIGHT * 2.0
+                            + 2.0;
+                        ui.allocate_ui_with_layout(
+                            egui::vec2(pair_w, slider_row_h),
+                            egui::Layout::left_to_right(egui::Align::Center),
+                            |ui| {
+                                ui.spacing_mut().item_spacing.x = pair_gap;
+
+                                ui.allocate_ui_with_layout(
+                                    egui::vec2(col_w, slider_row_h),
+                                    egui::Layout::top_down(egui::Align::Center),
+                                    |ui| {
+                                        let mut ui_key_sensitivity =
+                                            (self.key_color_sensitivity * 0.5).clamp(0.0, 1.0);
+                                        if Self::top_bar_slider_with_input(
+                                            ui,
+                                            "Key Color Sensitivity",
+                                            &mut ui_key_sensitivity,
+                                            0.0,
+                                            1.0,
+                                            "",
+                                            0.01,
+                                            2,
+                                        ) {
+                                            self.key_color_sensitivity =
+                                                (ui_key_sensitivity * 2.0).clamp(0.0, 2.0);
+                                        }
+                                    },
+                                );
+
+                                ui.allocate_ui_with_layout(
+                                    egui::vec2(col_w, slider_row_h),
+                                    egui::Layout::top_down(egui::Align::Center),
+                                    |ui| {
+                                        let _ = Self::top_bar_slider_with_input(
+                                            ui,
+                                            "Piano Zoom",
+                                            &mut self.piano_zoom,
+                                            PIANO_ZOOM_MIN,
+                                            PIANO_ZOOM_MAX,
+                                            "x",
+                                            0.01,
+                                            2,
+                                        );
+                                    },
+                                );
+                            },
+                        );
+                    });
+                ui.add_space(UI_VSPACE_TIGHT);
+                ui.spacing_mut().item_spacing.y = default_item_spacing_y;
+            });
+            self.piano_panel_height = piano_panel.response.rect.height().max(80.0);
+
+            // Always use the tallest proportion-correct key height.
+            let white_w_for_zoom =
+                keyboard_white_key_width(piano_panel.response.rect.width(), self.piano_zoom);
+            self.piano_key_height =
+                (white_w_for_zoom * WHITE_KEY_LENGTH_TO_WIDTH).clamp(MIN_PIANO_KEY_HEIGHT, 220.0);
+
+            self.probability_panel_height = if self.show_note_hist_window {
+                (self.piano_key_height * 0.9).clamp(MIN_PROBABILITY_STRIP_HEIGHT, 120.0)
             } else {
-                self.piano_drag_last_x = None;
-            }
-
-            ui.add_space(UI_VSPACE_TIGHT);
-            ui.spacing_mut().item_spacing.y = default_item_spacing_y.min(UI_VSPACE_TIGHT);
-            egui::Frame::none()
-                .inner_margin(egui::Margin::symmetric(12.0, UI_VSPACE_TIGHT))
-                .show(ui, |ui| {
-                    let pair_gap = 12.0;
-                    let pair_w = ui.available_width().max(0.0);
-                    let col_w = ((pair_w - pair_gap).max(0.0)) * 0.5;
-                    let slider_row_h = ui.spacing().interact_size.y.clamp(22.0, 30.0)
-                        + UI_VSPACE_TIGHT * 2.0
-                        + 2.0;
-                    ui.allocate_ui_with_layout(
-                        egui::vec2(pair_w, slider_row_h),
-                        egui::Layout::left_to_right(egui::Align::Center),
-                        |ui| {
-                            ui.spacing_mut().item_spacing.x = pair_gap;
-
-                            ui.allocate_ui_with_layout(
-                                egui::vec2(col_w, slider_row_h),
-                                egui::Layout::top_down(egui::Align::Center),
-                                |ui| {
-                                    let mut ui_key_sensitivity =
-                                        (self.key_color_sensitivity * 0.5).clamp(0.0, 1.0);
-                                    if Self::top_bar_slider_with_input(
-                                        ui,
-                                        "Key Color Sensitivity",
-                                        &mut ui_key_sensitivity,
-                                        0.0,
-                                        1.0,
-                                        "",
-                                        0.01,
-                                        2,
-                                    ) {
-                                        self.key_color_sensitivity =
-                                            (ui_key_sensitivity * 2.0).clamp(0.0, 2.0);
-                                    }
-                                },
-                            );
-
-                            ui.allocate_ui_with_layout(
-                                egui::vec2(col_w, slider_row_h),
-                                egui::Layout::top_down(egui::Align::Center),
-                                |ui| {
-                                    let _ = Self::top_bar_slider_with_input(
-                                        ui,
-                                        "Piano Zoom",
-                                        &mut self.piano_zoom,
-                                        PIANO_ZOOM_MIN,
-                                        PIANO_ZOOM_MAX,
-                                        "x",
-                                        0.01,
-                                        2,
-                                    );
-                                },
-                            );
-                        },
-                    );
-                });
-            ui.add_space(UI_VSPACE_TIGHT);
-            ui.spacing_mut().item_spacing.y = default_item_spacing_y;
-        });
-        self.piano_panel_height = piano_panel.response.rect.height().max(80.0);
-
-        // Always use the tallest proportion-correct key height.
-        let white_w_for_zoom =
-            keyboard_white_key_width(piano_panel.response.rect.width(), self.piano_zoom);
-        self.piano_key_height =
-            (white_w_for_zoom * WHITE_KEY_LENGTH_TO_WIDTH).clamp(MIN_PIANO_KEY_HEIGHT, 220.0);
-
-        self.probability_panel_height = if self.show_note_hist_window {
-            (self.piano_key_height * 0.9).clamp(MIN_PROBABILITY_STRIP_HEIGHT, 120.0)
+                0.0
+            };
         } else {
-            0.0
-        };
+            self.piano_panel_height = 0.0;
+            self.probability_panel_height = 0.0;
+        }
 
         let waveform_central = egui::CentralPanel::default()
             .frame(egui::Frame::none().inner_margin(egui::Margin::symmetric(UI_VSPACE_MEDIUM, 0.0)))
             .show(ctx, |ui| {
                 if self.audio_raw.is_none() {
-                    ui.label("Import an audio file to begin.");
+                    let import_surface_rect = ui.max_rect();
+                    let import_surface_id = ui.make_persistent_id("empty_audio_import_surface");
+                    let import_surface =
+                        ui.interact(import_surface_rect, import_surface_id, egui::Sense::click());
+
+                    if import_surface.hovered() {
+                        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+                    }
+
+                    paint_audio_import_overlay(
+                        ui.painter(),
+                        import_surface_rect,
+                        self.highlight_color,
+                        168,
+                        "Click Or Drag Audio File",
+                        "To Start Transcribing (wav, mp3, flac, ogg, m4a, aac)",
+                    );
+
+                    #[cfg(feature = "desktop-ui")]
+                    if import_surface.clicked() {
+                        self.import_audio_with_ctx(ctx);
+                    }
+
                     return;
                 }
 
@@ -615,7 +642,7 @@ impl eframe::App for KeyScribeApp {
         self.waveform_panel_height = waveform_central.response.rect.height().clamp(120.0, 5000.0);
 
         #[cfg(feature = "desktop-ui")]
-        if hovered_valid_drop.is_some() {
+        if hovered_valid_drop.is_some() && self.audio_raw.is_some() {
             let screen_rect = ctx.input(|i| i.screen_rect());
             let overlay_layer = egui::LayerId::new(
                 egui::Order::Foreground,
@@ -623,33 +650,13 @@ impl eframe::App for KeyScribeApp {
             );
             let painter = ctx.layer_painter(overlay_layer);
 
-            painter.rect_filled(
+            paint_audio_import_overlay(
+                &painter,
                 screen_rect,
-                0.0,
-                egui::Color32::from_rgba_unmultiplied(6, 10, 16, 168),
-            );
-
-            let border_color = egui::Color32::from_rgb(
-                self.highlight_color.r().saturating_add(20),
-                self.highlight_color.g().saturating_add(20),
-                self.highlight_color.b().saturating_add(20),
-            );
-            let frame_rect = screen_rect.shrink(22.0);
-            painter.rect_stroke(frame_rect, 12.0, egui::Stroke::new(2.0, border_color));
-
-            painter.text(
-                frame_rect.center() + egui::vec2(0.0, -10.0),
-                egui::Align2::CENTER_CENTER,
+                self.highlight_color,
+                228,
                 "Drop Audio File To Import",
-                egui::FontId::proportional(26.0),
-                egui::Color32::WHITE,
-            );
-            painter.text(
-                frame_rect.center() + egui::vec2(0.0, 22.0),
-                egui::Align2::CENTER_CENTER,
                 "Supports wav, mp3, flac, ogg, m4a, aac",
-                egui::FontId::proportional(16.0),
-                egui::Color32::from_gray(216),
             );
         }
 
@@ -677,4 +684,42 @@ impl Drop for KeyScribeApp {
     fn drop(&mut self) {
         self.save_state_to_disk();
     }
+}
+
+fn paint_audio_import_overlay(
+    painter: &egui::Painter,
+    overlay_rect: egui::Rect,
+    highlight_color: egui::Color32,
+    backdrop_alpha: u8,
+    title: &str,
+    subtitle: &str,
+) {
+    painter.rect_filled(
+        overlay_rect,
+        0.0,
+        egui::Color32::from_rgba_unmultiplied(6, 10, 16, backdrop_alpha),
+    );
+
+    let border_color = egui::Color32::from_rgb(
+        highlight_color.r().saturating_add(20),
+        highlight_color.g().saturating_add(20),
+        highlight_color.b().saturating_add(20),
+    );
+    let frame_rect = overlay_rect.shrink(22.0);
+    painter.rect_stroke(frame_rect, 12.0, egui::Stroke::new(2.0, border_color));
+
+    painter.text(
+        frame_rect.center() + egui::vec2(0.0, -10.0),
+        egui::Align2::CENTER_CENTER,
+        title,
+        egui::FontId::proportional(26.0),
+        egui::Color32::WHITE,
+    );
+    painter.text(
+        frame_rect.center() + egui::vec2(0.0, 22.0),
+        egui::Align2::CENTER_CENTER,
+        subtitle,
+        egui::FontId::proportional(16.0),
+        egui::Color32::from_gray(216),
+    );
 }

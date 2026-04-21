@@ -10,6 +10,7 @@ const SETTINGS_RGB_SLIDER_MAX_WIDTH: f32 = 220.0;
 const CONTROLS_PANEL_HORIZONTAL_PADDING: f32 = 6.0;
 const CONTROLS_PANEL_VERTICAL_PADDING: f32 = UI_VSPACE_COMPACT;
 const SLIDER_PAIR_VERTICAL_SPACING: f32 = UI_VSPACE_TIGHT;
+const SHORTCUTS_MODAL_WIDTH: f32 = 470.0;
 
 impl KeyScribeApp {
     fn draw_toolbar_separator(ui: &mut egui::Ui) {
@@ -311,6 +312,14 @@ impl KeyScribeApp {
                 ui.set_min_width(Self::responsive_menu_min_width(ui));
                 self.draw_preferences_menu(ui);
             });
+
+            ui.menu_button("Help", |ui| {
+                ui.set_min_width(220.0);
+                if ui.button("Keyboard Shortcuts").clicked() {
+                    self.show_shortcuts_help_modal = true;
+                    ui.close_menu();
+                }
+            });
         });
 
         if let Some(path) = selected_recent_file {
@@ -318,6 +327,64 @@ impl KeyScribeApp {
                 self.last_error = Some(err);
             }
         }
+    }
+
+    fn draw_keyboard_shortcuts_modal(&mut self, ctx: &egui::Context) {
+        if !self.show_shortcuts_help_modal {
+            return;
+        }
+
+        let mut keep_open = self.show_shortcuts_help_modal;
+        let mut close_requested = false;
+
+        egui::Window::new("Keyboard Shortcuts")
+            .id(egui::Id::new("keyboard_shortcuts_help_modal"))
+            .open(&mut keep_open)
+            .default_width(SHORTCUTS_MODAL_WIDTH)
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
+            .show(ctx, |ui| {
+                ui.label("Playback");
+                egui::Grid::new("keyboard_shortcuts_help_grid")
+                    .num_columns(2)
+                    .min_col_width(140.0)
+                    .spacing([14.0, 8.0])
+                    .striped(true)
+                    .show(ui, |ui| {
+                        ui.monospace("Space");
+                        ui.label("Replay from the selected time");
+                        ui.end_row();
+
+                        ui.monospace("K");
+                        ui.label("Play or pause");
+                        ui.end_row();
+
+                        ui.monospace("Left Arrow");
+                        ui.label("Seek backward by 5 seconds");
+                        ui.end_row();
+
+                        ui.monospace("Right Arrow");
+                        ui.label("Seek forward by 5 seconds");
+                        ui.end_row();
+
+                        ui.monospace("Ctrl + Left/Right Arrow");
+                        ui.label("Shift loop range by 5 seconds (when loop is active)");
+                        ui.end_row();
+                    });
+
+                ui.add_space(UI_VSPACE_COMPACT);
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if ui.button("Close").clicked() {
+                        close_requested = true;
+                    }
+                });
+            });
+
+        if close_requested {
+            keep_open = false;
+        }
+        self.show_shortcuts_help_modal = keep_open;
     }
 
     pub(super) fn top_bar_slider_with_input(
@@ -680,6 +747,10 @@ impl KeyScribeApp {
                                 self.draw_settings_menu(ui);
                             },
                         );
+
+                        if ui.button("Help").clicked() {
+                            self.show_shortcuts_help_modal = true;
+                        }
                     });
 
                     if self.is_touch_platform() {
@@ -917,5 +988,7 @@ impl KeyScribeApp {
                     }
                 });
         });
+
+            self.draw_keyboard_shortcuts_modal(ctx);
     }
 }

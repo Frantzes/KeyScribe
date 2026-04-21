@@ -3,6 +3,8 @@
 KeyScribe is desktop app for polyphonic note detection from recorded audio.
 Built in Rust. Optimized for accuracy, responsiveness, portable distribution.
 
+[Visit website](https://keyscribe.frantzeselzaurdia.com/)
+
 > Status: Beta (active development).
 > The app is still evolving quickly and behavior, UI, and outputs may change between releases.
 
@@ -45,63 +47,6 @@ Run app:
 cargo run --release
 ```
 
-## Portable Builds
-
-### Windows
-
-```powershell
-powershell -ExecutionPolicy Bypass -File scripts/build-windows.ps1
-```
-
-Outputs:
-
-- build/windows/keyscribe-windows-x64/
-- build/windows/keyscribe-windows-x64.zip
-
-### macOS
-
-```bash
-chmod +x scripts/build-macos.sh
-./scripts/build-macos.sh
-```
-
-Outputs:
-
-- Portable:
-- build/macos/keyscribe-macos-arm64/
-- build/macos/keyscribe-macos-arm64.zip
-- App bundle archive:
-- build/macos/keyscribe-macos-arm64-app/KeyScribe.app
-- (disabled in current CI) build/macos/keyscribe-macos-arm64-app.zip
-- Drag-and-drop installer:
-- build/macos/keyscribe-macos-arm64.dmg
-- Package installer:
-- (disabled in current CI) build/macos/keyscribe-macos-arm64.pkg
-
-For installed `.app` runs on macOS, app state and analysis cache are stored in user Library locations (not inside the app bundle), so installs under `/Applications` remain writable for cache updates.
-
-### Linux
-
-```bash
-chmod +x scripts/build-linux.sh
-./scripts/build-linux.sh
-```
-
-Outputs:
-
-- build/linux/keyscribe-linux-x64/ or build/linux/keyscribe-linux-arm64/
-- build/linux/keyscribe-linux-x64.zip or build/linux/keyscribe-linux-arm64.zip
-
-## Automated Releases (Tags)
-
-Tag push triggers [.github/workflows/release-on-tag.yml](.github/workflows/release-on-tag.yml).
-Workflow builds Windows and Linux portable zips, plus macOS arm64 DMG installer artifacts and uploads assets to GitHub Release.
-
-```bash
-git tag v0.1.0
-git push origin v0.1.0
-```
-
 ## Usage Flow
 
 1. Open audio file.
@@ -118,17 +63,5 @@ git push origin v0.1.0
 - DSP core: rustfft + custom CQT, preprocessing, viterbi modules
 - Optional model integration path: ONNX Runtime crate (ort)
 
-## Limitations
-
-- File-based workflow only, no live microphone transcription yet.
-- Outputs note activations, not chord names or notation export.
-- CQT Pro mode introduces intentional smoothing latency for stability.
-
-## More Documentation
-
-- [CQT_PRO_MODE.md](CQT_PRO_MODE.md)
-- [HFSFORMER_IMPLEMENTATION.md](HFSFORMER_IMPLEMENTATION.md)
-
 ## License
-
-MIT. See LICENSE.
+GNU AGPL-3. See LICENSE.

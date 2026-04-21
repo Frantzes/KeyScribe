@@ -837,6 +837,7 @@ pub struct KeyScribeApp {
     touch_loop_select_mode: bool,
     manual_import_path: String,
     mobile_ui_tweaks_applied: bool,
+    show_shortcuts_help_modal: bool,
 }
 
 struct ProcessingResult {
@@ -1012,6 +1013,7 @@ impl KeyScribeApp {
                 .map(|path| path.to_string_lossy().to_string())
                 .unwrap_or_default(),
             mobile_ui_tweaks_applied: false,
+            show_shortcuts_help_modal: false,
         };
 
         app.refresh_audio_output_devices();
