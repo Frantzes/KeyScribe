@@ -399,6 +399,7 @@ impl KeyScribeApp {
             speed: self.speed,
             pitch_semitones: self.pitch_semitones,
             key_color_sensitivity: self.key_color_sensitivity,
+            key_highlight_max_sec: self.key_highlight_max_sec,
             piano_zoom: self.piano_zoom,
             piano_key_height: self.piano_key_height,
             waveform_panel_height: self.waveform_panel_height,
@@ -424,8 +425,47 @@ impl KeyScribeApp {
         }
     }
 
+    pub(super) fn update_note_highlight_visuals(&mut self, elapsed_sec: f32) {
+        if self.note_highlight_hold_remaining.len() != self.note_probs.len() {
+            self.note_highlight_hold_remaining
+                .resize(self.note_probs.len(), 0.0);
+        }
+
+        let dt = elapsed_sec.clamp(0.0, 0.25);
+        let hold_max_sec = self
+            .key_highlight_max_sec
+            .clamp(KEY_HIGHLIGHT_MAX_SEC_MIN, KEY_HIGHLIGHT_MAX_SEC_MAX);
+        let hold_floor = (NOTE_HIGHLIGHT_ACTIVATION_THRESHOLD
+            / self.key_color_sensitivity.max(0.05))
+        .clamp(0.0, 1.0);
+
+        for ((smoothed, current), hold_remaining) in self
+            .note_probs_smoothed
+            .iter_mut()
+            .zip(self.note_probs.iter())
+            .zip(self.note_highlight_hold_remaining.iter_mut())
+        {
+            let current = current.clamp(0.0, 1.0);
+            if current >= hold_floor {
+                *hold_remaining = hold_max_sec;
+            } else if dt > 0.0 {
+                *hold_remaining = (*hold_remaining - dt).max(0.0);
+            }
+
+            let held_target = if *hold_remaining > 0.0 {
+                hold_floor
+            } else {
+                0.0
+            };
+            let target = current.max(held_target);
+
+            *smoothed = *smoothed * 0.86 + target * 0.14;
+        }
+    }
+
     pub(super) fn update_note_probabilities(&mut self, force: bool) {
-        if !force && self.last_prob_update.elapsed() < PROBABILITY_UPDATE_INTERVAL {
+        let elapsed_sec = self.last_prob_update.elapsed().as_secs_f32();
+        if !force && elapsed_sec < PROBABILITY_UPDATE_INTERVAL.as_secs_f32() {
             return;
         }
 
@@ -470,14 +510,7 @@ impl KeyScribeApp {
             };
         }
 
-        // Smooth the visual state to reduce rapid flicker between adjacent notes.
-        for (smoothed, current) in self
-            .note_probs_smoothed
-            .iter_mut()
-            .zip(self.note_probs.iter())
-        {
-            *smoothed = *smoothed * 0.78 + *current * 0.22;
-        }
+        self.update_note_highlight_visuals(elapsed_sec);
 
         self.last_prob_update = Instant::now();
     }

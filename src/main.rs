@@ -30,7 +30,7 @@ fn run_native_app(mut native_options: eframe::NativeOptions) -> eframe::Result<(
     }
 
     eframe::run_native(
-        "KeyScribe",
+        "Keyscribe",
         native_options,
         Box::new(|cc| Box::new(KeyScribeApp::new(cc))),
     )

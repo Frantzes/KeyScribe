@@ -237,13 +237,8 @@ impl KeyScribeApp {
             Self::transpose_frame(frame, self.pitch_semitones)
         };
 
-        for (smoothed, current) in self
-            .note_probs_smoothed
-            .iter_mut()
-            .zip(self.note_probs.iter())
-        {
-            *smoothed = *smoothed * 0.78 + *current * 0.22;
-        }
+        let elapsed_sec = self.last_prob_update.elapsed().as_secs_f32();
+        self.update_note_highlight_visuals(elapsed_sec);
 
         self.last_prob_update = Instant::now();
     }

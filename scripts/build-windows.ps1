@@ -1,7 +1,9 @@
 param(
     [string]$Target = "x86_64-pc-windows-msvc",
     [switch]$SkipCargoBuild,
-    [string]$OutputRoot = "build/windows"
+    [string]$OutputRoot = "build/windows",
+    [switch]$PersonalUpdate,
+    [switch]$SkipZip
 )
 
 Set-StrictMode -Version Latest
@@ -42,12 +44,42 @@ try {
     $bundleDir = Join-Path $repoRoot "$OutputRoot/$bundleName"
     $modelsDir = Join-Path $bundleDir "models"
 
-    if (Test-Path $bundleDir) {
+    if ($PersonalUpdate) {
+        Write-Host "Personal update mode enabled: preserving existing files in $bundleDir"
+    } elseif (Test-Path $bundleDir) {
         Remove-Item -Path $bundleDir -Recurse -Force
     }
     New-Item -ItemType Directory -Path $modelsDir -Force | Out-Null
 
-    Copy-Item -Path $binaryPath -Destination (Join-Path $bundleDir $bundleBinaryName) -Force
+    $bundleBinaryPath = Join-Path $bundleDir $bundleBinaryName
+    try {
+        Copy-Item -Path $binaryPath -Destination $bundleBinaryPath -Force -ErrorAction Stop
+    } catch {
+        if (-not $PersonalUpdate) {
+            throw
+        }
+
+        $stagedBinaryPath = Join-Path $bundleDir "keyscribe.update.exe"
+        Copy-Item -Path $binaryPath -Destination $stagedBinaryPath -Force
+
+        $swapScriptPath = Join-Path $bundleDir "apply-update.cmd"
+        Set-Content -Path $swapScriptPath -Encoding ASCII -Value @"
+@echo off
+setlocal
+echo Applying Keyscribe update...
+copy /Y "keyscribe.update.exe" "keyscribe.exe" >nul
+if errorlevel 1 (
+  echo Update failed. Make sure Keyscribe is fully closed, then run this again.
+  exit /b 1
+)
+del "keyscribe.update.exe" >nul 2>nul
+echo Update applied successfully.
+exit /b 0
+"@
+
+        Write-Warning "Could not overwrite running keyscribe.exe. Staged update as keyscribe.update.exe."
+        Write-Warning "Close Keyscribe, then run apply-update.cmd in $bundleDir to finish replacing the executable."
+    }
 
     $modelPath = Join-Path $repoRoot "models/basic-pitch.onnx"
     if (-not (Test-Path $modelPath)) {
@@ -93,15 +125,20 @@ Contents:
 Run keyscribe.exe from this folder so the relative model path works.
 "@
 
-    $zipPath = Join-Path $repoRoot "$OutputRoot/$bundleName.zip"
-    if (Test-Path $zipPath) {
-        Remove-Item -Path $zipPath -Force
+    $shouldZip = -not $SkipZip -and -not $PersonalUpdate
+    if ($shouldZip) {
+        $zipPath = Join-Path $repoRoot "$OutputRoot/$bundleName.zip"
+        if (Test-Path $zipPath) {
+            Remove-Item -Path $zipPath -Force
+        }
+
+        Compress-Archive -Path (Join-Path $bundleDir "*") -DestinationPath $zipPath -CompressionLevel Optimal
+        Write-Host "Portable bundle zip:       $zipPath"
+    } else {
+        Write-Host "Portable zip generation skipped."
     }
 
-    Compress-Archive -Path (Join-Path $bundleDir "*") -DestinationPath $zipPath -CompressionLevel Optimal
-
     Write-Host "Portable bundle directory: $bundleDir"
-    Write-Host "Portable bundle zip:       $zipPath"
 }
 finally {
     Pop-Location

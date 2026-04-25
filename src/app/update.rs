@@ -210,58 +210,145 @@ impl eframe::App for KeyScribeApp {
                 egui::Frame::none()
                     .inner_margin(egui::Margin::symmetric(12.0, UI_VSPACE_TIGHT))
                     .show(ui, |ui| {
-                        let pair_gap = 12.0;
-                        let pair_w = ui.available_width().max(0.0);
-                        let col_w = ((pair_w - pair_gap).max(0.0)) * 0.5;
+                        let trio_gap = 12.0;
+                        let trio_w = ui.available_width().max(0.0);
+                        let stack_controls = trio_w < 780.0;
                         let slider_row_h = ui.spacing().interact_size.y.clamp(22.0, 30.0)
                             + UI_VSPACE_TIGHT * 2.0
                             + 2.0;
-                        ui.allocate_ui_with_layout(
-                            egui::vec2(pair_w, slider_row_h),
-                            egui::Layout::left_to_right(egui::Align::Center),
-                            |ui| {
-                                ui.spacing_mut().item_spacing.x = pair_gap;
+                        let mut visuals_changed = false;
 
-                                ui.allocate_ui_with_layout(
-                                    egui::vec2(col_w, slider_row_h),
-                                    egui::Layout::top_down(egui::Align::Center),
-                                    |ui| {
-                                        let mut ui_key_sensitivity =
-                                            (self.key_color_sensitivity * 0.5).clamp(0.0, 1.0);
-                                        if Self::top_bar_slider_with_input(
-                                            ui,
-                                            "Key Color Sensitivity",
-                                            &mut ui_key_sensitivity,
-                                            0.0,
-                                            1.0,
-                                            "",
-                                            0.01,
-                                            2,
-                                        ) {
-                                            self.key_color_sensitivity =
-                                                (ui_key_sensitivity * 2.0).clamp(0.0, 2.0);
-                                        }
-                                    },
-                                );
+                        if stack_controls {
+                            ui.allocate_ui_with_layout(
+                                egui::vec2(trio_w, 0.0),
+                                egui::Layout::top_down(egui::Align::Center),
+                                |ui| {
+                                    let mut ui_key_sensitivity =
+                                        (self.key_color_sensitivity * 0.5).clamp(0.0, 1.0);
+                                    if Self::top_bar_slider_with_input(
+                                        ui,
+                                        "Key Color Sensitivity",
+                                        &mut ui_key_sensitivity,
+                                        0.0,
+                                        1.0,
+                                        "",
+                                        0.01,
+                                        2,
+                                    ) {
+                                        self.key_color_sensitivity =
+                                            (ui_key_sensitivity * 2.0).clamp(0.0, 2.0);
+                                        visuals_changed = true;
+                                    }
 
-                                ui.allocate_ui_with_layout(
-                                    egui::vec2(col_w, slider_row_h),
-                                    egui::Layout::top_down(egui::Align::Center),
-                                    |ui| {
-                                        let _ = Self::top_bar_slider_with_input(
-                                            ui,
-                                            "Piano Zoom",
-                                            &mut self.piano_zoom,
-                                            PIANO_ZOOM_MIN,
-                                            PIANO_ZOOM_MAX,
-                                            "x",
-                                            0.01,
-                                            2,
-                                        );
-                                    },
-                                );
-                            },
-                        );
+                                    ui.add_space(UI_VSPACE_TIGHT);
+                                    if Self::top_bar_slider_with_input(
+                                        ui,
+                                        "Max Key Highlight Time",
+                                        &mut self.key_highlight_max_sec,
+                                        KEY_HIGHLIGHT_MAX_SEC_MIN,
+                                        KEY_HIGHLIGHT_MAX_SEC_MAX,
+                                        " s",
+                                        0.005,
+                                        2,
+                                    ) {
+                                        self.key_highlight_max_sec = self
+                                            .key_highlight_max_sec
+                                            .clamp(KEY_HIGHLIGHT_MAX_SEC_MIN, KEY_HIGHLIGHT_MAX_SEC_MAX);
+                                        visuals_changed = true;
+                                    }
+
+                                    ui.add_space(UI_VSPACE_TIGHT);
+                                    let _ = Self::top_bar_slider_with_input(
+                                        ui,
+                                        "Piano Zoom",
+                                        &mut self.piano_zoom,
+                                        PIANO_ZOOM_MIN,
+                                        PIANO_ZOOM_MAX,
+                                        "x",
+                                        0.01,
+                                        2,
+                                    );
+                                },
+                            );
+                        } else {
+                            let col_w = ((trio_w - trio_gap * 2.0).max(0.0)) / 3.0;
+                            ui.allocate_ui_with_layout(
+                                egui::vec2(trio_w, slider_row_h),
+                                egui::Layout::left_to_right(egui::Align::Center),
+                                |ui| {
+                                    ui.spacing_mut().item_spacing.x = trio_gap;
+
+                                    ui.allocate_ui_with_layout(
+                                        egui::vec2(col_w, slider_row_h),
+                                        egui::Layout::top_down(egui::Align::Center),
+                                        |ui| {
+                                            let mut ui_key_sensitivity =
+                                                (self.key_color_sensitivity * 0.5).clamp(0.0, 1.0);
+                                            if Self::top_bar_slider_with_input(
+                                                ui,
+                                                "Key Color Sensitivity",
+                                                &mut ui_key_sensitivity,
+                                                0.0,
+                                                1.0,
+                                                "",
+                                                0.01,
+                                                2,
+                                            ) {
+                                                self.key_color_sensitivity =
+                                                    (ui_key_sensitivity * 2.0).clamp(0.0, 2.0);
+                                                visuals_changed = true;
+                                            }
+                                        },
+                                    );
+
+                                    ui.allocate_ui_with_layout(
+                                        egui::vec2(col_w, slider_row_h),
+                                        egui::Layout::top_down(egui::Align::Center),
+                                        |ui| {
+                                            if Self::top_bar_slider_with_input(
+                                                ui,
+                                                "Max Key Highlight Time",
+                                                &mut self.key_highlight_max_sec,
+                                                KEY_HIGHLIGHT_MAX_SEC_MIN,
+                                                KEY_HIGHLIGHT_MAX_SEC_MAX,
+                                                " s",
+                                                0.005,
+                                                2,
+                                            ) {
+                                                self.key_highlight_max_sec = self
+                                                    .key_highlight_max_sec
+                                                    .clamp(
+                                                        KEY_HIGHLIGHT_MAX_SEC_MIN,
+                                                        KEY_HIGHLIGHT_MAX_SEC_MAX,
+                                                    );
+                                                visuals_changed = true;
+                                            }
+                                        },
+                                    );
+
+                                    ui.allocate_ui_with_layout(
+                                        egui::vec2(col_w, slider_row_h),
+                                        egui::Layout::top_down(egui::Align::Center),
+                                        |ui| {
+                                            let _ = Self::top_bar_slider_with_input(
+                                                ui,
+                                                "Piano Zoom",
+                                                &mut self.piano_zoom,
+                                                PIANO_ZOOM_MIN,
+                                                PIANO_ZOOM_MAX,
+                                                "x",
+                                                0.01,
+                                                2,
+                                            );
+                                        },
+                                    );
+                                },
+                            );
+                        }
+
+                        if visuals_changed {
+                            self.update_note_probabilities(true);
+                        }
                     });
                 ui.add_space(UI_VSPACE_TIGHT);
                 ui.spacing_mut().item_spacing.y = default_item_spacing_y;

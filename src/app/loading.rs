@@ -23,6 +23,9 @@ impl KeyScribeApp {
         for value in &mut self.note_probs_smoothed {
             *value = 0.0;
         }
+        for value in &mut self.note_highlight_hold_remaining {
+            *value = 0.0;
+        }
     }
 
     pub(super) fn note_visuals_ready(&self) -> bool {

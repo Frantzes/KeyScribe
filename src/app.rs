@@ -53,6 +53,9 @@ const STATE_FILE_NAME: &str = ".keyscribe_state.json";
 const LEGACY_STATE_FILE_NAME: &str = ".transcriber_state.json";
 const MAX_STATE_FILE_BYTES: u64 = 256 * 1024;
 const PROBABILITY_UPDATE_INTERVAL: Duration = Duration::from_millis(16);
+const KEY_HIGHLIGHT_MAX_SEC_MIN: f32 = 0.01;
+const KEY_HIGHLIGHT_MAX_SEC_MAX: f32 = 1.0;
+const NOTE_HIGHLIGHT_ACTIVATION_THRESHOLD: f32 = 0.12;
 const FFT_TIMELINE_STEP_SEC: f32 = 0.05;
 const FFT_WINDOW_SIZE: usize = 4096;
 const LOOP_MIN_DURATION_SEC: f32 = 0.01;
@@ -142,6 +145,10 @@ fn default_key_color_sensitivity() -> f32 {
     0.46
 }
 
+fn default_key_highlight_max_sec() -> f32 {
+    0.1
+}
+
 fn default_playback_volume() -> f32 {
     0.8
 }
@@ -225,6 +232,8 @@ struct PersistedState {
     pitch_semitones: f32,
     #[serde(default = "default_key_color_sensitivity")]
     key_color_sensitivity: f32,
+    #[serde(default = "default_key_highlight_max_sec")]
+    key_highlight_max_sec: f32,
     piano_zoom: f32,
     piano_key_height: f32,
     waveform_panel_height: f32,
@@ -260,6 +269,7 @@ impl Default for PersistedState {
             speed: 1.0,
             pitch_semitones: 0.0,
             key_color_sensitivity: default_key_color_sensitivity(),
+            key_highlight_max_sec: default_key_highlight_max_sec(),
             piano_zoom: 1.0,
             piano_key_height: 72.0,
             waveform_panel_height: 320.0,
@@ -761,10 +771,12 @@ pub struct KeyScribeApp {
     base_note_timeline_step_sec: f32,
     note_probs: Vec<f32>,
     note_probs_smoothed: Vec<f32>,
+    note_highlight_hold_remaining: Vec<f32>,
     selected_time_sec: f32,
     speed: f32,
     pitch_semitones: f32,
     key_color_sensitivity: f32,
+    key_highlight_max_sec: f32,
     piano_zoom: f32,
     piano_key_height: f32,
     waveform_panel_height: f32,
@@ -925,10 +937,15 @@ impl KeyScribeApp {
             base_note_timeline_step_sec: 0.0,
             note_probs: vec![0.0; (PIANO_HIGH_MIDI - PIANO_LOW_MIDI + 1) as usize],
             note_probs_smoothed: vec![0.0; (PIANO_HIGH_MIDI - PIANO_LOW_MIDI + 1) as usize],
+            note_highlight_hold_remaining:
+                vec![0.0; (PIANO_HIGH_MIDI - PIANO_LOW_MIDI + 1) as usize],
             selected_time_sec: persisted.selected_time_sec.max(0.0),
             speed: persisted.speed.clamp(0.5, 2.0),
             pitch_semitones: persisted.pitch_semitones.clamp(-12.0, 12.0),
             key_color_sensitivity: persisted.key_color_sensitivity.clamp(0.0, 2.0),
+            key_highlight_max_sec: persisted
+                .key_highlight_max_sec
+                .clamp(KEY_HIGHLIGHT_MAX_SEC_MIN, KEY_HIGHLIGHT_MAX_SEC_MAX),
             piano_zoom: persisted.piano_zoom.clamp(PIANO_ZOOM_MIN, PIANO_ZOOM_MAX),
             piano_key_height: persisted
                 .piano_key_height
