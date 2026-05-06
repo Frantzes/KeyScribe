@@ -3,17 +3,12 @@
 use crate::cqt::CQTransform;
 use crate::inference::{BasicPitchInference, InferenceConfig};
 use crate::pipeline::{AudioPipeline, PipelineConfig};
-use rustfft::num_complex::Complex;
-use rustfft::FftPlanner;
-use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::{Mutex, OnceLock};
 
 static BASIC_PITCH_ENGINE: OnceLock<Mutex<Option<BasicPitchInference>>> = OnceLock::new();
-static CQT_PREVIEW_ENGINE: OnceLock<Mutex<Option<(u32, Arc<CQTransform>)>>> = OnceLock::new();
-static FFT_PLAN_CACHE: OnceLock<Mutex<HashMap<usize, Arc<dyn rustfft::Fft<f32>>>>> =
+static CQT_PREVIEW_ENGINE: OnceLock<Mutex<Option<(u32, Arc<crate::cqt::CQTransform>)>>> =
     OnceLock::new();
-static HANN_WINDOW_CACHE: OnceLock<Mutex<HashMap<usize, Arc<Vec<f32>>>>> = OnceLock::new();
 
 pub const PIANO_LOW_MIDI: u8 = 21;
 pub const PIANO_HIGH_MIDI: u8 = 108;
@@ -42,175 +37,12 @@ pub fn detect_note_probabilities(
     center_sample: usize,
     fft_size: usize,
 ) -> Vec<f32> {
-    let note_count = (PIANO_HIGH_MIDI - PIANO_LOW_MIDI + 1) as usize;
-    let mut probs = vec![0.0f32; note_count];
-
-    if samples.len() < fft_size || sample_rate == 0 || fft_size < 32 {
+    if let Some(probs) = detect_note_probabilities_basic_pitch(samples, sample_rate, center_sample)
+    {
         return probs;
     }
-
-    let half = fft_size / 2;
-    let start = center_sample
-        .saturating_sub(half)
-        .min(samples.len() - fft_size);
-    let slice = &samples[start..start + fft_size];
-
-    let fft = get_cached_fft_plan(fft_size);
-    let window = get_cached_hann_window(fft_size);
-
-    let mut buffer: Vec<Complex<f32>> = slice
-        .iter()
-        .enumerate()
-        .map(|(i, &s)| Complex::new(s * window[i], 0.0))
-        .collect();
-
-    fft.as_ref().process(&mut buffer);
-    let power: Vec<f32> = buffer.iter().take(fft_size / 2).map(|c| c.norm_sqr()).collect();
-
-    let bin_hz = sample_rate as f32 / fft_size as f32;
-    let nyquist_hz = sample_rate as f32 * 0.5;
-    let split_hz = 3200.0f32.min(nyquist_hz * 0.95);
-    let split_bin = ((split_hz / bin_hz) as usize).min(power.len().saturating_sub(1));
-
-    let low_energy: f32 = power.iter().take(split_bin.max(1)).copied().sum();
-    let high_energy: f32 = power.iter().skip(split_bin.max(1)).copied().sum();
-    let high_ratio = high_energy / (low_energy + high_energy + 1.0e-9);
-
-    // Spectral flatness: close to 0 => tonal/harmonic, close to 1 => noisy/percussive.
-    let flatness = if split_bin > 16 {
-        let bins = &power[8..split_bin];
-        let n = bins.len() as f32;
-        let geo = (bins.iter().map(|v| (v + 1.0e-12).ln()).sum::<f32>() / n).exp();
-        let arith = bins.iter().copied().sum::<f32>() / n + 1.0e-12;
-        (geo / arith).clamp(0.0, 1.0)
-    } else {
-        1.0
-    };
-
-    let tonal_factor =
-        (1.0 - flatness).clamp(0.0, 1.0).powf(1.35) * (1.0 - high_ratio).clamp(0.0, 1.0).powf(0.65);
-
-    if tonal_factor < 0.05 {
-        return probs;
-    }
-
-    for (idx, midi) in (PIANO_LOW_MIDI..=PIANO_HIGH_MIDI).enumerate() {
-        let f0 = midi_to_freq(midi);
-        let mut score = 0.0;
-        let mut fundamental = 0.0;
-        let mut second = 0.0;
-
-        for harmonic in 1..=7 {
-            let target = f0 * harmonic as f32;
-            if target >= nyquist_hz * 0.98 {
-                break;
-            }
-            let bin = (target / bin_hz).round() as usize;
-            if bin < power.len() {
-                let peak = weighted_peak(&power, bin);
-                let background = local_noise_floor(&power, bin);
-                let peakiness = (peak - background * 0.9).max(0.0);
-                let h_w = 1.0 / (harmonic as f32).powf(1.2);
-                score += peakiness * h_w;
-                if harmonic == 1 {
-                    fundamental = peakiness;
-                } else if harmonic == 2 {
-                    second = peakiness;
-                }
-            }
-        }
-
-        // Suppress notes with weak fundamental support (common in transients/noise).
-        let support = fundamental + second;
-        if support < 1.0e-9 {
-            score *= 0.2;
-        } else if fundamental < second * 0.25 {
-            score *= 0.65;
-        }
-
-        probs[idx] = score;
-    }
-
-    let max_v = probs
-        .iter()
-        .copied()
-        .fold(0.0f32, |a, b| if a > b { a } else { b });
-
-    if max_v > 1.0e-9 {
-        for p in &mut probs {
-            *p /= max_v;
-        }
-
-        // Keep the strongest candidates and suppress weak "always-on" tails.
-        let mut ranked = probs.clone();
-        ranked.sort_by(|a, b| b.partial_cmp(a).unwrap_or(std::cmp::Ordering::Equal));
-        let sparse_floor = ranked.get(9).copied().unwrap_or(0.0) * 0.55;
-
-        for p in &mut probs {
-            let s = ((*p - sparse_floor).max(0.0) / (1.0 - sparse_floor + 1.0e-6)).powf(1.8);
-            let gated = (s * tonal_factor).clamp(0.0, 1.0);
-            *p = if gated >= 0.06 { gated } else { 0.0 };
-        }
-
-        let max_after = probs
-            .iter()
-            .copied()
-            .fold(0.0f32, |a, b| if a > b { a } else { b });
-        if max_after > 1.0e-9 {
-            for p in &mut probs {
-                *p /= max_after;
-            }
-        }
-    }
-
-    probs
-}
-
-fn get_cached_fft_plan(fft_size: usize) -> Arc<dyn rustfft::Fft<f32>> {
-    let cache = FFT_PLAN_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
-    let Ok(mut guard) = cache.lock() else {
-        let mut planner = FftPlanner::<f32>::new();
-        return planner.plan_fft_forward(fft_size);
-    };
-
-    if let Some(plan) = guard.get(&fft_size) {
-        return Arc::clone(plan);
-    }
-
-    let mut planner = FftPlanner::<f32>::new();
-    let plan = planner.plan_fft_forward(fft_size);
-    guard.insert(fft_size, Arc::clone(&plan));
-    plan
-}
-
-fn get_cached_hann_window(fft_size: usize) -> Arc<Vec<f32>> {
-    let cache = HANN_WINDOW_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
-    let Ok(mut guard) = cache.lock() else {
-        return Arc::new(
-            (0..fft_size)
-                .map(|i| {
-                    0.5 - 0.5
-                        * (2.0 * std::f32::consts::PI * i as f32 / (fft_size - 1) as f32).cos()
-                })
-                .collect(),
-        );
-    };
-
-    if let Some(window) = guard.get(&fft_size) {
-        return Arc::clone(window);
-    }
-
-    let window = Arc::new(
-        (0..fft_size)
-            .map(|i| {
-                0.5
-                    - 0.5
-                        * (2.0 * std::f32::consts::PI * i as f32 / (fft_size - 1) as f32).cos()
-            })
-            .collect(),
-    );
-    guard.insert(fft_size, Arc::clone(&window));
-    window
+    let _ = (samples, sample_rate, center_sample, fft_size);
+    vec![0.0f32; (PIANO_HIGH_MIDI - PIANO_LOW_MIDI + 1) as usize]
 }
 
 pub fn pitch_track(samples: &[f32], sample_rate: u32, points: usize) -> Vec<[f64; 2]> {
@@ -306,6 +138,7 @@ fn local_noise_floor(power: &[f32], center_bin: usize) -> f32 {
 
 /// Compute Constant-Q Transform based note probabilities
 /// This provides better frequency resolution for polyphonic transcription
+#[deprecated(note = "CQT analysis is deprecated. Use Basic Pitch only.")]
 pub fn detect_note_probabilities_cqt(
     samples: &[f32],
     sample_rate: u32,
@@ -317,20 +150,29 @@ pub fn detect_note_probabilities_cqt(
         return probs;
     }
 
-    detect_note_probabilities_cqt_fallback(samples, sample_rate, center_sample, fft_size)
+    let _ = fft_size;
+    let note_count = (PIANO_HIGH_MIDI - PIANO_LOW_MIDI + 1) as usize;
+    vec![0.0f32; note_count]
 }
 
 /// Lightweight CQT detector for responsive live previews.
 ///
 /// This intentionally avoids Basic Pitch ONNX inference so UI-driven updates remain smooth
 /// while loading. Full Pro analysis still runs in the background pipeline.
+#[deprecated(note = "CQT preview is deprecated. Use Basic Pitch only.")]
 pub fn detect_note_probabilities_cqt_preview(
     samples: &[f32],
     sample_rate: u32,
     center_sample: usize,
     fft_size: usize,
 ) -> Vec<f32> {
-    detect_note_probabilities_cqt_fallback(samples, sample_rate, center_sample, fft_size)
+    if let Some(probs) = detect_note_probabilities_basic_pitch(samples, sample_rate, center_sample)
+    {
+        return probs;
+    }
+    let _ = fft_size;
+    let note_count = (PIANO_HIGH_MIDI - PIANO_LOW_MIDI + 1) as usize;
+    vec![0.0f32; note_count]
 }
 
 fn compute_cached_cqt_preview_frame(
@@ -397,15 +239,29 @@ fn detect_note_probabilities_basic_pitch(
 
     let note_count = (PIANO_HIGH_MIDI - PIANO_LOW_MIDI + 1) as usize;
     let mut probs = vec![0.0f32; note_count];
-    for frame in &note_frames {
+    let center_idx = note_frames.len() / 2;
+    let start_idx = center_idx.saturating_sub(1);
+    let end_idx = (center_idx + 1).min(note_frames.len().saturating_sub(1));
+    let span = end_idx.saturating_sub(start_idx) + 1;
+
+    for frame_idx in start_idx..=end_idx {
+        let frame = &note_frames[frame_idx];
         for (i, p) in frame.iter().take(note_count).enumerate() {
-            probs[i] = probs[i].max(*p);
+            probs[i] += *p;
+        }
+    }
+
+    if span > 1 {
+        let inv = 1.0 / span as f32;
+        for p in &mut probs {
+            *p *= inv;
         }
     }
 
     Some(probs)
 }
 
+#[deprecated(note = "CQT fallback is deprecated. Use Basic Pitch only.")]
 fn detect_note_probabilities_cqt_fallback(
     samples: &[f32],
     sample_rate: u32,
@@ -529,6 +385,7 @@ pub fn create_hfsformer_pipeline(sample_rate: u32) -> anyhow::Result<AudioPipeli
 }
 
 /// Compute log-magnitude CQT spectrogram
+#[deprecated(note = "CQT spectrogram is deprecated. Use Basic Pitch only.")]
 pub fn compute_cqt_spectrogram(
     samples: &[f32],
     sample_rate: u32,
@@ -559,6 +416,7 @@ pub fn compute_cqt_spectrogram(
 }
 
 /// Pitch track using CQT (better for polyphonic audio)
+#[deprecated(note = "CQT pitch tracking is deprecated. Use Basic Pitch only.")]
 pub fn pitch_track_cqt(samples: &[f32], sample_rate: u32, points: usize) -> Vec<[f64; 2]> {
     if samples.is_empty() || sample_rate == 0 || points == 0 {
         return Vec::new();
@@ -570,7 +428,7 @@ pub fn pitch_track_cqt(samples: &[f32], sample_rate: u32, points: usize) -> Vec<
     for i in 0..points {
         let frac = i as f32 / points as f32;
         let center = (frac * last_idx as f32) as usize;
-        let probs = detect_note_probabilities_cqt(samples, sample_rate, center, 4096);
+        let probs = detect_note_probabilities(samples, sample_rate, center, 4096);
 
         let (best_idx, best_prob) = probs.iter().enumerate().fold(
             (0usize, 0.0f32),

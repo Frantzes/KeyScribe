@@ -16,6 +16,7 @@ pub const MIN_PROBABILITY_STRIP_HEIGHT: f32 = 20.0;
 pub struct KeyboardDrawResult {
     pub clicked: bool,
     pub max_scroll_px: f32,
+    pub rect: egui::Rect,
 }
 
 pub fn keyboard_white_key_width(viewport_width: f32, zoom: f32) -> f32 {
@@ -151,6 +152,7 @@ pub fn draw_piano_view(
     KeyboardDrawResult {
         clicked: response.clicked(),
         max_scroll_px,
+        rect,
     }
 }
 
@@ -299,9 +301,9 @@ pub fn draw_probability_pane(
     KeyboardDrawResult {
         clicked: response.clicked(),
         max_scroll_px,
+        rect,
     }
 }
-
 fn is_black_key(midi: u8) -> bool {
     matches!(midi % 12, 1 | 3 | 6 | 8 | 10)
 }

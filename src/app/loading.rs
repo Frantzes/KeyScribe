@@ -32,6 +32,10 @@ impl KeyScribeApp {
         let has_preprocessed_timeline =
             !self.note_timeline.is_empty() && self.note_timeline_step_sec > 0.0;
 
+        if self.separated_stems.is_some() {
+            return self.audio_raw.is_some();
+        }
+
         if self.is_audio_loading {
             return self.preprocess_audio
                 && self.loading_cache_timeline_preloaded
@@ -68,6 +72,7 @@ impl KeyScribeApp {
             RebuildMode::Full => CoreRebuildMode::Full,
             RebuildMode::ParametersOnly => CoreRebuildMode::ParametersOnly,
             RebuildMode::ParametersPreview => CoreRebuildMode::ParametersPreview,
+            RebuildMode::VisualizationOnly => CoreRebuildMode::ParametersPreview,
         };
 
         let quality_multiplier = match self.audio_quality_mode {

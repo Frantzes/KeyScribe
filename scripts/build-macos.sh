@@ -1,5 +1,7 @@
 #!/usr/bin/env bash
 
+# shellcheck shell=bash
+
 set -euo pipefail
 
 TARGET=""
@@ -165,9 +167,10 @@ if [[ -z "$BINARY_PATH" ]]; then
     exit 1
 fi
 
-MODEL_PATH="$REPO_ROOT/models/basic-pitch.onnx"
-if [[ ! -f "$MODEL_PATH" ]]; then
-    echo "Missing model file: models/basic-pitch.onnx" >&2
+MODEL_SOURCE_DIR="$REPO_ROOT/models"
+mapfile -t MODEL_FILES < <(find "$MODEL_SOURCE_DIR" -maxdepth 1 -type f -name '*.onnx' | sort)
+if [[ ${#MODEL_FILES[@]} -eq 0 ]]; then
+    echo "Missing model files in models/" >&2
     exit 1
 fi
 
@@ -182,14 +185,16 @@ if [[ "$DMG_ONLY" -eq 0 ]]; then
 
     cp "$BINARY_PATH" "$BUNDLE_DIR/$BUNDLE_BINARY_NAME"
     chmod +x "$BUNDLE_DIR/$BUNDLE_BINARY_NAME"
-    cp "$MODEL_PATH" "$MODELS_DIR/basic-pitch.onnx"
+    for MODEL_PATH in "${MODEL_FILES[@]}"; do
+        cp "$MODEL_PATH" "$MODELS_DIR/$(basename "$MODEL_PATH")"
+    done
 
     cat > "$BUNDLE_DIR/README-portable.txt" <<'EOF'
 KeyScribe portable macOS bundle
 
 Contents:
 - keyscribe
-- models/basic-pitch.onnx
+- models/*.onnx
 
 Run ./keyscribe from this folder so relative model path works.
 If Gatekeeper blocks launch, run:
@@ -231,7 +236,9 @@ if [[ "$PORTABLE_ONLY" -eq 0 ]]; then
 
     cp "$BINARY_PATH" "$APP_MACOS_DIR/keyscribe-bin"
     chmod +x "$APP_MACOS_DIR/keyscribe-bin"
-    cp "$MODEL_PATH" "$APP_MODELS_DIR/basic-pitch.onnx"
+    for MODEL_PATH in "${MODEL_FILES[@]}"; do
+        cp "$MODEL_PATH" "$APP_MODELS_DIR/$(basename "$MODEL_PATH")"
+    done
 
     if [[ -f "$REPO_ROOT/icon.png" ]]; then
         cp "$REPO_ROOT/icon.png" "$APP_RESOURCES_DIR/AppIcon.png"

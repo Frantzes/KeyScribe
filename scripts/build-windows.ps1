@@ -81,11 +81,14 @@ exit /b 0
         Write-Warning "Close Keyscribe, then run apply-update.cmd in $bundleDir to finish replacing the executable."
     }
 
-    $modelPath = Join-Path $repoRoot "models/basic-pitch.onnx"
-    if (-not (Test-Path $modelPath)) {
-        throw "Missing model file: models/basic-pitch.onnx"
+    $modelSourceDir = Join-Path $repoRoot "models"
+    $modelFiles = Get-ChildItem -Path $modelSourceDir -Filter "*.onnx" -File -ErrorAction Stop
+    if (-not $modelFiles -or $modelFiles.Count -eq 0) {
+        throw "Missing model files in models/"
     }
-    Copy-Item -Path $modelPath -Destination (Join-Path $modelsDir "basic-pitch.onnx") -Force
+    foreach ($modelFile in $modelFiles) {
+        Copy-Item -Path $modelFile.FullName -Destination (Join-Path $modelsDir $modelFile.Name) -Force
+    }
 
     $directMlCandidates = @(
         (Join-Path $repoRoot "target/$Target/release/DirectML.dll"),
@@ -119,7 +122,7 @@ KeyScribe portable Windows bundle
 
 Contents:
 - keyscribe.exe
-- models/basic-pitch.onnx
+- models/*.onnx
 - DirectML.dll (if discovered)
 
 Run keyscribe.exe from this folder so the relative model path works.

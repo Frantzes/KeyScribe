@@ -140,6 +140,14 @@ impl KeyScribeApp {
         self.request_rebuild(was_playing, RebuildMode::Full);
     }
 
+    pub(super) fn request_rebuild_preserving_playback_and_waveform(&mut self) {
+        if self.is_audio_loading {
+            return;
+        }
+
+        self.request_rebuild(false, RebuildMode::VisualizationOnly);
+    }
+
     pub(super) fn cancel_active_processing(&mut self) {
         let cancel_epoch = self.next_job_id;
         self.next_job_id = self.next_job_id.saturating_add(1);
@@ -298,12 +306,12 @@ impl KeyScribeApp {
                 self.restart_playback_after_processing = false;
                 if let Some(preview) = result.preview_playback {
                     let playback_rate = self.playback_rate();
-                    if let Some(raw) = &self.audio_raw {
+                        if self.audio_raw.is_some() {
                         if let Some(engine) = &mut self.engine {
                             if let Err(err) = engine.play_chunk_at_timeline(
                                 &preview.samples,
                                 preview.channels,
-                                raw.sample_rate,
+                                preview.sample_rate,
                                 preview.timeline_start_sec,
                                 playback_rate,
                             ) {
@@ -344,10 +352,16 @@ impl KeyScribeApp {
             None
         };
 
-        self.processed_samples = result.processed_samples;
-        self.processed_playback_samples = result.processed_playback_samples;
-        self.processed_playback_channels = result.processed_playback_channels;
-        self.set_waveform_data(result.waveform, true);
+        if result.mode != RebuildMode::VisualizationOnly {
+            self.processed_samples = result.processed_samples;
+            self.processed_playback_samples = result.processed_playback_samples;
+            self.processed_playback_channels = result.processed_playback_channels;
+            
+            // Only reset waveform view on initial Full load, not on background param updates.
+            let reset_view = result.mode == RebuildMode::Full && self.waveform.is_empty();
+            self.set_waveform_data(result.waveform, reset_view);
+        }
+
         self.note_timeline = result.note_timeline;
         self.note_timeline_step_sec = result.note_timeline_step_sec;
         self.base_note_timeline = result.base_note_timeline;

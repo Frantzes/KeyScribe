@@ -6,7 +6,7 @@
 #[cfg(feature = "desktop-ui")]
 use eframe::egui;
 #[cfg(feature = "native-ui")]
-use keyscribe::app::KeyScribeApp;
+use keyscribe_lib::app::KeyScribeApp;
 
 #[cfg(feature = "desktop-ui")]
 fn load_window_icon() -> Option<egui::IconData> {

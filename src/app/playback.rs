@@ -1,4 +1,5 @@
 use super::*;
+use crate::leadsheet::StemType;
 
 impl KeyScribeApp {
     fn loading_preview_chunk_start(start_sec: f32) -> f32 {
@@ -30,8 +31,8 @@ impl KeyScribeApp {
         let chunk_start_sec = Self::loading_preview_chunk_start(start_sec);
 
         if let Some(entry) = self.loading_preview_cache.iter_mut().find(|entry| {
-            entry.source_key == source_key &&
-                (entry.chunk_start_sec - chunk_start_sec).abs() < 1.0e-3
+            entry.source_key == source_key
+                && (entry.chunk_start_sec - chunk_start_sec).abs() < 1.0e-3
         }) {
             entry.last_used_at = std::time::Instant::now();
             return Ok((
@@ -42,11 +43,8 @@ impl KeyScribeApp {
             ));
         }
 
-        let preview = load_audio_preview_chunk(
-            path,
-            chunk_start_sec,
-            LOADING_PREVIEW_CACHE_CHUNK_SEC,
-        )?;
+        let preview =
+            load_audio_preview_chunk(path, chunk_start_sec, LOADING_PREVIEW_CACHE_CHUNK_SEC)?;
         if preview.samples_interleaved.is_empty() {
             return Err(anyhow::anyhow!("Preview decode returned no audio frames"));
         }
@@ -87,12 +85,12 @@ impl KeyScribeApp {
 
         let (cached_samples, channels, sample_rate, chunk_start_sec) =
             match self.get_or_decode_loading_preview_chunk(path.as_path(), start_sec) {
-            Ok(preview) => preview,
-            Err(err) => {
-                self.last_error = Some(format!("Preview decode error: {err}"));
-                return false;
-            }
-        };
+                Ok(preview) => preview,
+                Err(err) => {
+                    self.last_error = Some(format!("Preview decode error: {err}"));
+                    return false;
+                }
+            };
 
         let channels_usize = channels.max(1) as usize;
         let total_frames = cached_samples.len() / channels_usize;
@@ -152,6 +150,73 @@ impl KeyScribeApp {
         false
     }
 
+    pub(super) fn visualizing_stem_audio(&self) -> Option<(Arc<Vec<f32>>, u32)> {
+        let stems = self.separated_stems.as_ref()?;
+        if stems.is_empty() {
+            return None;
+        }
+
+        let stem_sample_rate = stems.first().map(|stem| stem.sample_rate)?;
+
+        let enabled_indices: Vec<usize> = self.enabled_stem_indices.iter().copied().collect();
+        let melodic_stems: Vec<_> = enabled_indices
+            .into_iter()
+            .filter_map(|idx| stems.get(idx).cloned())
+            .filter(|s| s.stem_type != StemType::Drums)
+            .collect();
+
+        if melodic_stems.is_empty() {
+            let total_len = stems
+                .iter()
+                .map(|s| s.samples_mono.len())
+                .max()
+                .unwrap_or(0);
+            return Some((Arc::new(vec![0.0f32; total_len]), stem_sample_rate));
+        }
+
+        Some((
+            crate::leadsheet::blend_for_chords(melodic_stems.as_slice()),
+            stem_sample_rate,
+        ))
+    }
+
+    pub(super) fn listening_stem_audio(&self) -> Option<(Arc<Vec<f32>>, u16, u32)> {
+        let stems = self.separated_stems.as_ref()?;
+        if stems.is_empty() {
+            return None;
+        }
+
+        let stem_sample_rate = stems.first().map(|stem| stem.sample_rate)?;
+
+        let enabled_indices: Vec<usize> = self.enabled_listening_indices.iter().copied().collect();
+        let enabled_stems: Vec<_> = enabled_indices
+            .into_iter()
+            .filter_map(|idx| stems.get(idx).cloned())
+            .collect();
+
+        if enabled_stems.is_empty() {
+            // If nothing is selected for listening, blend all available stems
+            // (Standard "Original Mix" behavior)
+            let (samples, channels) = crate::leadsheet::blend_interleaved_stems(stems.as_slice());
+            Some((samples, channels, stem_sample_rate))
+        } else if enabled_stems.len() == 1 {
+            let stem = &enabled_stems[0];
+            Some((
+                Arc::clone(&stem.samples_interleaved),
+                stem.channels,
+                stem.sample_rate,
+            ))
+        } else {
+            let (samples, channels) =
+                crate::leadsheet::blend_interleaved_stems(enabled_stems.as_slice());
+            Some((samples, channels, stem_sample_rate))
+        }
+    }
+
+    pub(super) fn active_stem_audio(&self) -> Option<(Arc<Vec<f32>>, u16, u32)> {
+        self.listening_stem_audio()
+    }
+
     pub(super) fn play_from_selected(&mut self) {
         if self.play_preview_at(self.selected_time_sec, None) {
             self.live_stream_playback = false;
@@ -173,11 +238,22 @@ impl KeyScribeApp {
         };
         let playback_rate = self.playback_rate();
 
+        let (playback_samples, channels, sample_rate) =
+            if let Some((stems, ch, sr)) = self.active_stem_audio() {
+                (stems, ch, sr)
+            } else {
+                (
+                    Arc::new(self.processed_playback_samples.clone()),
+                    self.processed_playback_channels,
+                    raw.sample_rate,
+                )
+            };
+
         if let Some(engine) = &mut self.engine {
             if let Err(err) = engine.play_from(
-                &self.processed_playback_samples,
-                self.processed_playback_channels,
-                raw.sample_rate,
+                &playback_samples,
+                channels,
+                sample_rate,
                 self.selected_time_sec,
                 playback_rate,
             ) {
@@ -275,8 +351,7 @@ impl KeyScribeApp {
 
         let available_duration = self.source_duration();
         if self.is_audio_loading
-            && (start_sec > available_duration + 0.01
-                || self.processed_playback_samples.is_empty())
+            && (start_sec > available_duration + 0.01 || self.processed_playback_samples.is_empty())
         {
             if self.play_loading_preview_from_source(start_sec, end_sec) {
                 return;
@@ -288,11 +363,22 @@ impl KeyScribeApp {
         };
         let playback_rate = self.playback_rate();
 
+        let (playback_samples, channels, sample_rate) =
+            if let Some((stems, ch, sr)) = self.active_stem_audio() {
+                (stems, ch, sr)
+            } else {
+                (
+                    Arc::new(self.processed_playback_samples.clone()),
+                    self.processed_playback_channels,
+                    raw.sample_rate,
+                )
+            };
+
         if let Some(engine) = &mut self.engine {
             if let Err(err) = engine.play_range(
-                &self.processed_playback_samples,
-                self.processed_playback_channels,
-                raw.sample_rate,
+                &playback_samples,
+                channels,
+                sample_rate,
                 start_sec,
                 end_sec,
                 playback_rate,
@@ -397,6 +483,20 @@ impl KeyScribeApp {
         }
     }
 
+    pub(super) fn maybe_restart_playback_for_listen_sync(&mut self) {
+        if !self.is_playing() {
+            return;
+        }
+
+        if self.loop_enabled {
+            if let Some((a, b)) = self.loop_selection {
+                self.play_range(self.selected_time_sec, Some(b.max(a)));
+                return;
+            }
+        }
+        self.play_from_selected();
+    }
+
     pub(super) fn stop(&mut self) {
         if let Some(engine) = &mut self.engine {
             engine.stop();
@@ -411,7 +511,8 @@ impl KeyScribeApp {
         if let Some(engine) = &mut self.engine {
             engine.sync_finished();
             if engine.is_playing() {
-                self.selected_time_sec = engine.current_position().min(self.timeline_duration_sec());
+                self.selected_time_sec =
+                    engine.current_position().min(self.timeline_duration_sec());
                 self.update_note_probabilities(false);
             } else if self.loop_enabled && self.loop_playback_enabled {
                 if let Some((a, b)) = self.loop_selection {

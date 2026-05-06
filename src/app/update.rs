@@ -78,7 +78,14 @@ impl eframe::App for KeyScribeApp {
         }
 
         self.poll_audio_loading(ctx);
+        
+        // Auto-run separation once audio is loaded if not already done
+        if self.audio_raw.is_some() && self.separated_stems.is_none() && !self.is_separating && !self.is_audio_loading {
+            self.run_instrument_separation();
+        }
+
         self.poll_processing_result();
+        self.poll_separation_result();
         self.sync_playhead_from_engine();
 
         self.draw_top_controls_panel(ctx);
@@ -132,6 +139,27 @@ impl eframe::App for KeyScribeApp {
                         self.highlight_color,
                     );
                     max_scroll_px = max_scroll_px.max(prob_draw.max_scroll_px);
+                    if let Some(chord) = &self.current_chord {
+                        let pane = prob_draw.rect;
+                        let overlay_w = pane.width().min(280.0);
+                        let overlay_rect = egui::Rect::from_min_size(
+                            egui::pos2(pane.left() + 6.0, pane.top() + 6.0),
+                            egui::vec2(overlay_w, pane.height() - 12.0),
+                        );
+                        let painter = ui.painter();
+                        painter.rect_filled(
+                            overlay_rect,
+                            8.0,
+                            egui::Color32::from_rgba_unmultiplied(0, 0, 0, 153),
+                        );
+                        painter.text(
+                            egui::pos2(overlay_rect.left() + 10.0, overlay_rect.center().y),
+                            egui::Align2::LEFT_CENTER,
+                            chord,
+                            egui::FontId::proportional(26.0),
+                            egui::Color32::WHITE,
+                        );
+                    }
                     if prob_draw.clicked {
                         self.piano_has_focus = true;
                     }
@@ -258,6 +286,26 @@ impl eframe::App for KeyScribeApp {
                                     }
 
                                     ui.add_space(UI_VSPACE_TIGHT);
+                                    if Self::top_bar_slider_with_input(
+                                        ui,
+                                        "Visualization Offset",
+                                        &mut self.visualization_timing_offset_ms,
+                                        VISUALIZATION_TIMING_OFFSET_MS_MIN,
+                                        VISUALIZATION_TIMING_OFFSET_MS_MAX,
+                                        " ms",
+                                        1.0,
+                                        0,
+                                    ) {
+                                        self.visualization_timing_offset_ms = self
+                                            .visualization_timing_offset_ms
+                                            .clamp(
+                                                VISUALIZATION_TIMING_OFFSET_MS_MIN,
+                                                VISUALIZATION_TIMING_OFFSET_MS_MAX,
+                                            );
+                                        visuals_changed = true;
+                                    }
+
+                                    ui.add_space(UI_VSPACE_TIGHT);
                                     let _ = Self::top_bar_slider_with_input(
                                         ui,
                                         "Piano Zoom",
@@ -271,7 +319,7 @@ impl eframe::App for KeyScribeApp {
                                 },
                             );
                         } else {
-                            let col_w = ((trio_w - trio_gap * 2.0).max(0.0)) / 3.0;
+                            let col_w = ((trio_w - trio_gap * 3.0).max(0.0)) / 4.0;
                             ui.allocate_ui_with_layout(
                                 egui::vec2(trio_w, slider_row_h),
                                 egui::Layout::left_to_right(egui::Align::Center),
@@ -330,6 +378,31 @@ impl eframe::App for KeyScribeApp {
                                         egui::vec2(col_w, slider_row_h),
                                         egui::Layout::top_down(egui::Align::Center),
                                         |ui| {
+                                            if Self::top_bar_slider_with_input(
+                                                ui,
+                                                "Visualization Offset",
+                                                &mut self.visualization_timing_offset_ms,
+                                                VISUALIZATION_TIMING_OFFSET_MS_MIN,
+                                                VISUALIZATION_TIMING_OFFSET_MS_MAX,
+                                                " ms",
+                                                1.0,
+                                                0,
+                                            ) {
+                                                self.visualization_timing_offset_ms = self
+                                                    .visualization_timing_offset_ms
+                                                    .clamp(
+                                                        VISUALIZATION_TIMING_OFFSET_MS_MIN,
+                                                        VISUALIZATION_TIMING_OFFSET_MS_MAX,
+                                                    );
+                                                visuals_changed = true;
+                                            }
+                                        },
+                                    );
+
+                                    ui.allocate_ui_with_layout(
+                                        egui::vec2(col_w, slider_row_h),
+                                        egui::Layout::top_down(egui::Align::Center),
+                                        |ui| {
                                             let _ = Self::top_bar_slider_with_input(
                                                 ui,
                                                 "Piano Zoom",
@@ -349,6 +422,16 @@ impl eframe::App for KeyScribeApp {
                         if visuals_changed {
                             self.update_note_probabilities(true);
                         }
+
+                        if self.note_probs.iter().any(|&p| p > 0.1) {
+                            let _active_keys: Vec<u8> = self.note_probs.iter().enumerate()
+                                .filter(|(_, &p)| p > 0.1)
+                                .map(|(i, _)| (PIANO_LOW_MIDI as usize + i) as u8)
+                                .collect();
+                            // println!("[DEBUG] Visualization Active. ProbSum={:.2}, ActiveKeys={:?}", 
+                            //    self.note_probs.iter().sum::<f32>(), active_keys);
+                        }
+
                     });
                 ui.add_space(UI_VSPACE_TIGHT);
                 ui.spacing_mut().item_spacing.y = default_item_spacing_y;
@@ -425,6 +508,42 @@ impl eframe::App for KeyScribeApp {
                     ui.spacing_mut().item_spacing.y = default_stack_spacing_y.min(UI_VSPACE_TIGHT);
                     self.draw_speed_pitch_controls(ui);
                 });
+
+                ui.add_space(UI_VSPACE_TIGHT);
+                ui.horizontal_wrapped(|ui| {
+                    if ui
+                        .add_enabled(
+                            self.audio_raw.is_some(),
+                            egui::Button::new("Separate Instruments"),
+                        )
+                        .clicked()
+                    {
+                        self.run_instrument_separation();
+                    }
+
+                    if self.separated_stems.is_some() {
+                        ui.label(egui::RichText::new("Stem audio is loaded. Use the waveform tab controls to preview or enable instruments.").weak());
+                    } else {
+                        ui.label(egui::RichText::new("Run separation to load instrument stems.").weak());
+                    }
+                });
+
+                self.draw_main_content_tabs(ui);
+                ui.add_space(UI_VSPACE_TIGHT);
+                draw_horizontal_separator(ui, 0.0);
+                ui.add_space(UI_VSPACE_TIGHT);
+
+                if self.main_content_tab == MainContentTab::SheetMusic {
+                    self.draw_sheet_music_view(
+                        ui,
+                        interaction_ready,
+                        interaction_duration,
+                        default_stack_spacing_y,
+                        waveform_visual_gap,
+                    );
+                    ui.spacing_mut().item_spacing.y = default_stack_spacing_y;
+                    return;
+                }
 
                 // Compute waveform/media heights from the remaining space after speed/pitch controls.
                 let remaining_stack_h = ui.available_height().max(0.0);

@@ -4,6 +4,7 @@ version = "0.1.0"
 edition = "2021"
 
 [lib]
+name = "keyscribe_lib"
 crate-type = ["cdylib", "rlib"]
 
 [features]
@@ -46,6 +47,7 @@ crossbeam-channel = "0.5"
 parking_lot = "0.12"
 rayon = "1.9"
 thiserror = "1.0"
+verovioxide = "0.3.0"
 
 [build-dependencies]
 winresource = "0.1"
