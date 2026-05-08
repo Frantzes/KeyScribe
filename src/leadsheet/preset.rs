@@ -1,4 +1,4 @@
-use crate::leadsheet::beat_association::{associate_note_events, beats_per_bar_from_downbeats};
+use crate::leadsheet::beat_association::associate_note_events;
 use crate::leadsheet::bpm::{BpmDetectionConfig, TempoEstimate};
 use crate::leadsheet::chord::{detect_chord_changes, ChordAnalysisConfig};
 use crate::leadsheet::instrument_separation::{
@@ -15,8 +15,8 @@ use crate::leadsheet::tempo_map::{
     TimeSignatureConfig,
 };
 use crate::leadsheet::types::{
-    BeatAlignedNote, ChordSymbolChange, NoteEvent, QuantizedNote, SwingSection, TempoSegment,
-    TimeSignatureSegment,
+    BeatAlignedNote, ChordSymbolChange, MeterClass, NoteEvent, QuantizedNote, SwingSection,
+    TempoSegment, TimeSignatureSegment,
 };
 
 #[derive(Debug, Clone)]
@@ -30,6 +30,7 @@ pub struct LeadSheetPresetConfig {
     pub joint_rhythm: JointRhythmConfig,
     pub use_instrument_separation: bool,
     pub separation: SeparationConfig,
+    pub swing_override: Option<crate::leadsheet::types::SwingStyle>,
 }
 
 impl Default for LeadSheetPresetConfig {
@@ -44,6 +45,7 @@ impl Default for LeadSheetPresetConfig {
             joint_rhythm: JointRhythmConfig::default(),
             use_instrument_separation: false,
             separation: SeparationConfig::default(),
+            swing_override: None,
         }
     }
 }
@@ -177,11 +179,99 @@ fn generate_lead_sheet_with_separation_and_tempo_map(
     })
 }
 
-/// Enhanced pipeline that uses beat-aligned notes and swing-aware quantization.
+/// Build a per-bar tempo map from beat-this downbeat/beat positions.
+/// Each segment spans one bar (downbeat → next downbeat) with the actual BPM for that bar.
+pub fn tempo_map_from_beats_and_downbeats(
+    beats: &[f32],
+    downbeats: &[f32],
+    beats_per_bar: u32,
+) -> Option<(Vec<TempoSegment>, TempoEstimate)> {
+    if beats.len() < 4 || downbeats.is_empty() {
+        return None;
+    }
+
+    let beat_intervals: Vec<f32> = beats.windows(2).map(|w| w[1] - w[0]).filter(|&d| d > 0.001).collect();
+    if beat_intervals.is_empty() {
+        return None;
+    }
+    let global_beat_dur = median_of(&beat_intervals);
+    let global_bpm = (60.0 / global_beat_dur.max(0.001)).clamp(40.0, 260.0);
+
+    let mut segments: Vec<TempoSegment> = Vec::with_capacity(downbeats.len());
+    let mut current_offset = 0.0;
+    
+    for i in 0..downbeats.len() {
+        let start = downbeats[i];
+        let end = if i + 1 < downbeats.len() {
+            downbeats[i + 1]
+        } else {
+            // last bar: extend using beat interval
+            start + beats_per_bar as f32 * global_beat_dur
+        };
+        if end <= start {
+            continue;
+        }
+
+        // Compute actual BPM for this bar from beats within it
+        let bar_beats: Vec<f32> = beats
+            .iter()
+            .copied()
+            .filter(|&b| b >= start - 0.001 && b < end - 0.001)
+            .collect();
+
+        let beat_dur = if bar_beats.len() >= 2 {
+            let bi: Vec<f32> = bar_beats.windows(2).map(|w| w[1] - w[0]).collect();
+            median_of(&bi)
+        } else {
+            global_beat_dur
+        };
+        let bar_bpm = (60.0 / beat_dur.max(0.001)).clamp(40.0, 260.0);
+
+        segments.push(TempoSegment {
+            start_time_sec: start,
+            end_time_sec: end,
+            bpm: bar_bpm,
+            beat_duration_sec: beat_dur,
+            beat_offset: current_offset,
+        });
+        
+        current_offset += beats_per_bar as f32;
+    }
+
+    if segments.is_empty() {
+        return None;
+    }
+
+    let tempo = TempoEstimate {
+        bpm: global_bpm,
+        beat_duration_sec: global_beat_dur,
+        confidence: 0.85,
+    };
+
+    Some((segments, tempo))
+}
+
+fn median_of(values: &[f32]) -> f32 {
+    if values.is_empty() {
+        return 0.0;
+    }
+    let mut sorted: Vec<f32> = values.to_vec();
+    sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let mid = sorted.len() / 2;
+    if sorted.len() % 2 == 0 {
+        (sorted[mid - 1] + sorted[mid]) * 0.5
+    } else {
+        sorted[mid]
+    }
+}
+
+/// Enhanced pipeline that uses beat-this beat/downbeat positions for accurate
+/// note alignment and a per-bar tempo map.
 pub fn generate_lead_sheet_enhanced(
     notes: &[NoteEvent],
     beat_times: &[f32],
     downbeat_times: &[f32],
+    beats_per_bar: u32,
     config: &LeadSheetPresetConfig,
 ) -> Option<LeadSheetFoundation> {
     if beat_times.len() < 2 || notes.is_empty() {
@@ -193,9 +283,19 @@ pub fn generate_lead_sheet_enhanced(
         return None;
     }
 
-    let beats_per_bar = beats_per_bar_from_downbeats(downbeat_times, beat_times);
-    let swing_config = SwingDetectionConfig::default();
-    let swing_sections = detect_swing(&aligned, beats_per_bar, &swing_config);
+    let swing_sections = if let Some(style) = config.swing_override {
+        let max_bar = aligned.iter().map(|n| n.bar_index).max().unwrap_or(0) + 1;
+        vec![SwingSection {
+            bar_start: 0,
+            bar_end: max_bar.max(1),
+            style,
+            confidence: 1.0,
+            swing_ratio: if style == crate::leadsheet::types::SwingStyle::Swing { Some(2.0 / 3.0) } else { None },
+        }]
+    } else {
+        let swing_config = SwingDetectionConfig::default();
+        detect_swing(&aligned, beats_per_bar, &swing_config)
+    };
 
     let mut quantized = quantize_aligned_notes(&aligned, &swing_sections, beats_per_bar);
     if quantized.is_empty() {
@@ -205,53 +305,47 @@ pub fn generate_lead_sheet_enhanced(
     quantized = detect_grace_notes(&quantized, &aligned);
     quantized = detect_articulation(&quantized, &aligned);
 
-    let beat_duration_sec = beat_times
-        .windows(2)
-        .map(|w| w[1] - w[0])
-        .filter(|&d| d > 0.001)
-        .fold(0.0f32, |acc, d| acc + d)
-        / (beat_times.len().saturating_sub(1) as f32).max(1.0);
-
-    let global_bpm = (60.0 / beat_duration_sec.max(0.001)).clamp(40.0, 260.0);
-    let tempo = crate::leadsheet::TempoEstimate {
-        bpm: global_bpm,
-        beat_duration_sec,
-        confidence: 0.8,
-    };
-
-    let tempo_map: Vec<TempoSegment> = beat_times
-        .windows(2)
-        .enumerate()
-        .map(|(i, w)| {
-            let interval = (w[1] - w[0]).max(0.001);
-            TempoSegment {
-                start_time_sec: w[0],
-                end_time_sec: w[1],
-                bpm: (60.0 / interval).clamp(40.0, 260.0),
-                beat_duration_sec: interval,
-                beat_offset: i as f32,
-            }
-        })
-        .collect();
+    // ---- per-bar tempo map from actual beat positions ----
+    let (tempo_map, tempo) = tempo_map_from_beats_and_downbeats(
+        beat_times,
+        downbeat_times,
+        beats_per_bar,
+    ).unwrap_or_else(|| {
+        // fallback: single global tempo
+        let d = beat_times.windows(2)
+            .map(|w| w[1] - w[0])
+            .filter(|&d| d > 0.001)
+            .fold(0.0f32, |a, d| a + d)
+            / (beat_times.len().saturating_sub(1) as f32).max(1.0);
+        let b = (60.0 / d.max(0.001)).clamp(40.0, 260.0);
+        let t = TempoEstimate { bpm: b, beat_duration_sec: d, confidence: 0.8 };
+        let seg = vec![TempoSegment {
+            start_time_sec: beat_times[0],
+            end_time_sec: beat_times[beat_times.len() - 1],
+            bpm: b,
+            beat_duration_sec: d,
+            beat_offset: 0.0,
+        }];
+        (seg, t)
+    });
 
     let time_sig_numerator = beats_per_bar as u8;
     let time_sig_denominator = 4u8;
-    let time_signature_segments = vec![crate::leadsheet::TimeSignatureSegment {
+
+    let last_beat = aligned.last().map(|n| n.beat_index as f32).unwrap_or(4.0);
+    let time_signature_segments = vec![TimeSignatureSegment {
         start_beat: 0.0,
-        end_beat: (aligned.len() as f32).max(4.0),
+        end_beat: last_beat.max(4.0),
         numerator: time_sig_numerator,
         denominator: time_sig_denominator,
-        confidence: 0.8,
-        meter_class: crate::leadsheet::MeterClass::from_signature(
-            time_sig_numerator,
-            time_sig_denominator,
-        ),
+        confidence: 0.85,
+        meter_class: MeterClass::from_signature(time_sig_numerator, time_sig_denominator),
     }];
 
     let chord_changes =
         detect_chord_changes(quantized.as_slice(), config.chord_analysis);
     let rhythm_confidence = if swing_sections.is_empty() {
-        0.7
+        0.8
     } else {
         swing_sections
             .iter()

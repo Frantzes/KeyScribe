@@ -26,14 +26,19 @@ impl KeyScribeApp {
         for value in &mut self.note_highlight_hold_remaining {
             *value = 0.0;
         }
+        if !self.note_stem_colors.is_empty() {
+            self.note_stem_colors
+                .fill(self.highlight_color);
+        }
     }
 
     pub(super) fn note_visuals_ready(&self) -> bool {
         let has_preprocessed_timeline =
             !self.note_timeline.is_empty() && self.note_timeline_step_sec > 0.0;
+        let has_stem_analyses = !self.stem_analyses.is_empty();
 
         if self.separated_stems.is_some() {
-            return self.audio_raw.is_some();
+            return self.audio_raw.is_some() && (has_stem_analyses || has_preprocessed_timeline);
         }
 
         if self.is_audio_loading {
@@ -136,6 +141,15 @@ impl KeyScribeApp {
             self.cache_status_message = Some("Analysis cache: precheck pending...".to_string());
             self.cache_status_message_at = Some(Instant::now());
         }
+        // Clear all stem state from previous song
+        self.separated_stems = None;
+        self.stem_analyses.clear();
+        self.stem_colors.clear();
+        self.stem_analysis_rx = None;
+        self.is_separating = false;
+        self.separation_rx = None;
+        self.enabled_stem_indices.clear();
+        self.enabled_listening_indices.clear();
         self.clear_note_visuals();
 
         let (tx, rx) = mpsc::channel::<StreamingAudioEvent>();

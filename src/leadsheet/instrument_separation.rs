@@ -281,11 +281,11 @@ pub fn blend_for_chords(stems: &[SeparatedStem]) -> Arc<Vec<f32>> {
         }
     }
 
-    let stem_count = stems.len() as f32;
-    if stem_count > 1.0 {
-        let inv_count = 1.0 / stem_count;
+    let max_val = blend.iter().copied().fold(0.0f32, |a, b| a.max(b.abs()));
+    if max_val > 1.0 {
+        let scale = 1.0 / max_val;
         for sample in blend.iter_mut() {
-            *sample *= inv_count;
+            *sample *= scale;
         }
     }
     Arc::new(blend)
@@ -328,11 +328,14 @@ pub fn blend_interleaved_stems(stems: &[SeparatedStem]) -> (Arc<Vec<f32>>, u16) 
         }
     }
 
-    let stem_count = stems.len() as f32;
-    if stem_count > 1.0 {
-        let inv_count = 1.0 / stem_count;
+    // Sum stems at their natural mix level (no division by count).
+    // The sum of all Demucs stems approximates the original mix.
+    // Normalize to [-1, 1] to prevent clipping from summed peaks.
+    let max_val = blend.iter().copied().fold(0.0f32, |a, b| a.max(b.abs()));
+    if max_val > 1.0 {
+        let scale = 1.0 / max_val;
         for sample in blend.iter_mut() {
-            *sample *= inv_count;
+            *sample *= scale;
         }
     }
     (Arc::new(blend), channels)

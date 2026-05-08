@@ -20,8 +20,10 @@ use serde::{Deserialize, Serialize};
 use rfd::FileDialog;
 
 use crate::analysis::{
-    analyze_with_full_pipeline, detect_note_probabilities, PIANO_HIGH_MIDI, PIANO_LOW_MIDI,
+    analyze_with_full_pipeline, detect_note_probabilities, PIANO_HIGH_MIDI, PIANO_KEY_COUNT,
+    PIANO_LOW_MIDI,
 };
+use crate::leadsheet::StemType;
 use crate::audio_io::{
     load_audio_file_streaming, load_audio_preview_chunk, AudioData, AudioPreviewChunk,
     StreamingAudioEvent,
@@ -214,6 +216,21 @@ fn default_use_cqt_analysis() -> bool {
     true
 }
 
+fn assign_stem_colors(stems: &[crate::leadsheet::SeparatedStem]) -> Vec<egui::Color32> {
+    stems
+        .iter()
+        .map(|s| match s.stem_type {
+            StemType::Vocals => egui::Color32::from_rgb(255, 170, 60),
+            StemType::Bass => egui::Color32::from_rgb(72, 162, 255),
+            StemType::Piano => egui::Color32::from_rgb(148, 106, 255),
+            StemType::Guitar => egui::Color32::from_rgb(56, 204, 142),
+            StemType::Drums => egui::Color32::from_rgb(160, 160, 160),
+            StemType::Other => egui::Color32::from_rgb(238, 190, 73),
+            StemType::Custom(_) => egui::Color32::from_rgb(220, 160, 220),
+        })
+        .collect()
+}
+
 fn default_highlight_hex() -> String {
     "#946AFF".to_string()
 }
@@ -267,6 +284,10 @@ struct PersistedState {
     highlight_hex: String,
     #[serde(default)]
     recent_highlight_hex: Vec<String>,
+    #[serde(default)]
+    saved_visualize_stem_indices: Option<Vec<usize>>,
+    #[serde(default)]
+    saved_listen_stem_indices: Option<Vec<usize>>,
 }
 
 impl Default for PersistedState {
@@ -295,6 +316,8 @@ impl Default for PersistedState {
             dark_mode: true,
             highlight_hex: default_highlight_hex(),
             recent_highlight_hex: Vec::new(),
+            saved_visualize_stem_indices: None,
+            saved_listen_stem_indices: None,
         }
     }
 }
@@ -493,7 +516,7 @@ fn analysis_cache_dir() -> PathBuf {
     app_cache_base_dir().join(ANALYSIS_CACHE_DIR_NAME)
 }
 
-fn analysis_cache_library_dir() -> PathBuf {
+pub(crate) fn analysis_cache_library_dir() -> PathBuf {
     analysis_cache_dir().join(ANALYSIS_CACHE_LIBRARY_DIR_NAME)
 }
 
@@ -885,11 +908,38 @@ pub struct KeyScribeApp {
     sheet_music_mode: SheetMusicMode,
     melody_stem_index: Option<usize>,
     chord_stem_index: Option<usize>,
+    chord_skip: bool,
     current_chord: Option<String>,
+    stem_analyses: Vec<StemAnalysis>,
+    stem_colors: Vec<egui::Color32>,
+    note_stem_colors: Vec<egui::Color32>,
+    stem_analysis_rx: Option<Receiver<StemAnalysisResult>>,
+    saved_visualize_stem_indices: Option<Vec<usize>>,
+    saved_listen_stem_indices: Option<Vec<usize>>,
+    manual_bpm: Option<f32>,
+    manual_swing: Option<crate::leadsheet::types::SwingStyle>,
+    bpm_input_str: String,
+    melody_min_note: Option<u8>,
+    melody_max_note: Option<u8>,
+    melody_min_input_str: String,
+    melody_max_input_str: String,
+    sheet_render_result_rx: Option<std::sync::mpsc::Receiver<SheetRenderResult>>,
 }
 
 struct SeparationResult {
     stems: Vec<crate::leadsheet::SeparatedStem>,
+    error: Option<String>,
+}
+
+#[derive(Clone)]
+struct StemAnalysis {
+    stem_index: usize,
+    timeline: Arc<Vec<Vec<f32>>>,
+    step_sec: f32,
+}
+
+struct StemAnalysisResult {
+    analyses: Vec<StemAnalysis>,
     error: Option<String>,
 }
 
@@ -963,6 +1013,9 @@ struct SheetPreviewCacheKey {
     mode_bits: u8,
     melody_stem_bit: Option<u8>,
     chord_stem_bit: Option<u8>,
+    swing_style_bit: Option<u8>,
+    stem_analysis_key: u64,
+    melody_note_range_bits: u32,
 }
 
 #[derive(Clone)]
@@ -970,6 +1023,34 @@ struct SheetPreviewData {
     foundation: LeadSheetFoundation,
     note_count: usize,
     threshold: f32,
+    bpm_source: String,
+}
+
+#[derive(Clone)]
+struct NotePosition {
+    x: f32,
+    y: f32,
+    w: f32,
+    h: f32,
+    pitch: u8,
+}
+
+struct SheetRenderJob {
+    musicxml: String,
+    key: SheetPreviewCacheKey,
+}
+
+struct SheetRenderResult {
+    key: SheetPreviewCacheKey,
+    pages: Vec<SheetRawPage>,
+    error: Option<String>,
+}
+
+struct SheetRawPage {
+    width_px: usize,
+    height_px: usize,
+    rgba_data: Vec<u8>,
+    note_positions: Vec<NotePosition>,
 }
 
 #[derive(Clone)]
@@ -977,6 +1058,7 @@ struct EngravedSheetPage {
     texture: egui::TextureHandle,
     width_px: usize,
     height_px: usize,
+    note_positions: Vec<NotePosition>,
     beat_start: f32,
     beat_end: f32,
 }
@@ -1155,7 +1237,25 @@ impl KeyScribeApp {
             sheet_music_mode: SheetMusicMode::LeadSheet,
             melody_stem_index: None,
             chord_stem_index: None,
+            chord_skip: false,
             current_chord: None,
+            stem_analyses: Vec::new(),
+            stem_colors: Vec::new(),
+            note_stem_colors: vec![
+                egui::Color32::from_rgb(148, 106, 255);
+                PIANO_KEY_COUNT
+            ],
+            stem_analysis_rx: None,
+            saved_visualize_stem_indices: persisted.saved_visualize_stem_indices.clone(),
+            saved_listen_stem_indices: persisted.saved_listen_stem_indices.clone(),
+            manual_bpm: None,
+            manual_swing: None,
+            bpm_input_str: String::new(),
+            melody_min_note: None,
+            melody_max_note: None,
+            melody_min_input_str: String::new(),
+            melody_max_input_str: String::new(),
+            sheet_render_result_rx: None,
         };
 
         app.refresh_audio_output_devices();

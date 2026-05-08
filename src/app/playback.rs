@@ -217,6 +217,24 @@ impl KeyScribeApp {
         self.listening_stem_audio()
     }
 
+    /// Get speed/pitch-adjusted stem audio for playback in a single Vec<f32>.
+    /// Applies speed/pitch inline so stem selection toggling is instant.
+    fn stem_audio_with_speed_pitch(&self) -> Option<(Vec<f32>, u16, u32)> {
+        let (audio, channels, sample_rate) = self.active_stem_audio()?;
+        if speed_pitch_is_identity(self.speed, self.pitch_semitones) {
+            Some((audio.as_ref().to_vec(), channels, sample_rate))
+        } else {
+            let processed = apply_speed_and_pitch_interleaved(
+                audio.as_ref(),
+                channels,
+                sample_rate,
+                self.speed,
+                self.pitch_semitones,
+            );
+            Some((processed, channels, sample_rate))
+        }
+    }
+
     pub(super) fn play_from_selected(&mut self) {
         if self.play_preview_at(self.selected_time_sec, None) {
             self.live_stream_playback = false;
@@ -239,8 +257,8 @@ impl KeyScribeApp {
         let playback_rate = self.playback_rate();
 
         let (playback_samples, channels, sample_rate) =
-            if let Some((stems, ch, sr)) = self.active_stem_audio() {
-                (stems, ch, sr)
+            if let Some((stems_audio, ch, sr)) = self.stem_audio_with_speed_pitch() {
+                (Arc::new(stems_audio), ch, sr)
             } else {
                 (
                     Arc::new(self.processed_playback_samples.clone()),
@@ -364,8 +382,8 @@ impl KeyScribeApp {
         let playback_rate = self.playback_rate();
 
         let (playback_samples, channels, sample_rate) =
-            if let Some((stems, ch, sr)) = self.active_stem_audio() {
-                (stems, ch, sr)
+            if let Some((stems_audio, ch, sr)) = self.stem_audio_with_speed_pitch() {
+                (Arc::new(stems_audio), ch, sr)
             } else {
                 (
                     Arc::new(self.processed_playback_samples.clone()),

@@ -129,47 +129,34 @@ pub fn tempo_map_from_beats(beat_times: &[f32]) -> Option<(TempoEstimate, Vec<Te
     };
 
     let mut segments = Vec::new();
-    let first_interval = intervals.first().copied().unwrap_or(median_interval);
     let first_beat = beats[0];
-    if first_beat > 1.0e-3 && first_interval > 0.0 {
-        let beat_offset = -first_beat / first_interval;
+    if first_beat > 1.0e-3 && median_interval > 0.0 {
+        let beat_offset = -first_beat / median_interval;
         segments.push(TempoSegment {
             start_time_sec: 0.0,
             end_time_sec: first_beat,
-            bpm: (60.0 / first_interval).clamp(40.0, 260.0),
-            beat_duration_sec: first_interval,
+            bpm: global_bpm,
+            beat_duration_sec: median_interval,
             beat_offset,
         });
-    }
-
-    let mut beat_offset = 0.0f32;
-    for window in beats.windows(2) {
-        let start = window[0];
-        let end = window[1];
-        let interval = end - start;
-        if interval <= 1.0e-3 {
-            continue;
-        }
-
-        segments.push(TempoSegment {
-            start_time_sec: start,
-            end_time_sec: end,
-            bpm: (60.0 / interval).clamp(40.0, 260.0),
-            beat_duration_sec: interval,
-            beat_offset,
-        });
-        beat_offset += 1.0;
     }
 
     let last_beat = *beats.last().unwrap_or(&0.0);
-    let tail_interval = intervals.last().copied().unwrap_or(median_interval);
-    if tail_interval > 0.0 {
+    segments.push(TempoSegment {
+        start_time_sec: first_beat,
+        end_time_sec: last_beat,
+        bpm: global_bpm,
+        beat_duration_sec: median_interval,
+        beat_offset: 0.0,
+    });
+
+    if median_interval > 0.0 {
         segments.push(TempoSegment {
             start_time_sec: last_beat,
-            end_time_sec: last_beat + tail_interval,
-            bpm: (60.0 / tail_interval).clamp(40.0, 260.0),
-            beat_duration_sec: tail_interval,
-            beat_offset,
+            end_time_sec: last_beat + median_interval,
+            bpm: global_bpm,
+            beat_duration_sec: median_interval,
+            beat_offset: (last_beat - first_beat) / median_interval,
         });
     }
 

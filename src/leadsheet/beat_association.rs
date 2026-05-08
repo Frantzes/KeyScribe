@@ -50,6 +50,10 @@ pub fn associate_notes_to_beat_grid(
         .filter(|t| t.is_finite() && *t >= 0.0)
         .collect();
 
+    let beats_per_bar = beats_per_bar_from_downbeats(&downbeats, &beats);
+    let has_anacrusis = beats.first().copied().unwrap_or(0.0) < downbeats.first().copied().unwrap_or(0.0) - 0.001;
+    let bar_shift = if has_anacrusis { 1 } else { 0 };
+
     let max_len = start_times.len().min(pitches.len()).min(velocities.len()).min(end_times.len());
     let mut aligned = Vec::with_capacity(max_len);
 
@@ -67,8 +71,16 @@ pub fn associate_notes_to_beat_grid(
         let beat_duration_sec = (next_beat - prev_beat).max(0.001);
         let intra_beat_pos = ((onset - prev_beat) / beat_duration_sec).clamp(0.0, 1.0);
 
-        let beat_index = find_beat_index(onset, &beats);
-        let bar_index = find_bar_index_for_beat(beat_index, &beats, &downbeats);
+        let raw_beat_index = find_beat_index(onset, &beats);
+        
+        let (bar_index, beat_offset_in_bar) = find_structural_position(
+            raw_beat_index,
+            &beats,
+            &downbeats,
+            beats_per_bar,
+            bar_shift,
+        );
+        let structural_beat_index = bar_index * beats_per_bar + beat_offset_in_bar;
 
         aligned.push(BeatAlignedNote {
             pitch,
@@ -76,7 +88,7 @@ pub fn associate_notes_to_beat_grid(
             channel: None,
             original_start_time: onset,
             original_end_time: end,
-            beat_index,
+            beat_index: structural_beat_index,
             bar_index,
             intra_beat_pos,
             prev_beat_time: prev_beat,
@@ -89,18 +101,17 @@ pub fn associate_notes_to_beat_grid(
 }
 
 fn find_surrounding_beats(time: f32, beats: &[f32]) -> Option<(f32, f32)> {
+    if beats.len() < 2 {
+        return None;
+    }
     if time < beats[0] {
-        return Some((beats[0] - (beats[1] - beats[0]), beats[0]));
+        return Some((beats[0], beats[1]));
     }
     if time >= beats[beats.len() - 1] {
         let last = beats[beats.len() - 1];
-        let prev = if beats.len() >= 2 {
-            beats[beats.len() - 2]
-        } else {
-            last - 0.5
-        };
+        let prev = beats[beats.len() - 2];
         let dur = (last - prev).max(0.001);
-        return Some((last - dur, last + dur));
+        return Some((last, last + dur));
     }
     for i in 0..beats.len() - 1 {
         if time >= beats[i] && time < beats[i + 1] {
@@ -122,19 +133,39 @@ fn find_beat_index(time: f32, beats: &[f32]) -> u32 {
     0
 }
 
-fn find_bar_index_for_beat(beat_index: u32, beats: &[f32], downbeats: &[f32]) -> u32 {
+fn find_structural_position(raw_beat_index: u32, beats: &[f32], downbeats: &[f32], beats_per_bar: u32, bar_shift: u32) -> (u32, u32) {
     if downbeats.is_empty() {
-        return beat_index / 4;
+        return (raw_beat_index / beats_per_bar, raw_beat_index % beats_per_bar);
     }
-    let beat_time = beats.get(beat_index as usize).copied().unwrap_or(0.0);
-    for i in (0..downbeats.len()).rev() {
-        if beat_time >= downbeats[i] - 0.001 {
-            return i as u32;
+
+    let beat_time = beats.get(raw_beat_index as usize).copied().unwrap_or(0.0);
+
+    let mut nearest_downbeat_idx = 0;
+    let mut nearest_downbeat_time = downbeats[0];
+
+    for (i, &db_time) in downbeats.iter().enumerate().rev() {
+        if beat_time >= db_time - 0.001 {
+            nearest_downbeat_idx = i as u32;
+            nearest_downbeat_time = db_time;
+            break;
         }
     }
-    0
-}
 
+    if beat_time < downbeats[0] - 0.001 {
+        let beats_before = beats.iter().filter(|&&b| b >= beat_time - 0.001 && b < downbeats[0] - 0.001).count() as u32;
+        let offset = if beats_before >= beats_per_bar {
+            0
+        } else {
+            beats_per_bar - beats_before
+        };
+        return (0, offset % beats_per_bar);
+    }
+
+    let beats_since_downbeat = beats.iter().filter(|&&b| b >= nearest_downbeat_time - 0.001 && b < beat_time + 0.001).count() as u32;
+    let offset = beats_since_downbeat.saturating_sub(1);
+
+    (nearest_downbeat_idx + bar_shift, offset % beats_per_bar)
+}
 pub fn associate_note_events(
     note_events: &[crate::leadsheet::NoteEvent],
     beat_times: &[f32],

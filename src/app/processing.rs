@@ -1,6 +1,16 @@
 use super::*;
 use crate::leadsheet::StemType;
 
+const STEM_ANALYSIS_CACHE_VERSION: u32 = 1;
+
+#[derive(Serialize, Deserialize)]
+struct StemAnalysisCacheBlob {
+    version: u32,
+    sample_rate: u32,
+    timeline_step_sec: f32,
+    timeline: Vec<Vec<f32>>,
+}
+
 impl KeyScribeApp {
     pub(super) fn request_rebuild(&mut self, restart_playback: bool, mode: RebuildMode) {
         if self.is_audio_loading {
@@ -403,15 +413,16 @@ impl KeyScribeApp {
                 return;
             }
 
-            let waveform = if let Some(ps) = &processed_samples {
+            // Always build waveform from the original full mix, not stem-blended audio.
+            let waveform = if mode == RebuildMode::VisualizationOnly {
+                Vec::new()
+            } else {
                 build_waveform_for_processed(
-                    ps,
-                    sample_rate,
+                    raw_samples_mono.as_ref(),
+                    raw_sample_rate,
                     audio_quality_mode.waveform_points(),
                     speed,
                 )
-            } else {
-                Vec::new()
             };
 
             let expected_duration_sec = if raw_sample_rate > 0 {
@@ -528,19 +539,236 @@ impl KeyScribeApp {
                     self.last_error = Some(err);
                 } else {
                     self.separated_stems = Some(result.stems);
-                    self.enabled_listening_indices.clear();
+
+                    // Compute confidence as each stem's fraction of total stem energy.
+                    // Comparing vs the summed original mix unfairly penalizes transient-
+                    // heavy stems (drums) whose RMS appears low despite being very audible.
+                    if let Some(stems) = self.separated_stems.as_mut() {
+                        let mut total_energy = 0.0f32;
+                        let mut energies: Vec<f32> = Vec::with_capacity(stems.len());
+                        for stem in stems.iter() {
+                            let e = stem
+                                .samples_mono
+                                .iter()
+                                .map(|s| s * s)
+                                .sum::<f32>()
+                                / stem.samples_mono.len().max(1) as f32;
+                            total_energy += e;
+                            energies.push(e);
+                        }
+                        for (stem, &e) in stems.iter_mut().zip(energies.iter()) {
+                            stem.confidence =
+                                (e / total_energy.max(1e-10)).clamp(0.0, 1.0);
+                        }
+                    }
+
+                    self.stem_colors = assign_stem_colors(
+                        self.separated_stems.as_ref().unwrap(),
+                    );
+                    self.stem_analyses.clear();
+
+                    // Restore saved stem selections or use defaults
+                    let stems = self.separated_stems.as_ref().unwrap();
                     self.enabled_stem_indices = self
-                        .separated_stems
-                        .as_ref()
-                        .map(|stems| (0..stems.len()).collect())
-                        .unwrap_or_default();
+                        .restore_saved_stem_selection(
+                            &self.saved_visualize_stem_indices,
+                            stems,
+                            |_| true,
+                        );
+                    self.enabled_listening_indices = self
+                        .restore_saved_stem_selection(
+                            &self.saved_listen_stem_indices,
+                            stems,
+                            |_| true,
+                        );
+
+                    self.cache_status_message =
+                        Some("Analyzing individual stems...".to_string());
+                    self.cache_status_message_at = Some(Instant::now());
                     self.refresh_note_timeline_from_selected_stems();
+                    self.start_stem_analysis();
                 }
             }
             Err(TryRecvError::Empty) => {}
             Err(TryRecvError::Disconnected) => {
                 self.is_separating = false;
                 self.separation_rx = None;
+            }
+        }
+    }
+
+    fn restore_saved_stem_selection(
+        &self,
+        saved: &Option<Vec<usize>>,
+        stems: &[crate::leadsheet::SeparatedStem],
+        default_filter: impl Fn(&crate::leadsheet::SeparatedStem) -> bool,
+    ) -> std::collections::BTreeSet<usize> {
+        if let Some(saved_indices) = saved {
+            let saved_set: std::collections::BTreeSet<usize> =
+                saved_indices.iter().copied().collect();
+            if saved_set.iter().all(|i| *i < stems.len()) {
+                return saved_set;
+            }
+        }
+        stems
+            .iter()
+            .enumerate()
+            .filter(|(_, s)| default_filter(s))
+            .map(|(i, _)| i)
+            .collect()
+    }
+
+    pub(super) fn start_stem_analysis(&mut self) {
+        let Some(stems) = self.separated_stems.clone() else {
+            return;
+        };
+        let Some(ref song_hash) = self.loaded_audio_hash.clone() else {
+            return;
+        };
+        let model_id: String = self
+            .selected_separation_model_path()
+            .and_then(|p| {
+                p.file_stem()
+                    .map(|s| s.to_string_lossy().to_string())
+            })
+            .unwrap_or_else(|| "htdemucs_6s".to_string());
+
+        let (tx, rx) = mpsc::channel::<StemAnalysisResult>();
+        self.stem_analysis_rx = Some(rx);
+        let song_hash = song_hash.clone();
+
+        thread::spawn(move || {
+            let cache_dir = analysis_cache_library_dir();
+            let mut analyses = Vec::new();
+
+            for (i, stem) in stems.iter().enumerate() {
+                let samples = &stem.samples_mono;
+                if samples.is_empty() {
+                    continue;
+                }
+
+                // Try loading from cache first
+                let cache_path = cache_dir
+                    .join(&song_hash)
+                    .join(format!("stem_{}_{}.bin.zst", i, model_id));
+                let cached = Self::load_stem_analysis_from_cache(&cache_path);
+
+                if let Some((cached_timeline, cached_step)) = cached {
+                    analyses.push(StemAnalysis {
+                        stem_index: i,
+                        timeline: Arc::new(cached_timeline),
+                        step_sec: cached_step,
+                    });
+                    continue;
+                }
+
+                match analyze_with_full_pipeline(samples, stem.sample_rate) {
+                    Ok((_smoothed, probs)) => {
+                        let duration_sec =
+                            samples.len() as f32 / stem.sample_rate.max(1) as f32;
+                        let step_sec = if probs.is_empty() {
+                            0.0
+                        } else {
+                            (duration_sec / probs.len() as f32).max(1e-3)
+                        };
+                        // Save to cache
+                        Self::save_stem_analysis_to_cache(
+                            &cache_path,
+                            stem.sample_rate,
+                            &probs,
+                            step_sec,
+                        );
+
+                        analyses.push(StemAnalysis {
+                            stem_index: i,
+                            timeline: Arc::new(probs),
+                            step_sec,
+                        });
+                    }
+                    Err(err) => {
+                        let _ = tx.send(StemAnalysisResult {
+                            analyses: Vec::new(),
+                            error: Some(format!(
+                                "Stem {} analysis failed: {}",
+                                stem.stem_type.display_name(),
+                                err
+                            )),
+                        });
+                        return;
+                    }
+                }
+            }
+            let _ = tx.send(StemAnalysisResult {
+                analyses,
+                error: None,
+            });
+        });
+    }
+
+    fn load_stem_analysis_from_cache(
+        cache_path: &std::path::Path,
+    ) -> Option<(Vec<Vec<f32>>, f32)> {
+        if !cache_path.exists() {
+            return None;
+        }
+        let bytes = fs::read(cache_path).ok()?;
+        if bytes.is_empty() || bytes.len() > ANALYSIS_CACHE_MAX_COMPRESSED_BYTES {
+            return None;
+        }
+        let decompress_budget = analysis_cache_decompress_budget(bytes.len());
+        let payload = zstd::bulk::decompress(&bytes, decompress_budget).ok()?;
+        let blob: StemAnalysisCacheBlob =
+            bincode::DefaultOptions::new().deserialize(&payload).ok()?;
+        if blob.version != STEM_ANALYSIS_CACHE_VERSION {
+            return None;
+        }
+        Some((blob.timeline, blob.timeline_step_sec))
+    }
+
+    fn save_stem_analysis_to_cache(
+        cache_path: &std::path::Path,
+        sample_rate: u32,
+        timeline: &[Vec<f32>],
+        step_sec: f32,
+    ) {
+        let blob = StemAnalysisCacheBlob {
+            version: STEM_ANALYSIS_CACHE_VERSION,
+            sample_rate,
+            timeline_step_sec: step_sec,
+            timeline: timeline.to_vec(),
+        };
+        if let Ok(payload) = bincode::DefaultOptions::new().serialize(&blob) {
+            if let Ok(compressed) = zstd::bulk::compress(&payload, ANALYSIS_CACHE_ZSTD_LEVEL) {
+                if let Some(parent) = cache_path.parent() {
+                    let _ = fs::create_dir_all(parent);
+                }
+                let _ = fs::write(cache_path, compressed);
+            }
+        }
+    }
+
+    pub(super) fn poll_stem_analysis_result(&mut self) {
+        let Some(rx) = &self.stem_analysis_rx else {
+            return;
+        };
+
+        match rx.try_recv() {
+            Ok(result) => {
+                self.stem_analysis_rx = None;
+                if let Some(err) = result.error {
+                    self.last_error = Some(err);
+                } else {
+                    self.stem_analyses = result.analyses;
+                    self.cache_status_message = Some(
+                        "Stem analysis complete.".to_string(),
+                    );
+                    self.cache_status_message_at = Some(Instant::now());
+                    self.update_note_probabilities(true);
+                }
+            }
+            Err(TryRecvError::Empty) => {}
+            Err(TryRecvError::Disconnected) => {
+                self.stem_analysis_rx = None;
             }
         }
     }
@@ -588,6 +816,16 @@ impl KeyScribeApp {
             dark_mode: self.dark_mode,
             highlight_hex: color_to_hex(self.highlight_color),
             recent_highlight_hex: self.recent_highlight_hex.clone(),
+            saved_visualize_stem_indices: if self.separated_stems.is_some() {
+                Some(self.enabled_stem_indices.iter().copied().collect())
+            } else {
+                None
+            },
+            saved_listen_stem_indices: if self.separated_stems.is_some() {
+                Some(self.enabled_listening_indices.iter().copied().collect())
+            } else {
+                None
+            },
         };
 
         if let Ok(raw) = serde_json::to_string_pretty(&state) {
@@ -602,6 +840,9 @@ impl KeyScribeApp {
         if self.note_highlight_hold_remaining.len() != self.note_probs.len() {
             self.note_highlight_hold_remaining
                 .resize(self.note_probs.len(), 0.0);
+        }
+        if self.note_stem_colors.len() != self.note_probs.len() {
+            self.note_stem_colors = vec![self.highlight_color; self.note_probs.len()];
         }
 
         let dt = elapsed_sec.clamp(0.0, 0.25);
@@ -632,7 +873,8 @@ impl KeyScribeApp {
             };
             let target = current.max(held_target);
 
-            *smoothed = *smoothed * 0.86 + target * 0.14;
+            let alpha = (1.0 - (-dt / 0.05).exp()).clamp(0.02, 1.0);
+            *smoothed = *smoothed * (1.0 - alpha) + target * alpha;
         }
     }
 
@@ -656,13 +898,69 @@ impl KeyScribeApp {
         };
         let current_time = (current_time + timing_offset_sec).max(0.0);
 
-        // 1. Prioritize pre-computed timeline (works for both original audio and stems)
-        if !self.note_timeline.is_empty() && self.note_timeline_step_sec > 0.0 {
+        let note_count = (PIANO_HIGH_MIDI - PIANO_LOW_MIDI + 1) as usize;
+
+        // 1. Per-stem timeline combination (when individual stem analyses are available)
+        if !self.stem_analyses.is_empty() && self.separated_stems.is_some() {
+            let pitch = self.pitch_semitones;
+            let mut combined = vec![0.0f32; note_count];
+            let mut colors = vec![self.highlight_color; note_count];
+
+            for analysis in &self.stem_analyses {
+                if !self.enabled_stem_indices.contains(&analysis.stem_index) {
+                    continue;
+                }
+                if analysis.timeline.is_empty() || analysis.step_sec <= 0.0 {
+                    continue;
+                }
+                let idx = (current_time / analysis.step_sec) as usize;
+                let idx = idx.min(analysis.timeline.len().saturating_sub(1));
+                let frame = &analysis.timeline[idx];
+
+                let frame = if pitch.abs() < 1.0e-6 {
+                    frame.clone()
+                } else {
+                    Self::transpose_frame(frame, pitch)
+                };
+
+                let stem_color = self
+                    .stem_colors
+                    .get(analysis.stem_index)
+                    .copied()
+                    .unwrap_or(self.highlight_color);
+
+                for (ni, &prob) in frame.iter().enumerate().take(note_count) {
+                    if prob > combined[ni] {
+                        combined[ni] = prob;
+                        colors[ni] = stem_color;
+                    }
+                }
+            }
+
+            // Preserve colors for notes that are in the hold period
+            // but no longer active in the current frame
+            let hold_floor = (NOTE_HIGHLIGHT_ACTIVATION_THRESHOLD
+                / self.key_color_sensitivity.max(0.05))
+            .clamp(0.0, 1.0);
+            for i in 0..note_count {
+                if combined[i] < hold_floor
+                    && self.note_highlight_hold_remaining.get(i).copied().unwrap_or(0.0) > 0.0
+                {
+                    colors[i] = self.note_stem_colors.get(i).copied().unwrap_or(self.highlight_color);
+                }
+            }
+
+            self.note_probs = combined;
+            self.note_stem_colors = colors;
+        }
+        // 2. Pre-computed blended timeline (original audio or blended stems when per-stem not ready)
+        else if !self.note_timeline.is_empty() && self.note_timeline_step_sec > 0.0 {
             let idx = (current_time.max(0.0) / self.note_timeline_step_sec) as usize;
             let idx = idx.min(self.note_timeline.len().saturating_sub(1));
             self.note_probs = self.note_timeline[idx].clone();
+            self.note_stem_colors = vec![self.highlight_color; note_count];
         }
-        // 2. Fallback to live analysis if timeline is not ready
+        // 3. Live analysis fallback
         else if let Some((stem_audio, stem_sample_rate)) = self.visualizing_stem_audio() {
             if self.audio_raw.is_none() {
                 return;
@@ -678,8 +976,9 @@ impl KeyScribeApp {
                     fft_window_size,
                 );
             } else {
-                self.note_probs = vec![0.0; (PIANO_HIGH_MIDI - PIANO_LOW_MIDI + 1) as usize];
+                self.note_probs = vec![0.0; note_count];
             }
+            self.note_stem_colors = vec![self.highlight_color; note_count];
         } else {
             let Some(raw) = &self.audio_raw else {
                 return;
@@ -697,6 +996,7 @@ impl KeyScribeApp {
                 center,
                 fft_window_size,
             );
+            self.note_stem_colors = vec![self.highlight_color; note_count];
         }
 
         self.update_note_highlight_visuals(elapsed_sec);
@@ -726,11 +1026,19 @@ impl KeyScribeApp {
     }
 
     pub(super) fn refresh_note_timeline_from_selected_stems(&mut self) {
-        self.request_rebuild(false, RebuildMode::Full);
+        if self.stem_analyses.is_empty() {
+            self.request_rebuild(false, RebuildMode::Full);
+        } else {
+            self.update_note_probabilities(true);
+        }
     }
 
     pub(super) fn refresh_note_timeline_from_selected_stems_preserving(&mut self) {
-        self.request_rebuild_preserving_playback_and_waveform();
+        if self.stem_analyses.is_empty() {
+            self.request_rebuild_preserving_playback_and_waveform();
+        } else {
+            self.update_note_probabilities(true);
+        }
     }
 
     pub(super) fn compute_fft_timeline(

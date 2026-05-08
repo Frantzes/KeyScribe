@@ -2557,6 +2557,7 @@ dependencies = [
  "rayon",
  "rfd",
  "rodio",
+ "roxmltree 0.20.0",
  "rustfft",
  "serde",
  "serde_json",

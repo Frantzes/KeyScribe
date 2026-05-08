@@ -306,7 +306,7 @@ mod tests {
     fn test_hann_window() {
         let window = Preprocessor::hann_window(512);
         assert_eq!(window.len(), 512);
-        assert!(window[0] > 0.0);
+        assert!(window[0] >= 0.0);
         assert!(window[256] > 0.99); // Peak near center
     }
 

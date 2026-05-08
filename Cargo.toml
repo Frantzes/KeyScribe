@@ -49,6 +49,8 @@ rayon = "1.9"
 thiserror = "1.0"
 verovioxide = "0.3.0"
 
+roxmltree = "0.20"
+
 [build-dependencies]
 winresource = "0.1"
 image = { version = "0.25", default-features = false, features = ["png"] }

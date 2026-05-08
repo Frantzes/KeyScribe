@@ -34,11 +34,12 @@ fn white_index_before_midi(midi: u8) -> usize {
 pub fn draw_piano_view(
     ui: &mut egui::Ui,
     probs: &[f32],
+    note_colors: &[egui::Color32],
     sensitivity: f32,
     zoom: f32,
     key_height: f32,
     scroll_px: f32,
-    highlight_color: egui::Color32,
+    _highlight_color: egui::Color32,
 ) -> KeyboardDrawResult {
     let desired_size = egui::vec2(
         ui.available_width(),
@@ -83,11 +84,11 @@ pub fn draw_piano_view(
         let idx = (midi - PIANO_LOW_MIDI) as usize;
         let p = probs.get(idx).copied().unwrap_or(0.0).clamp(0.0, 1.0);
         let s = sensitivity.clamp(0.0, 2.0);
-        // Optimized: use fast approximation instead of expensive pow operations
         let adjusted = (p * s).clamp(0.0, 1.0);
         let activation_threshold = 0.12;
         if adjusted >= activation_threshold {
-            painter.rect_filled(key_rect, 0.0, highlight_color);
+            let color = note_colors.get(idx).copied().unwrap_or(_highlight_color);
+            painter.rect_filled(key_rect, 0.0, color);
             painter.rect_stroke(
                 key_rect,
                 0.0,
@@ -126,11 +127,11 @@ pub fn draw_piano_view(
         let idx = (midi - PIANO_LOW_MIDI) as usize;
         let p = probs.get(idx).copied().unwrap_or(0.0).clamp(0.0, 1.0);
         let s = sensitivity.clamp(0.0, 2.0);
-        // Optimized: use fast approximation instead of expensive pow operations
         let adjusted = (p * s).clamp(0.0, 1.0);
         let activation_threshold = 0.12;
         if adjusted >= activation_threshold {
-            painter.rect_filled(key_rect, 2.0, highlight_color);
+            let color = note_colors.get(idx).copied().unwrap_or(_highlight_color);
+            painter.rect_filled(key_rect, 2.0, color);
             painter.rect_stroke(
                 key_rect,
                 2.0,
@@ -160,10 +161,11 @@ pub fn draw_probability_pane(
     ui: &mut egui::Ui,
     probs_smoothed: &[f32],
     probs_raw: &[f32],
+    note_colors: &[egui::Color32],
     zoom: f32,
     scroll_px: f32,
     strip_height: f32,
-    highlight_color: egui::Color32,
+    _highlight_color: egui::Color32,
 ) -> KeyboardDrawResult {
     let desired_size = egui::vec2(
         ui.available_width(),
@@ -211,6 +213,7 @@ pub fn draw_probability_pane(
             .copied()
             .unwrap_or(p_raw)
             .clamp(0.0, 1.0);
+        let bar_color = note_colors.get(idx).copied().unwrap_or(_highlight_color);
 
         let h = p_raw * (rect.height() - 8.0);
         if h > 0.5 {
@@ -218,7 +221,7 @@ pub fn draw_probability_pane(
                 egui::pos2(x0 + 1.0, rect.bottom() - h - 2.0),
                 egui::pos2(x1 - 1.0, rect.bottom() - 2.0),
             );
-            painter.rect_filled(bar, 1.0, highlight_color);
+            painter.rect_filled(bar, 1.0, bar_color);
         }
 
         let glow_h = p_smooth * (rect.height() - 8.0);
@@ -228,9 +231,9 @@ pub fn draw_probability_pane(
                 egui::pos2(x1 - 1.0, rect.bottom() - glow_h - 1.0),
             );
             let glow_color = egui::Color32::from_rgba_unmultiplied(
-                highlight_color.r().saturating_add(28),
-                highlight_color.g().saturating_add(28),
-                highlight_color.b().saturating_add(28),
+                bar_color.r().saturating_add(28),
+                bar_color.g().saturating_add(28),
+                bar_color.b().saturating_add(28),
                 180,
             );
             painter.rect_filled(glow, 1.0, glow_color);
@@ -272,6 +275,7 @@ pub fn draw_probability_pane(
             .copied()
             .unwrap_or(p_raw)
             .clamp(0.0, 1.0);
+        let bar_color = note_colors.get(idx).copied().unwrap_or(_highlight_color);
 
         let h = p_raw * (key_rect.height() - 4.0);
         if h > 0.5 {
@@ -279,7 +283,7 @@ pub fn draw_probability_pane(
                 egui::pos2(x0 + 1.0, key_rect.bottom() - h - 1.0),
                 egui::pos2(x1 - 1.0, key_rect.bottom() - 1.0),
             );
-            painter.rect_filled(bar, 1.0, highlight_color);
+            painter.rect_filled(bar, 1.0, bar_color);
         }
 
         let glow_h = p_smooth * (key_rect.height() - 4.0);
@@ -289,9 +293,9 @@ pub fn draw_probability_pane(
                 egui::pos2(x1 - 1.0, key_rect.bottom() - glow_h),
             );
             let glow_color = egui::Color32::from_rgba_unmultiplied(
-                highlight_color.r().saturating_add(36),
-                highlight_color.g().saturating_add(36),
-                highlight_color.b().saturating_add(36),
+                bar_color.r().saturating_add(36),
+                bar_color.g().saturating_add(36),
+                bar_color.b().saturating_add(36),
                 210,
             );
             painter.rect_filled(glow, 1.0, glow_color);

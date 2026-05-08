@@ -12,10 +12,10 @@ pub struct BpmDetectionConfig {
 impl Default for BpmDetectionConfig {
     fn default() -> Self {
         Self {
-            min_bpm: 60.0,
-            max_bpm: 180.0,
+            min_bpm: 40.0,
+            max_bpm: 200.0,
             onset_bin_size_sec: 0.01,
-            harmonic_score_ratio: 0.9,
+            harmonic_score_ratio: 0.7,
             subdivision_tolerance_beats: 0.07,
         }
     }
@@ -278,6 +278,115 @@ fn subdivision_alignment_score(onsets: &[f32], beat_duration_sec: f32, tolerance
     }
 
     score / onsets.len() as f32
+}
+
+/// Detect BPM directly from raw audio samples using onset envelope autocorrelation.
+/// Designed for use with bass and drum stems which provide the strongest rhythmic reference.
+pub fn detect_bpm_from_audio(
+    samples: &[f32],
+    sample_rate: u32,
+    config: BpmDetectionConfig,
+) -> Option<TempoEstimate> {
+    if samples.len() < sample_rate as usize {
+        // Need at least 1 second of audio
+        return None;
+    }
+
+    // Downsample to ~2205 Hz (every 20th sample at 44.1kHz) for efficiency
+    let decimation = (sample_rate as usize / 2205).max(1);
+    let decimated: Vec<f32> = samples
+        .iter()
+        .step_by(decimation)
+        .copied()
+        .collect();
+    let dec_rate = sample_rate / decimation as u32;
+
+    // Rectify and compute onset envelope:
+    // 1. Half-wave rectify (keep positive only — energy increase = onset)
+    // 2. Smooth with ~30ms moving average window
+    let smooth_len = ((dec_rate as f32 * 0.030) as usize).max(1);
+    let mut envelope = vec![0.0f32; decimated.len()];
+    let mut sum = 0.0f32;
+    for i in 0..decimated.len() {
+        let val = decimated[i].max(0.0);
+        sum += val;
+        if i >= smooth_len {
+            sum -= decimated[i - smooth_len].max(0.0);
+        }
+        envelope[i] = sum / smooth_len as f32;
+    }
+
+    // Differentiate and half-wave rectify → onset signal
+    let mut onset = vec![0.0f32; envelope.len()];
+    for i in 1..envelope.len() {
+        let diff = envelope[i] - envelope[i - 1];
+        onset[i] = diff.max(0.0);
+    }
+
+    // Autocorrelation: find dominant periodicity
+    let min_period = (60.0 / config.max_bpm * dec_rate as f32).round() as usize;
+    let max_period = (60.0 / config.min_bpm * dec_rate as f32).round() as usize;
+    let max_period = max_period.min(onset.len() / 2);
+
+    if min_period >= max_period || max_period < 2 {
+        return None;
+    }
+
+    let mut best_lag = min_period;
+    let mut best_score = 0.0f32;
+
+    for lag in min_period..=max_period {
+        let mut score = 0.0f32;
+        let mut count = 0usize;
+        for i in 0..(onset.len() - lag) {
+            if onset[i] > 0.0 && onset[i + lag] > 0.0 {
+                score += onset[i] * onset[i + lag];
+                count += 1;
+            }
+        }
+        if count > 0 {
+            score /= count as f32;
+        }
+        if score > best_score {
+            best_score = score;
+            best_lag = lag;
+        }
+    }
+
+    if best_score <= 0.0 {
+        return None;
+    }
+
+    let beat_duration_sec = best_lag as f32 / dec_rate as f32;
+    let bpm = (60.0 / beat_duration_sec).clamp(config.min_bpm, config.max_bpm);
+
+    // Also check half and double BPM for harmonic correction
+    let primary = TempoCandidate {
+        bpm,
+        raw_score: best_score,
+    };
+
+    // Generate pseudo-onsets from signal for harmonic resolution
+    let mut pseudo_onsets: Vec<f32> = Vec::new();
+    let threshold = onset.iter().copied().fold(0.0f32, |a, b| a.max(b)) * 0.3;
+    for (i, &val) in onset.iter().enumerate() {
+        if val > threshold && (i == 0 || val > onset[i - 1]) {
+            pseudo_onsets.push(i as f32 / dec_rate as f32);
+        }
+    }
+
+    let resolved = if pseudo_onsets.len() >= 3 {
+        resolve_harmonic_ambiguity(primary, &pseudo_onsets, config)
+    } else {
+        primary
+    };
+
+    let beat_duration = 60.0 / resolved.bpm;
+    Some(TempoEstimate {
+        bpm: resolved.bpm,
+        beat_duration_sec: beat_duration,
+        confidence: (resolved.raw_score * 10.0).clamp(0.0, 1.0),
+    })
 }
 
 #[cfg(test)]

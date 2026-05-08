@@ -126,7 +126,7 @@ impl KeyScribeApp {
         }
     }
 
-    fn selected_separation_model_path(&self) -> Option<std::path::PathBuf> {
+    pub(super) fn selected_separation_model_path(&self) -> Option<std::path::PathBuf> {
         let options = Self::available_separation_models();
         if options.is_empty() {
             return None;

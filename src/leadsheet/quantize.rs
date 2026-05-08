@@ -33,19 +33,9 @@ pub struct QuantizationConfig {
 impl Default for QuantizationConfig {
     fn default() -> Self {
         Self {
-            grids: vec![1.0, 0.5, 0.25, 0.125, 1.0 / 12.0],
+            grids: vec![1.0, 0.5, 0.25],
             finer_grid_improvement_threshold: 0.03,
-            duration_grids: vec![
-                4.0,
-                3.0,
-                2.0,
-                1.5,
-                1.0,
-                0.75,
-                0.5,
-                0.375,
-                0.25,
-            ],
+            duration_grids: vec![4.0, 3.0, 2.0, 1.5, 1.0, 0.75, 0.5, 0.25],
             duration_finer_grid_improvement_threshold: 0.015,
             min_duration_beats: 0.25,
         }
@@ -383,7 +373,9 @@ fn meter_specific_grids(config: &QuantizationConfig, meter: MeterClass) -> (Vec<
                 1.0,
                 2.0 / 3.0,
                 0.5,
+                1.0 / 3.0,
                 0.25,
+                1.0 / 6.0,
             ],
         )
     } else {
@@ -605,22 +597,9 @@ fn classify_intra_beat_distribution(
         0.0
     };
 
-    let mut triplet_bins = std::collections::BTreeSet::new();
-    for &tp in &config.triplet_positions {
-        let bin = (tp * bins as f32).round() as usize;
-        triplet_bins.insert(bin);
-        triplet_bins.insert(bin.saturating_sub(1));
-        triplet_bins.insert((bin + 1).min(bins - 1));
-    }
-    let triplet_energy: f32 = triplet_bins
-        .iter()
-        .map(|&b| hist.get(b).copied().unwrap_or(0) as f32)
-        .sum();
-
     let total_f = total as f32;
     let swing_score = (on_beat_energy + swing_energy) / total_f;
     let straight_score = (on_beat_energy + straight_energy) / total_f;
-    let triplet_score = triplet_energy / total_f;
 
     let spread = |bin: usize| -> f32 {
         let vals: Vec<f32> = positions
@@ -639,11 +618,6 @@ fn classify_intra_beat_distribution(
         1.0 - (variance.sqrt() * 5.0).clamp(0.0, 1.0)
     };
 
-    if triplet_score > config.triplet_cluster_threshold && triplet_score > straight_score {
-        let conf = (triplet_score * spread(half_bin)).clamp(0.3, 0.98);
-        return (SwingStyle::Triplet, conf, Some(1.0 / 3.0));
-    }
-
     if swing_score > config.swing_cluster_threshold && swing_score > straight_score {
         let conf = (swing_score * spread(half_bin)).clamp(0.3, 0.98);
         return (SwingStyle::Swing, conf, Some(config.swing_ratio_target));
@@ -658,13 +632,13 @@ fn classify_intra_beat_distribution(
 fn subdivision_grid(swing_style: SwingStyle) -> Vec<f32> {
     match swing_style {
         SwingStyle::Straight => {
-            vec![0.0, 0.25, 0.5, 0.75]
+            vec![0.0, 0.25, 0.5, 0.75, 1.0]
         }
         SwingStyle::Swing => {
-            vec![0.0, 2.0 / 3.0]
+            vec![0.0, 2.0 / 3.0, 1.0]
         }
         SwingStyle::Triplet => {
-            vec![0.0, 1.0 / 3.0, 2.0 / 3.0]
+            vec![0.0, 1.0 / 3.0, 2.0 / 3.0, 1.0]
         }
     }
 }
@@ -767,13 +741,11 @@ pub fn quantize_aligned_notes(
         let (snapped_pos, snap_error) = snap_intra_beat_pos(note.intra_beat_pos, &sub_grid);
 
         let subdivision_pos = snapped_pos;
-        let beat_start_in_bar = note.beat_index as f32 + subdivision_pos;
-        let beat_start = note.bar_index as f32 * beats_per_bar as f32 + beat_start_in_bar;
+        let beat_start = note.beat_index as f32 + subdivision_pos;
 
         let next_notes: Vec<&BeatAlignedNote> = sorted
             .iter()
             .skip(i + 1)
-            .filter(|n| n.pitch == note.pitch)
             .copied()
             .collect();
         let raw_dur = compute_next_onset_duration(note, &next_notes);
@@ -795,7 +767,7 @@ pub fn quantize_aligned_notes(
             channel: note.channel,
             confidence,
             bar_index: note.bar_index,
-            beat_index: note.beat_index,
+            beat_index: note.beat_index % beats_per_bar,
             intra_beat_pos: note.intra_beat_pos,
             articulation,
             swing_style: style,

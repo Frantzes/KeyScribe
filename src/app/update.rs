@@ -86,6 +86,8 @@ impl eframe::App for KeyScribeApp {
 
         self.poll_processing_result();
         self.poll_separation_result();
+        self.poll_stem_analysis_result();
+        self.poll_sheet_rendering(ctx);
         self.sync_playhead_from_engine();
 
         self.draw_top_controls_panel(ctx);
@@ -133,6 +135,7 @@ impl eframe::App for KeyScribeApp {
                         ui,
                         &self.note_probs_smoothed,
                         self.note_probs.as_slice(),
+                        &self.note_stem_colors,
                         self.piano_zoom,
                         self.piano_scroll_px,
                         prob_strip_height,
@@ -169,6 +172,7 @@ impl eframe::App for KeyScribeApp {
                 let piano_draw = draw_piano_view(
                     ui,
                     &self.note_probs_smoothed,
+                    &self.note_stem_colors,
                     self.key_color_sensitivity,
                     self.piano_zoom,
                     key_h_for_frame,

@@ -13,7 +13,11 @@ pub use beat_association::{
     associate_note_events, associate_notes_to_beat_grid, beats_per_bar_from_downbeats,
     BeatAssociationConfig,
 };
-pub use beat_tracking::{run_beat_this, BeatTrackConfig, BeatTrackDevice, BeatTrackResult};
+pub use beat_tracking::{
+    cross_validate_beat_sources, detect_beats_from_notes, detect_beats_from_stems, run_beat_this,
+    run_beat_this_combined, run_beat_this_multi, BeatTrackConfig, BeatTrackDevice,
+    BeatTrackResult, CrossValidatedBeats,
+};
 pub use bpm::{detect_bpm, BpmDetectionConfig, TempoEstimate};
 pub use chord::{detect_chord_changes, ChordAnalysisConfig};
 pub use instrument_separation::{

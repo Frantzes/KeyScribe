@@ -7,6 +7,7 @@ use crate::leadsheet::types::{Articulation, ChordSymbolChange, QuantizedNote, Sw
 pub struct ChordAnalysisConfig {
     pub step_beats: f32,
     pub min_active_notes: usize,
+    pub skip: bool,
 }
 
 impl Default for ChordAnalysisConfig {
@@ -14,6 +15,7 @@ impl Default for ChordAnalysisConfig {
         Self {
             step_beats: 1.0,
             min_active_notes: 2,
+            skip: false,
         }
     }
 }
@@ -22,7 +24,7 @@ pub fn detect_chord_changes(
     quantized_notes: &[QuantizedNote],
     config: ChordAnalysisConfig,
 ) -> Vec<ChordSymbolChange> {
-    if quantized_notes.is_empty() {
+    if config.skip || quantized_notes.is_empty() {
         return Vec::new();
     }
 
