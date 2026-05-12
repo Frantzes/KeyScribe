@@ -96,6 +96,13 @@ impl KeyScribeApp {
 
         let processing_sample_rate = stem_sample_rate.unwrap_or(raw_sample_rate);
 
+        // Waveform doesn't change with speed/pitch; reuse existing for param-only updates
+        let existing_waveform = if mode == RebuildMode::ParametersOnly {
+            self.waveform.clone()
+        } else {
+            Vec::new()
+        };
+
         thread::spawn(move || {
             if processing_epoch.load(Ordering::Acquire) != job_id {
                 return;
@@ -414,7 +421,9 @@ impl KeyScribeApp {
             }
 
             // Always build waveform from the original full mix, not stem-blended audio.
-            let waveform = if mode == RebuildMode::VisualizationOnly {
+            let waveform = if !existing_waveform.is_empty() {
+                existing_waveform
+            } else if mode == RebuildMode::VisualizationOnly {
                 Vec::new()
             } else {
                 build_waveform_for_processed(
@@ -534,11 +543,13 @@ impl KeyScribeApp {
         match rx.try_recv() {
             Ok(result) => {
                 self.is_separating = false;
+                self.separation_attempted = true;
                 self.separation_rx = None;
                 if let Some(err) = result.error {
                     self.last_error = Some(err);
                 } else {
                     self.separated_stems = Some(result.stems);
+                    self.stem_playback_cache = None;
 
                     // Compute confidence as each stem's fraction of total stem energy.
                     // Comparing vs the summed original mix unfairly penalizes transient-
@@ -547,43 +558,40 @@ impl KeyScribeApp {
                         let mut total_energy = 0.0f32;
                         let mut energies: Vec<f32> = Vec::with_capacity(stems.len());
                         for stem in stems.iter() {
-                            let e = stem
-                                .samples_mono
-                                .iter()
-                                .map(|s| s * s)
-                                .sum::<f32>()
+                            let e = stem.samples_mono.iter().map(|s| s * s).sum::<f32>()
                                 / stem.samples_mono.len().max(1) as f32;
                             total_energy += e;
                             energies.push(e);
                         }
                         for (stem, &e) in stems.iter_mut().zip(energies.iter()) {
-                            stem.confidence =
-                                (e / total_energy.max(1e-10)).clamp(0.0, 1.0);
+                            stem.confidence = (e / total_energy.max(1e-10)).clamp(0.0, 1.0);
                         }
                     }
 
-                    self.stem_colors = assign_stem_colors(
-                        self.separated_stems.as_ref().unwrap(),
-                    );
+                    self.stem_colors = assign_stem_colors(self.separated_stems.as_ref().unwrap());
                     self.stem_analyses.clear();
 
                     // Restore saved stem selections or use defaults
                     let stems = self.separated_stems.as_ref().unwrap();
-                    self.enabled_stem_indices = self
-                        .restore_saved_stem_selection(
-                            &self.saved_visualize_stem_indices,
-                            stems,
-                            |_| true,
-                        );
-                    self.enabled_listening_indices = self
-                        .restore_saved_stem_selection(
-                            &self.saved_listen_stem_indices,
-                            stems,
-                            |_| true,
-                        );
+                    self.enabled_stem_indices = self.restore_saved_stem_selection(
+                        &self.saved_visualize_stem_indices,
+                        stems,
+                        |_| true,
+                    );
+                    let restored_listen = self.restore_saved_stem_selection(
+                        &self.saved_listen_stem_indices,
+                        stems,
+                        |_| true,
+                    );
+                    if self.saved_listen_stem_indices.is_none()
+                        || restored_listen.len() == stems.len()
+                    {
+                        self.enabled_listening_indices.clear();
+                    } else {
+                        self.enabled_listening_indices = restored_listen;
+                    }
 
-                    self.cache_status_message =
-                        Some("Analyzing individual stems...".to_string());
+                    self.cache_status_message = Some("Analyzing individual stems...".to_string());
                     self.cache_status_message_at = Some(Instant::now());
                     self.refresh_note_timeline_from_selected_stems();
                     self.start_stem_analysis();
@@ -592,6 +600,7 @@ impl KeyScribeApp {
             Err(TryRecvError::Empty) => {}
             Err(TryRecvError::Disconnected) => {
                 self.is_separating = false;
+                self.separation_attempted = true;
                 self.separation_rx = None;
             }
         }
@@ -627,10 +636,7 @@ impl KeyScribeApp {
         };
         let model_id: String = self
             .selected_separation_model_path()
-            .and_then(|p| {
-                p.file_stem()
-                    .map(|s| s.to_string_lossy().to_string())
-            })
+            .and_then(|p| p.file_stem().map(|s| s.to_string_lossy().to_string()))
             .unwrap_or_else(|| "htdemucs_6s".to_string());
 
         let (tx, rx) = mpsc::channel::<StemAnalysisResult>();
@@ -664,8 +670,7 @@ impl KeyScribeApp {
 
                 match analyze_with_full_pipeline(samples, stem.sample_rate) {
                     Ok((_smoothed, probs)) => {
-                        let duration_sec =
-                            samples.len() as f32 / stem.sample_rate.max(1) as f32;
+                        let duration_sec = samples.len() as f32 / stem.sample_rate.max(1) as f32;
                         let step_sec = if probs.is_empty() {
                             0.0
                         } else {
@@ -705,9 +710,7 @@ impl KeyScribeApp {
         });
     }
 
-    fn load_stem_analysis_from_cache(
-        cache_path: &std::path::Path,
-    ) -> Option<(Vec<Vec<f32>>, f32)> {
+    fn load_stem_analysis_from_cache(cache_path: &std::path::Path) -> Option<(Vec<Vec<f32>>, f32)> {
         if !cache_path.exists() {
             return None;
         }
@@ -759,9 +762,7 @@ impl KeyScribeApp {
                     self.last_error = Some(err);
                 } else {
                     self.stem_analyses = result.analyses;
-                    self.cache_status_message = Some(
-                        "Stem analysis complete.".to_string(),
-                    );
+                    self.cache_status_message = Some("Stem analysis complete.".to_string());
                     self.cache_status_message_at = Some(Instant::now());
                     self.update_note_probabilities(true);
                 }
@@ -826,6 +827,8 @@ impl KeyScribeApp {
             } else {
                 None
             },
+            sheet_use_musescore: self.sheet_use_musescore,
+            auto_separate: self.auto_separate,
         };
 
         if let Ok(raw) = serde_json::to_string_pretty(&state) {
@@ -891,12 +894,7 @@ impl KeyScribeApp {
         }
 
         let timing_offset_sec = self.visualization_timing_offset_ms / 1000.0;
-        let current_time = if self.is_playing() {
-            self.current_position_sec()
-        } else {
-            self.selected_time_sec
-        };
-        let current_time = (current_time + timing_offset_sec).max(0.0);
+        let current_time = (self.selected_time_sec + timing_offset_sec).max(0.0);
 
         let note_count = (PIANO_HIGH_MIDI - PIANO_LOW_MIDI + 1) as usize;
 
@@ -944,9 +942,18 @@ impl KeyScribeApp {
             .clamp(0.0, 1.0);
             for i in 0..note_count {
                 if combined[i] < hold_floor
-                    && self.note_highlight_hold_remaining.get(i).copied().unwrap_or(0.0) > 0.0
+                    && self
+                        .note_highlight_hold_remaining
+                        .get(i)
+                        .copied()
+                        .unwrap_or(0.0)
+                        > 0.0
                 {
-                    colors[i] = self.note_stem_colors.get(i).copied().unwrap_or(self.highlight_color);
+                    colors[i] = self
+                        .note_stem_colors
+                        .get(i)
+                        .copied()
+                        .unwrap_or(self.highlight_color);
                 }
             }
 
@@ -961,7 +968,13 @@ impl KeyScribeApp {
             self.note_stem_colors = vec![self.highlight_color; note_count];
         }
         // 3. Live analysis fallback
-        else if let Some((stem_audio, stem_sample_rate)) = self.visualizing_stem_audio() {
+        // Skip expensive ONNX inference during playback — the visualization
+        // isn't worth the UI-thread freeze. Full analysis will populate the
+        // timeline shortly, at which point path 2 (cheap lookup) is used.
+        else if self.is_playing() {
+            self.note_probs = vec![0.0; note_count];
+            self.note_stem_colors = vec![self.highlight_color; note_count];
+        } else if let Some((stem_audio, stem_sample_rate)) = self.visualizing_stem_audio() {
             if self.audio_raw.is_none() {
                 return;
             }

@@ -391,6 +391,9 @@ pub(super) fn draw_media_controls(
                                     if !app.loop_enabled {
                                         app.loop_selection = None;
                                         app.loop_playback_enabled = false;
+                                        if app.is_playing() {
+                                            app.play_from_selected();
+                                        }
                                     }
                                 }
                             });
@@ -524,6 +527,9 @@ pub(super) fn draw_media_controls(
                                                     if !app.loop_enabled {
                                                         app.loop_selection = None;
                                                         app.loop_playback_enabled = false;
+                                                        if app.is_playing() {
+                                                            app.play_from_selected();
+                                                        }
                                                     }
                                                 }
                                             },

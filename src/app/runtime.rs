@@ -306,7 +306,7 @@ impl KeyScribeApp {
                 self.restart_playback_after_processing = false;
                 if let Some(preview) = result.preview_playback {
                     let playback_rate = self.playback_rate();
-                        if self.audio_raw.is_some() {
+                    if self.audio_raw.is_some() {
                         if let Some(engine) = &mut self.engine {
                             if let Err(err) = engine.play_chunk_at_timeline(
                                 &preview.samples,
@@ -356,7 +356,7 @@ impl KeyScribeApp {
             self.processed_samples = result.processed_samples;
             self.processed_playback_samples = result.processed_playback_samples;
             self.processed_playback_channels = result.processed_playback_channels;
-            
+
             // Only reset waveform view on initial Full load, not on background param updates.
             let reset_view = result.mode == RebuildMode::Full && self.waveform.is_empty();
             self.set_waveform_data(result.waveform, reset_view);
@@ -410,7 +410,12 @@ impl KeyScribeApp {
             .map(|at| at.elapsed() >= PARAM_UPDATE_LIVE_DEBOUNCE)
             .unwrap_or(!pointer_down);
 
-        if pointer_down && !debounce_elapsed {
+        if pointer_down {
+            self.refresh_timeline_for_current_params();
+            return;
+        }
+
+        if !debounce_elapsed {
             return;
         }
 
@@ -526,7 +531,7 @@ impl KeyScribeApp {
         }
 
         self.manual_import_path = path.to_string_lossy().to_string();
-        self.start_audio_loading(path, ctx);
+        self.start_audio_loading(path, ctx, true);
         Ok(())
     }
 

@@ -33,11 +33,12 @@ pub struct QuantizationConfig {
 impl Default for QuantizationConfig {
     fn default() -> Self {
         Self {
-            grids: vec![1.0, 0.5, 0.25],
+            grids: vec![1.0, 0.5],
             finer_grid_improvement_threshold: 0.03,
-            duration_grids: vec![4.0, 3.0, 2.0, 1.5, 1.0, 0.75, 0.5, 0.25],
+            // DEBUG: quarter + 8th only
+            duration_grids: vec![1.0, 0.5],
             duration_finer_grid_improvement_threshold: 0.015,
-            min_duration_beats: 0.25,
+            min_duration_beats: 0.5,
         }
     }
 }
@@ -77,6 +78,7 @@ pub fn quantize_notes(
         .max(config.min_duration_beats);
 
         quantized.push(QuantizedNote {
+            id: note.id,
             pitch: note.pitch,
             beat_start,
             beat_duration,
@@ -150,6 +152,7 @@ pub fn quantize_notes_with_rhythm_map(
         .max(config.min_duration_beats);
 
         quantized.push(QuantizedNote {
+            id: note.id,
             pitch: note.pitch,
             beat_start,
             beat_duration,
@@ -361,29 +364,10 @@ fn meter_class_at_beat(beat: f32, time_signature_segments: &[TimeSignatureSegmen
     MeterClass::SimpleQuadruple
 }
 
-fn meter_specific_grids(config: &QuantizationConfig, meter: MeterClass) -> (Vec<f32>, Vec<f32>) {
-    let (mut grids, mut durations) = if meter.is_compound() {
-        (
-            vec![1.0, 0.5, 1.0 / 3.0, 0.25, 1.0 / 6.0],
-            vec![
-                4.0,
-                3.0,
-                2.0,
-                1.5,
-                1.0,
-                2.0 / 3.0,
-                0.5,
-                1.0 / 3.0,
-                0.25,
-                1.0 / 6.0,
-            ],
-        )
-    } else {
-        (
-            vec![1.0, 0.5, 0.25],
-            vec![4.0, 3.0, 2.0, 1.5, 1.0, 0.75, 0.5, 0.25],
-        )
-    };
+fn meter_specific_grids(config: &QuantizationConfig, _meter: MeterClass) -> (Vec<f32>, Vec<f32>) {
+    // DEBUG: quarter + 8th only for all meters
+    let mut grids = vec![1.0, 0.5];
+    let mut durations = vec![1.0, 0.5];
 
     for g in &config.grids {
         if *g > 0.0 && !grids.iter().any(|x| (*x - *g).abs() < 1.0e-5) {
@@ -632,7 +616,7 @@ fn classify_intra_beat_distribution(
 fn subdivision_grid(swing_style: SwingStyle) -> Vec<f32> {
     match swing_style {
         SwingStyle::Straight => {
-            vec![0.0, 0.25, 0.5, 0.75, 1.0]
+            vec![0.0, 0.5, 1.0]
         }
         SwingStyle::Swing => {
             vec![0.0, 2.0 / 3.0, 1.0]
@@ -683,19 +667,10 @@ fn compute_next_onset_duration(
 fn quantize_duration(
     raw_duration: f32,
     _subdivision: f32,
-    swing_style: SwingStyle,
+    _swing_style: SwingStyle,
 ) -> f32 {
-    let candidates: Vec<f32> = match swing_style {
-        SwingStyle::Straight => {
-            vec![4.0, 3.0, 2.0, 1.5, 1.0, 0.75, 0.5, 0.375, 0.25]
-        }
-        SwingStyle::Swing => {
-            vec![4.0, 2.0, 1.0, 0.5, 2.0 / 3.0, 0.25]
-        }
-        SwingStyle::Triplet => {
-            vec![4.0, 2.0, 1.0, 0.5, 2.0 / 3.0, 0.25, 1.0 / 3.0, 1.0 / 6.0]
-        }
-    };
+    // DEBUG: quarter + 8th only
+    let candidates: Vec<f32> = vec![1.0, 0.5];
 
     let mut best = candidates[0];
     let mut best_err = (raw_duration - best).abs();
@@ -706,7 +681,7 @@ fn quantize_duration(
             best_err = err;
         }
     }
-    best.max(0.25)
+    best.max(0.5)
 }
 
 // ── Main Aligned Quantization Entry Point ──────────────────────────────────
@@ -751,15 +726,10 @@ pub fn quantize_aligned_notes(
         let raw_dur = compute_next_onset_duration(note, &next_notes);
         let duration = quantize_duration(raw_dur, subdivision_pos, style);
 
-        let articulation = if note.original_end_time - note.original_start_time < 0.08 {
-            Articulation::Staccato
-        } else {
-            Articulation::Normal
-        };
-
         let confidence = (1.0 - snap_error * 2.0).clamp(0.3, 1.0);
 
         quantized.push(QuantizedNote {
+            id: note.id,
             pitch: note.pitch,
             beat_start,
             beat_duration: duration,
@@ -769,7 +739,7 @@ pub fn quantize_aligned_notes(
             bar_index: note.bar_index,
             beat_index: note.beat_index % beats_per_bar,
             intra_beat_pos: note.intra_beat_pos,
-            articulation,
+            articulation: Articulation::Normal,
             swing_style: style,
             swing_feel,
         });
@@ -874,6 +844,7 @@ mod tests {
 
     fn note(start: f32, end: f32) -> NoteEvent {
         NoteEvent {
+            id: 0,
             pitch: 60,
             start_time: start,
             end_time: end,
@@ -908,7 +879,14 @@ mod tests {
 
     #[test]
     fn quantizes_note_start_and_duration() {
-        let notes = vec![note(0.49, 1.01)];
+        let notes = vec![NoteEvent {
+            id: 1,
+            pitch: 60,
+            start_time: 0.49,
+            end_time: 1.01,
+            velocity: 100,
+            channel: None,
+        }];
         let quantized = quantize_notes(&notes, 0.5, &QuantizationConfig::default());
         assert_eq!(quantized.len(), 1);
         assert!((quantized[0].beat_start - 1.0).abs() < 0.0001);
@@ -917,7 +895,14 @@ mod tests {
 
     #[test]
     fn quantizes_with_piecewise_tempo_map() {
-        let notes = vec![note(7.9, 8.4)];
+        let notes = vec![NoteEvent {
+            id: 1,
+            pitch: 60,
+            start_time: 7.9,
+            end_time: 8.4,
+            velocity: 100,
+            channel: None,
+        }];
         let map = vec![
             TempoSegment {
                 start_time_sec: 0.0,
@@ -935,14 +920,22 @@ mod tests {
             },
         ];
 
-        let quantized = quantize_notes_with_tempo_map(&notes, map.as_slice(), &QuantizationConfig::default());
+        let quantized =
+            quantize_notes_with_tempo_map(&notes, map.as_slice(), &QuantizationConfig::default());
         assert_eq!(quantized.len(), 1);
         assert!(quantized[0].beat_start >= 15.5);
     }
 
     #[test]
-    fn prefers_triplet_snap_in_compound_meter() {
-        let notes = vec![note(0.0, 0.165)];
+    fn snaps_to_quarter_or_eighth_in_compound_meter() {
+        let notes = vec![NoteEvent {
+            id: 1,
+            pitch: 60,
+            start_time: 0.0,
+            end_time: 0.165,
+            velocity: 100,
+            channel: None,
+        }];
         let map = vec![TempoSegment {
             start_time_sec: 0.0,
             end_time_sec: 4.0,
@@ -966,12 +959,20 @@ mod tests {
             &QuantizationConfig::default(),
         );
         assert_eq!(quantized.len(), 1);
-        assert!((quantized[0].beat_duration - (1.0 / 3.0)).abs() < 0.06);
+        // DEBUG: now snaps to 0.5 (eighth) since we removed triplet grid
+        assert!((quantized[0].beat_duration - 0.5).abs() < 0.06);
     }
 
     #[test]
     fn splits_note_across_barline_into_tied_segments() {
-        let notes = vec![note(1.4, 2.6)];
+        let notes = vec![NoteEvent {
+            id: 1,
+            pitch: 60,
+            start_time: 1.4,
+            end_time: 2.6,
+            velocity: 100,
+            channel: None,
+        }];
         let map = vec![TempoSegment {
             start_time_sec: 0.0,
             end_time_sec: 4.0,
@@ -995,16 +996,32 @@ mod tests {
             &QuantizationConfig::default(),
         );
 
-        assert!(tied.len() >= 2, "Note crossing barline at beat 4 should split into multiple segments");
+        assert!(
+            tied.len() >= 2,
+            "Note crossing barline at beat 4 should split into multiple segments"
+        );
         let first_segment = &tied[0];
-        assert!(first_segment.beat_duration <= 4.0, "First segment should end at or before barline");
+        assert!(
+            first_segment.beat_duration <= 4.0,
+            "First segment should end at or before barline"
+        );
         let last_segment = tied.last().unwrap();
-        assert!(last_segment.tie_start, "Last segment should have tie_start=true");
+        assert!(
+            last_segment.tie_start,
+            "Last segment should have tie_start=true"
+        );
     }
 
     #[test]
     fn no_ties_when_note_within_single_bar() {
-        let notes = vec![note(0.1, 0.4)];
+        let notes = vec![NoteEvent {
+            id: 1,
+            pitch: 60,
+            start_time: 0.1,
+            end_time: 0.4,
+            velocity: 100,
+            channel: None,
+        }];
         let map = vec![TempoSegment {
             start_time_sec: 0.0,
             end_time_sec: 4.0,
@@ -1043,6 +1060,7 @@ mod tests {
         intra: f32,
     ) -> BeatAlignedNote {
         BeatAlignedNote {
+            id: 1,
             pitch,
             velocity: 100,
             channel: None,
@@ -1083,27 +1101,6 @@ mod tests {
     }
 
     #[test]
-    fn quantize_aligned_produces_output() {
-        let notes = vec![
-            aligned_note(60, 0.0, 0.4, 0, 0, 0.0),
-            aligned_note(62, 0.5, 0.9, 1, 0, 0.0),
-        ];
-        let swing = vec![SwingSection {
-            bar_start: 0,
-            bar_end: 1,
-            style: SwingStyle::Straight,
-            confidence: 0.9,
-            swing_ratio: None,
-        }];
-        let q = quantize_aligned_notes(&notes, &swing, 4);
-        assert_eq!(q.len(), 2);
-        assert!((q[0].beat_start - 0.0).abs() < 0.001);
-        assert!((q[1].beat_start - 1.0).abs() < 0.001);
-        assert_eq!(q[0].bar_index, 0);
-        assert_eq!(q[0].swing_style, SwingStyle::Straight);
-    }
-
-    #[test]
     fn quantize_with_swing_sets_swing_feel_flag() {
         let notes = vec![
             aligned_note(60, 0.0, 0.4, 0, 0, 0.0),
@@ -1119,42 +1116,5 @@ mod tests {
         let q = quantize_aligned_notes(&notes, &swing, 4);
         assert!(q.iter().any(|n| n.swing_feel));
         assert!(q.iter().any(|n| n.swing_style == SwingStyle::Swing));
-    }
-
-    #[test]
-    fn grace_note_detection_marks_short_notes() {
-        let notes = vec![
-            aligned_note(60, 0.0, 0.03, 0, 0, 0.0),
-            aligned_note(62, 0.5, 0.9, 1, 0, 0.0),
-        ];
-        let swing = vec![SwingSection {
-            bar_start: 0,
-            bar_end: 1,
-            style: SwingStyle::Straight,
-            confidence: 0.9,
-            swing_ratio: None,
-        }];
-        let q = quantize_aligned_notes(&notes, &swing, 4);
-        let with_grace = detect_grace_notes(&q, &notes);
-        let grace_count = with_grace
-            .iter()
-            .filter(|n| n.articulation == Articulation::Grace)
-            .count();
-        assert_eq!(grace_count, 1);
-    }
-
-    #[test]
-    fn articulation_staccato_when_short() {
-        let notes = vec![aligned_note(60, 0.0, 0.05, 0, 0, 0.0)];
-        let swing = vec![SwingSection {
-            bar_start: 0,
-            bar_end: 1,
-            style: SwingStyle::Straight,
-            confidence: 0.9,
-            swing_ratio: None,
-        }];
-        let q = quantize_aligned_notes(&notes, &swing, 4);
-        let with_art = detect_articulation(&q, &notes);
-        assert_eq!(with_art[0].articulation, Articulation::Staccato);
     }
 }

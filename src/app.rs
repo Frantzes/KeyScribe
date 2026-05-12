@@ -23,13 +23,13 @@ use crate::analysis::{
     analyze_with_full_pipeline, detect_note_probabilities, PIANO_HIGH_MIDI, PIANO_KEY_COUNT,
     PIANO_LOW_MIDI,
 };
-use crate::leadsheet::StemType;
 use crate::audio_io::{
     load_audio_file_streaming, load_audio_preview_chunk, AudioData, AudioPreviewChunk,
     StreamingAudioEvent,
 };
 use crate::core::processing::build_waveform_for_processed;
 use crate::dsp::{apply_speed_and_pitch, apply_speed_and_pitch_interleaved};
+use crate::leadsheet::StemType;
 use crate::leadsheet::{BeatTrackResult, LeadSheetFoundation};
 use crate::playback::{available_output_devices, AudioEngine, AudioOutputDeviceOption};
 use crate::theme::{apply_brand_theme, ACCENT_PURPLE, ERROR_RED};
@@ -216,6 +216,10 @@ fn default_use_cqt_analysis() -> bool {
     true
 }
 
+fn default_auto_separate() -> bool {
+    true
+}
+
 fn assign_stem_colors(stems: &[crate::leadsheet::SeparatedStem]) -> Vec<egui::Color32> {
     stems
         .iter()
@@ -288,6 +292,10 @@ struct PersistedState {
     saved_visualize_stem_indices: Option<Vec<usize>>,
     #[serde(default)]
     saved_listen_stem_indices: Option<Vec<usize>>,
+    #[serde(default)]
+    sheet_use_musescore: bool,
+    #[serde(default = "default_auto_separate")]
+    auto_separate: bool,
 }
 
 impl Default for PersistedState {
@@ -318,6 +326,8 @@ impl Default for PersistedState {
             recent_highlight_hex: Vec::new(),
             saved_visualize_stem_indices: None,
             saved_listen_stem_indices: None,
+            sheet_use_musescore: false,
+            auto_separate: true,
         }
     }
 }
@@ -823,6 +833,8 @@ pub struct KeyScribeApp {
     sheet_engraving_cache_key: Option<SheetPreviewCacheKey>,
     sheet_engraving_pages: Vec<EngravedSheetPage>,
     sheet_engraving_error: Option<String>,
+    sheet_config_modal_open: bool,
+    sheet_use_musescore: bool,
     speed: f32,
     pitch_semitones: f32,
     key_color_sensitivity: f32,
@@ -886,6 +898,7 @@ pub struct KeyScribeApp {
     audio_loading_cancel: Option<Arc<AtomicBool>>,
     is_audio_loading: bool,
     is_separating: bool,
+    separation_attempted: bool,
     separation_progress: Arc<std::sync::atomic::AtomicU32>,
     separation_rx: Option<Receiver<SeparationResult>>,
     loading_sample_rate: u32,
@@ -904,10 +917,16 @@ pub struct KeyScribeApp {
     manual_import_path: String,
     mobile_ui_tweaks_applied: bool,
     show_shortcuts_help_modal: bool,
+    auto_separate: bool,
     // Sheet music mode and stem source selectors
     sheet_music_mode: SheetMusicMode,
-    melody_stem_index: Option<usize>,
-    chord_stem_index: Option<usize>,
+    melody_stem_indices: std::collections::BTreeSet<usize>,
+    melody_stem_selector_open: bool,
+    melody_mode: MelodyMode,
+    melody_heuristic: bool,
+    melody_outlier_semitones: u8,
+    chord_stem_indices: std::collections::BTreeSet<usize>,
+    chord_stem_selector_open: bool,
     chord_skip: bool,
     current_chord: Option<String>,
     stem_analyses: Vec<StemAnalysis>,
@@ -924,6 +943,19 @@ pub struct KeyScribeApp {
     melody_min_input_str: String,
     melody_max_input_str: String,
     sheet_render_result_rx: Option<std::sync::mpsc::Receiver<SheetRenderResult>>,
+    sheet_preview_result_rx:
+        Option<std::sync::mpsc::Receiver<(SheetPreviewCacheKey, Result<SheetPreviewData, String>)>>,
+    stem_playback_cache: Option<StemPlaybackCache>,
+}
+
+struct StemPlaybackCache {
+    samples: Arc<Vec<f32>>,
+    processed_samples: Option<Arc<Vec<f32>>>,
+    channels: u16,
+    sample_rate: u32,
+    listening_key: Vec<usize>,
+    processed_speed: f32,
+    processed_pitch: f32,
 }
 
 struct SeparationResult {
@@ -1003,6 +1035,12 @@ impl SheetMusicMode {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MelodyMode {
+    Monophonic,
+    Polyphonic,
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 struct SheetPreviewCacheKey {
     timeline_ptr: usize,
@@ -1011,11 +1049,13 @@ struct SheetPreviewCacheKey {
     threshold_bits: u32,
     separation_selection_bits: u64,
     mode_bits: u8,
-    melody_stem_bit: Option<u8>,
-    chord_stem_bit: Option<u8>,
+    melody_stem_bits: u64,
+    chord_stem_bits: u64,
     swing_style_bit: Option<u8>,
     stem_analysis_key: u64,
     melody_note_range_bits: u32,
+    melody_mode_bits: u32,
+    use_musescore: bool,
 }
 
 #[derive(Clone)]
@@ -1024,20 +1064,42 @@ struct SheetPreviewData {
     note_count: usize,
     threshold: f32,
     bpm_source: String,
+    cursor_offset_sec: f32,
+    melody_events: Vec<crate::leadsheet::NoteEvent>,
 }
 
 #[derive(Clone)]
 struct NotePosition {
+    note_id: u32,
     x: f32,
     y: f32,
     w: f32,
     h: f32,
     pitch: u8,
+    tick: i32,
+    duration_ticks: i32,
 }
 
 struct SheetRenderJob {
     musicxml: String,
     key: SheetPreviewCacheKey,
+}
+
+struct SheetPreviewJob {
+    key: SheetPreviewCacheKey,
+    threshold: f32,
+    melody_events: Vec<crate::leadsheet::NoteEvent>,
+    melody_mode: MelodyMode,
+    melody_outlier_semitones: u8,
+    melody_heuristic: bool,
+    bass_audio: Option<Vec<f32>>,
+    drum_audio: Option<Vec<f32>>,
+    full_mix: Option<Vec<f32>>,
+    sample_rate: u32,
+    manual_bpm: Option<f32>,
+    chord_skip: bool,
+    chord_notes: Option<Vec<crate::leadsheet::NoteEvent>>,
+    source_duration: f32,
 }
 
 struct SheetRenderResult {
@@ -1125,8 +1187,10 @@ impl KeyScribeApp {
             base_note_timeline_step_sec: 0.0,
             note_probs: vec![0.0; (PIANO_HIGH_MIDI - PIANO_LOW_MIDI + 1) as usize],
             note_probs_smoothed: vec![0.0; (PIANO_HIGH_MIDI - PIANO_LOW_MIDI + 1) as usize],
-            note_highlight_hold_remaining:
-                vec![0.0; (PIANO_HIGH_MIDI - PIANO_LOW_MIDI + 1) as usize],
+            note_highlight_hold_remaining: vec![
+                0.0;
+                (PIANO_HIGH_MIDI - PIANO_LOW_MIDI + 1) as usize
+            ],
             main_content_tab: MainContentTab::Waveform,
             sheet_preview_cache_key: None,
             sheet_preview_cache: None,
@@ -1136,6 +1200,8 @@ impl KeyScribeApp {
             sheet_engraving_cache_key: None,
             sheet_engraving_pages: Vec::new(),
             sheet_engraving_error: None,
+            sheet_config_modal_open: false,
+            sheet_use_musescore: persisted.sheet_use_musescore,
             selected_time_sec: persisted.selected_time_sec.max(0.0),
             speed: persisted.speed.clamp(0.5, 2.0),
             pitch_semitones: persisted.pitch_semitones.clamp(-12.0, 12.0),
@@ -1143,12 +1209,10 @@ impl KeyScribeApp {
             key_highlight_max_sec: persisted
                 .key_highlight_max_sec
                 .clamp(KEY_HIGHLIGHT_MAX_SEC_MIN, KEY_HIGHLIGHT_MAX_SEC_MAX),
-            visualization_timing_offset_ms: persisted
-                .visualization_timing_offset_ms
-                .clamp(
-                    VISUALIZATION_TIMING_OFFSET_MS_MIN,
-                    VISUALIZATION_TIMING_OFFSET_MS_MAX,
-                ),
+            visualization_timing_offset_ms: persisted.visualization_timing_offset_ms.clamp(
+                VISUALIZATION_TIMING_OFFSET_MS_MIN,
+                VISUALIZATION_TIMING_OFFSET_MS_MAX,
+            ),
             piano_zoom: persisted.piano_zoom.clamp(PIANO_ZOOM_MIN, PIANO_ZOOM_MAX),
             piano_key_height: persisted
                 .piano_key_height
@@ -1216,6 +1280,7 @@ impl KeyScribeApp {
             audio_loading_cancel: None,
             is_audio_loading: false,
             is_separating: false,
+            separation_attempted: false,
             separation_progress: Arc::new(std::sync::atomic::AtomicU32::new(0)),
             separation_rx: None,
             loading_sample_rate: 0,
@@ -1234,17 +1299,20 @@ impl KeyScribeApp {
             manual_import_path: String::new(),
             mobile_ui_tweaks_applied: false,
             show_shortcuts_help_modal: false,
+            auto_separate: persisted.auto_separate,
             sheet_music_mode: SheetMusicMode::LeadSheet,
-            melody_stem_index: None,
-            chord_stem_index: None,
+            melody_stem_indices: std::collections::BTreeSet::new(),
+            melody_stem_selector_open: false,
+            melody_mode: MelodyMode::Monophonic,
+            melody_heuristic: true,
+            melody_outlier_semitones: 12,
+            chord_stem_indices: std::collections::BTreeSet::new(),
+            chord_stem_selector_open: false,
             chord_skip: false,
             current_chord: None,
             stem_analyses: Vec::new(),
             stem_colors: Vec::new(),
-            note_stem_colors: vec![
-                egui::Color32::from_rgb(148, 106, 255);
-                PIANO_KEY_COUNT
-            ],
+            note_stem_colors: vec![egui::Color32::from_rgb(148, 106, 255); PIANO_KEY_COUNT],
             stem_analysis_rx: None,
             saved_visualize_stem_indices: persisted.saved_visualize_stem_indices.clone(),
             saved_listen_stem_indices: persisted.saved_listen_stem_indices.clone(),
@@ -1256,6 +1324,8 @@ impl KeyScribeApp {
             melody_min_input_str: String::new(),
             melody_max_input_str: String::new(),
             sheet_render_result_rx: None,
+            sheet_preview_result_rx: None,
+            stem_playback_cache: None,
         };
 
         app.refresh_audio_output_devices();
@@ -1273,11 +1343,10 @@ impl KeyScribeApp {
 
         if let Some(path) = startup_path {
             if is_safe_startup_audio_path(path.as_path()) {
-                app.start_audio_loading(path, &_cc.egui_ctx);
+                app.start_audio_loading(path, &_cc.egui_ctx, false);
             }
         }
 
         app
     }
 }
-

@@ -1,12 +1,12 @@
 use crate::leadsheet::beat_association::associate_note_events;
 use crate::leadsheet::bpm::{BpmDetectionConfig, TempoEstimate};
-use crate::leadsheet::chord::{detect_chord_changes, ChordAnalysisConfig};
+use crate::leadsheet::chord::{debug_chord_notes_to_json, detect_chord_changes, detect_chord_changes_per_bar, ChordAnalysisConfig};
 use crate::leadsheet::instrument_separation::{
     extract_melodic_audio, SeparationConfig, StemType,
 };
 use crate::leadsheet::joint_tracker::JointRhythmConfig;
 use crate::leadsheet::quantize::{
-    detect_articulation, detect_grace_notes, detect_swing, quantize_aligned_notes,
+    detect_swing, quantize_aligned_notes,
     quantize_notes_with_rhythm_map, quantize_notes_with_ties, QuantizationConfig,
     SwingDetectionConfig,
 };
@@ -294,16 +294,40 @@ pub fn generate_lead_sheet_enhanced(
         }]
     } else {
         let swing_config = SwingDetectionConfig::default();
-        detect_swing(&aligned, beats_per_bar, &swing_config)
+        let mut sections = detect_swing(&aligned, beats_per_bar, &swing_config);
+        if sections.len() > 1 {
+            let swing_bars: u32 = sections.iter()
+                .filter(|s| s.style == crate::leadsheet::types::SwingStyle::Swing)
+                .map(|s| s.bar_end - s.bar_start)
+                .sum();
+            let total_bars: u32 = sections.iter()
+                .map(|s| s.bar_end - s.bar_start)
+                .sum();
+            if total_bars > 0 {
+                let majority_swing = swing_bars as f32 / total_bars as f32 > 0.5;
+                let majority_style = if majority_swing {
+                    crate::leadsheet::types::SwingStyle::Swing
+                } else {
+                    crate::leadsheet::types::SwingStyle::Straight
+                };
+                let max_bar = aligned.iter().map(|n| n.bar_index).max().unwrap_or(0) + 1;
+                let avg_conf = sections.iter().map(|s| s.confidence).sum::<f32>() / sections.len() as f32;
+                sections = vec![SwingSection {
+                    bar_start: 0,
+                    bar_end: max_bar.max(1),
+                    style: majority_style,
+                    confidence: avg_conf,
+                    swing_ratio: if majority_style == crate::leadsheet::types::SwingStyle::Swing { Some(2.0 / 3.0) } else { None },
+                }];
+            }
+        }
+        sections
     };
 
-    let mut quantized = quantize_aligned_notes(&aligned, &swing_sections, beats_per_bar);
+    let quantized = quantize_aligned_notes(&aligned, &swing_sections, beats_per_bar);
     if quantized.is_empty() {
         return None;
     }
-
-    quantized = detect_grace_notes(&quantized, &aligned);
-    quantized = detect_articulation(&quantized, &aligned);
 
     // ---- per-bar tempo map from actual beat positions ----
     let (tempo_map, tempo) = tempo_map_from_beats_and_downbeats(
@@ -343,7 +367,8 @@ pub fn generate_lead_sheet_enhanced(
     }];
 
     let chord_changes =
-        detect_chord_changes(quantized.as_slice(), config.chord_analysis);
+        detect_chord_changes_per_bar(quantized.as_slice(), beats_per_bar, config.chord_analysis);
+    debug_chord_notes_to_json(quantized.as_slice(), beats_per_bar, config.chord_analysis);
     let rhythm_confidence = if swing_sections.is_empty() {
         0.8
     } else {
@@ -529,6 +554,7 @@ fn audio_to_note_events(audio: &[f32], tempo_map: &[TempoSegment]) -> Vec<NoteEv
 
             if end_time > start_time + 0.05 {
                 events.push(NoteEvent {
+                    id: (events.len() + 1) as u32,
                     pitch: 60,
                     start_time,
                     end_time,
@@ -544,6 +570,7 @@ fn audio_to_note_events(audio: &[f32], tempo_map: &[TempoSegment]) -> Vec<NoteEv
         let end_time = audio.len() as f32 / sample_rate;
         if end_time > start_time + 0.05 {
             events.push(NoteEvent {
+                id: (events.len() + 1) as u32,
                 pitch: 60,
                 start_time,
                 end_time,
@@ -647,6 +674,7 @@ fn extract_melody_events(notes: &[NoteEvent]) -> Vec<NoteEvent> {
             if let Some(pitch) = current_melody_pitch {
                 if t > segment_start {
                     out.push(NoteEvent {
+                        id: (out.len() + 1) as u32,
                         pitch,
                         start_time: segment_start,
                         end_time: t,
@@ -662,6 +690,7 @@ fn extract_melody_events(notes: &[NoteEvent]) -> Vec<NoteEvent> {
             let ev = events[i];
             if ev.is_start {
                 active.push(NoteEvent {
+                    id: (active.len() + 1) as u32,
                     pitch: ev.pitch,
                     start_time: t,
                     end_time: t,
@@ -746,6 +775,7 @@ mod tests {
         for i in 0..16 {
             let t = i as f32 * 0.5;
             notes.push(NoteEvent {
+                id: (i + 1) as u32,
                 pitch: 60,
                 start_time: t,
                 end_time: t + 0.2,
@@ -769,6 +799,7 @@ mod tests {
     fn melody_quantization_keeps_shorter_values() {
         let notes = vec![
             NoteEvent {
+                id: 1,
                 pitch: 72,
                 start_time: 0.0,
                 end_time: 0.24,
@@ -776,6 +807,7 @@ mod tests {
                 channel: None,
             },
             NoteEvent {
+                id: 2,
                 pitch: 74,
                 start_time: 0.26,
                 end_time: 0.48,
@@ -783,6 +815,7 @@ mod tests {
                 channel: None,
             },
             NoteEvent {
+                id: 3,
                 pitch: 76,
                 start_time: 0.50,
                 end_time: 0.98,
@@ -790,6 +823,7 @@ mod tests {
                 channel: None,
             },
             NoteEvent {
+                id: 4,
                 pitch: 77,
                 start_time: 1.00,
                 end_time: 1.24,
@@ -797,6 +831,7 @@ mod tests {
                 channel: None,
             },
             NoteEvent {
+                id: 5,
                 pitch: 79,
                 start_time: 1.26,
                 end_time: 1.98,

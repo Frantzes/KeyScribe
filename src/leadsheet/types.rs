@@ -3,6 +3,7 @@ use serde::{Deserialize, Serialize};
 /// Beat-note association: how a note relates to its surrounding beats.
 #[derive(Debug, Clone, PartialEq)]
 pub struct BeatAlignedNote {
+    pub id: u32,
     pub pitch: u8,
     pub velocity: u8,
     pub channel: Option<u8>,
@@ -107,6 +108,8 @@ impl RhythmMap {
 /// Core note-event contract from inference/output layers.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct NoteEvent {
+    /// Unique identifier to track note through quantization and engraving.
+    pub id: u32,
     /// MIDI note number (0-127).
     pub pitch: u8,
     /// Note start time in seconds from track start.
@@ -128,6 +131,7 @@ impl NoteEvent {
 /// Stage-2 output after beat-grid quantization.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct QuantizedNote {
+    pub id: u32,
     pub pitch: u8,
     pub beat_start: f32,
     pub beat_duration: f32,
@@ -151,6 +155,7 @@ pub struct QuantizedNote {
 impl Default for QuantizedNote {
     fn default() -> Self {
         Self {
+            id: 0,
             pitch: 60,
             beat_start: 0.0,
             beat_duration: 1.0,

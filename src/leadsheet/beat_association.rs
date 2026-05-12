@@ -80,21 +80,23 @@ pub fn associate_notes_to_beat_grid(
             beats_per_bar,
             bar_shift,
         );
-        let structural_beat_index = bar_index * beats_per_bar + beat_offset_in_bar;
+        let _structural_beat_index = bar_index * beats_per_bar + beat_offset_in_bar;
 
         aligned.push(BeatAlignedNote {
+            id: i as u32,
             pitch,
             velocity,
             channel: None,
             original_start_time: onset,
             original_end_time: end,
-            beat_index: structural_beat_index,
+            beat_index: raw_beat_index,
             bar_index,
             intra_beat_pos,
             prev_beat_time: prev_beat,
             next_beat_time: next_beat,
             beat_duration_sec,
         });
+
     }
 
     aligned

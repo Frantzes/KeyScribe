@@ -8,6 +8,8 @@ pub struct ChordAnalysisConfig {
     pub step_beats: f32,
     pub min_active_notes: usize,
     pub skip: bool,
+    pub max_chords_per_bar: usize,
+    pub chord_min_simultaneous: usize,
 }
 
 impl Default for ChordAnalysisConfig {
@@ -16,6 +18,8 @@ impl Default for ChordAnalysisConfig {
             step_beats: 1.0,
             min_active_notes: 2,
             skip: false,
+            max_chords_per_bar: 2,
+            chord_min_simultaneous: 3,
         }
     }
 }
@@ -76,6 +80,197 @@ pub fn detect_chord_changes(
     out
 }
 
+/// Detect chord changes using per-bar analysis.
+/// Scans each bar at a fine resolution to find the moment with the most simultaneous
+/// notes, then aligns the resulting chord to the downbeat. Emits at most
+/// `max_chords_per_bar` chords per bar. Favors positions with 3+ simultaneous notes
+/// and longer note durations. Only places off-beat chords when the harmony is very
+/// clearly rooted at an off-beat position.
+pub fn detect_chord_changes_per_bar(
+    quantized_notes: &[QuantizedNote],
+    beats_per_bar: u32,
+    config: ChordAnalysisConfig,
+) -> Vec<ChordSymbolChange> {
+    if config.skip || quantized_notes.is_empty() {
+        return Vec::new();
+    }
+
+    let bpb = beats_per_bar.max(2) as f32;
+    let max_chords = config.max_chords_per_bar.max(1);
+    let min_simultaneous = config.chord_min_simultaneous.max(1);
+    let scan_step = 0.25;
+
+    let max_beat = quantized_notes
+        .iter()
+        .map(|n| n.beat_start + n.beat_duration)
+        .fold(0.0f32, f32::max);
+    let num_bars = (max_beat / bpb).ceil() as u32;
+
+    let mut out = Vec::new();
+    let mut last_symbol = String::new();
+
+    for bar_idx in 0..num_bars {
+        let bar_start = bar_idx as f32 * bpb;
+        let bar_end = bar_start + bpb;
+        let half_bar = bar_start + bpb * 0.5;
+
+        let bar_notes: Vec<&QuantizedNote> = quantized_notes
+            .iter()
+            .filter(|n| n.beat_start < bar_end && n.beat_start + n.beat_duration > bar_start)
+            .collect();
+
+        if bar_notes.is_empty() {
+            continue;
+        }
+
+        struct Candidate {
+            pos: f32,
+            pcs: Vec<u8>,
+            bass_pitch: Option<u8>,
+            num_pcs: usize,
+            score: f32,
+        }
+
+        fn collect_at(notes: &[&QuantizedNote], pos: f32) -> (BTreeSet<u8>, Option<u8>, f32, usize) {
+            let mut pcs_set = BTreeSet::<u8>::new();
+            let mut bass_pitch: Option<u8> = None;
+            let mut total_duration = 0.0f32;
+            let mut active_count = 0;
+            for note in notes {
+                let note_end = note.beat_start + note.beat_duration;
+                if pos + 1e-5 < note.beat_start || pos >= note_end {
+                    continue;
+                }
+                pcs_set.insert(note.pitch % 12);
+                bass_pitch = Some(match bass_pitch {
+                    Some(existing) => existing.min(note.pitch),
+                    None => note.pitch,
+                });
+                total_duration += note.beat_duration;
+                active_count += 1;
+            }
+            (pcs_set, bass_pitch, total_duration, active_count)
+        }
+
+        // Scan first half of bar at fine resolution
+        let mut best_first: Option<Candidate> = None;
+        let mut pos = bar_start;
+        while pos < half_bar - 1e-5 {
+            let (pcs_set, bass_pitch, total_dur, active) = collect_at(&bar_notes, pos);
+            let num_pcs = pcs_set.len();
+            if num_pcs >= 1 {
+                let score = num_pcs as f32 * 5.0 + total_dur * 2.0 + active as f32;
+                let is_better = match &best_first {
+                    Some(b) => num_pcs > b.num_pcs || (num_pcs == b.num_pcs && score > b.score),
+                    None => true,
+                };
+                if is_better {
+                    best_first = Some(Candidate {
+                        pos,
+                        pcs: pcs_set.iter().copied().collect(),
+                        bass_pitch,
+                        num_pcs,
+                        score,
+                    });
+                }
+            }
+            pos += scan_step;
+        }
+
+        // Scan second half of bar at fine resolution
+        let mut best_second: Option<Candidate> = None;
+        pos = half_bar;
+        while pos < bar_end - 1e-5 {
+            let (pcs_set, bass_pitch, total_dur, active) = collect_at(&bar_notes, pos);
+            let num_pcs = pcs_set.len();
+            if num_pcs >= 1 {
+                let score = num_pcs as f32 * 5.0 + total_dur * 2.0 + active as f32;
+                let is_better = match &best_second {
+                    Some(b) => num_pcs > b.num_pcs || (num_pcs == b.num_pcs && score > b.score),
+                    None => true,
+                };
+                if is_better {
+                    best_second = Some(Candidate {
+                        pos,
+                        pcs: pcs_set.iter().copied().collect(),
+                        bass_pitch,
+                        num_pcs,
+                        score,
+                    });
+                }
+            }
+            pos += scan_step;
+        }
+
+        // Helper: emit a chord if symbol changed, return true if emitted
+        let mut chords_added = 0;
+
+        // Decide where to place the chord: snap to downbeat unless clearly off-beat
+        let mut try_emit = |cand: &Candidate, default_placement: f32, min_pcs: usize| -> bool {
+            if cand.num_pcs < min_pcs {
+                return false;
+            }
+            if let Some(symbol) = choose_chord_symbol(&cand.pcs, cand.bass_pitch) {
+                if symbol == last_symbol {
+                    return false;
+                }
+                // Snap to nearest beat unless the chord is clearly off-beat
+                // (off-beat defined as > 0.3 beats from any beat boundary)
+                let min_dist = (cand.pos - bar_start).abs().min((cand.pos - half_bar).abs());
+                let placement = if min_dist > 0.3 && cand.num_pcs >= min_simultaneous {
+                    // Very clear off-beat: place at actual position
+                    cand.pos
+                } else {
+                    default_placement
+                };
+                out.push(ChordSymbolChange {
+                    beat_start: placement,
+                    symbol: symbol.clone(),
+                });
+                last_symbol = symbol;
+                true
+            } else {
+                false
+            }
+        };
+
+        // Try primary chord from first half, placed at downbeat
+        if let Some(ref best) = best_first {
+            if try_emit(best, bar_start, min_simultaneous) {
+                chords_added += 1;
+            }
+        }
+
+        // Try secondary chord from second half, placed at half-bar
+        if chords_added < max_chords {
+            if let Some(ref best) = best_second {
+                if try_emit(best, half_bar, min_simultaneous) {
+                    chords_added += 1;
+                }
+            }
+        }
+
+        // Fallback: no chord scored well enough — try downbeat with min_active_notes threshold
+        if chords_added == 0 {
+            let (pcs_set, bass_pitch, _, _) = collect_at(&bar_notes, bar_start);
+            if pcs_set.len() >= config.min_active_notes {
+                let pcs: Vec<u8> = pcs_set.iter().copied().collect();
+                if let Some(symbol) = choose_chord_symbol(&pcs, bass_pitch) {
+                    if symbol != last_symbol {
+                        out.push(ChordSymbolChange {
+                            beat_start: bar_start,
+                            symbol: symbol.clone(),
+                        });
+                        last_symbol = symbol;
+                    }
+                }
+            }
+        }
+    }
+
+    out
+}
+
 pub fn detect_chord_from_active_notes(active_midi: &[u8]) -> Option<String> {
     if active_midi.len() < 2 {
         return None;
@@ -121,9 +316,17 @@ fn best_template_for_root<'a>(
     let mut best_score = i32::MIN;
     for (suffix, intervals) in templates {
         if let Some((score, covered)) = score_template(pcs, root, intervals) {
-            if score > best_score {
-                best_score = score;
-                best = Some((*suffix, score, covered));
+            // Prefer simpler chords (fewer extensions) when scores are close.
+            // Simplicity bonus: triads get +1, 7th chords 0, extended chords negative.
+            let simplicity = match intervals.len() {
+                3 => 1,
+                4 => 0,
+                _ => -(intervals.len() as i32 - 4),
+            };
+            let adjusted = score + simplicity;
+            if adjusted > best_score {
+                best_score = adjusted;
+                best = Some((*suffix, adjusted, covered));
             }
         }
     }
@@ -221,18 +424,6 @@ pub(crate) fn choose_chord_symbol(pcs: &[u8], bass_pitch: Option<u8>) -> Option<
         }
     }
 
-    // Alternative: chord rooted on the bass note
-    if let Some(bass) = bass_pc {
-        if let Some((alt_suffix, alt_score, _)) = best_template_for_root(pcs, bass, &TEMPLATES) {
-            let threshold = (best_score as f32 * 0.75).ceil() as i32;
-            let is_different = alt_suffix != best_suffix || bass != best_root;
-            if alt_score >= threshold && is_different {
-                let alt = format!("{}{}", pitch_class_name_flat(bass), alt_suffix);
-                chord = format!("{} or {}", alt, chord);
-            }
-        }
-    }
-
     Some(chord)
 }
 
@@ -296,6 +487,169 @@ fn pitch_class_name_bass(bass_pc: u8, root_pc: u8) -> &'static str {
     }
 }
 
+fn midi_pitch_name(pitch: u8) -> String {
+    const NOTES: &[&str] = &["C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B"];
+    let octave = (pitch / 12).saturating_sub(1);
+    let note = NOTES[(pitch % 12) as usize];
+    format!("{}{}", note, octave)
+}
+
+/// Writes `chord_debug.json` with per-bar chord details: candidate positions,
+/// pitch classes, and all notes that contributed to each chord.
+pub fn debug_chord_notes_to_json(
+    quantized_notes: &[QuantizedNote],
+    beats_per_bar: u32,
+    config: ChordAnalysisConfig,
+) {
+    if quantized_notes.is_empty() {
+        return;
+    }
+
+    let bpb = beats_per_bar.max(2) as f32;
+    let min_simultaneous = config.chord_min_simultaneous.max(1);
+    let scan_step = 0.25;
+
+    let max_beat = quantized_notes
+        .iter()
+        .map(|n| n.beat_start + n.beat_duration)
+        .fold(0.0f32, f32::max);
+    let num_bars = (max_beat / bpb).ceil() as u32;
+
+    let mut bars_json = Vec::new();
+
+    for bar_idx in 0..num_bars {
+        let bar_start = bar_idx as f32 * bpb;
+        let bar_end = bar_start + bpb;
+        let half_bar = bar_start + bpb * 0.5;
+
+        let bar_notes: Vec<&QuantizedNote> = quantized_notes
+            .iter()
+            .filter(|n| n.beat_start < bar_end && n.beat_start + n.beat_duration > bar_start)
+            .collect();
+
+        if bar_notes.is_empty() {
+            continue;
+        }
+
+        let notes_at = |pos: f32| -> Vec<&QuantizedNote> {
+            bar_notes
+                .iter()
+                .filter(|n| {
+                    let ne = n.beat_start + n.beat_duration;
+                    pos + 1e-5 >= n.beat_start && pos < ne
+                })
+                .copied()
+                .collect()
+        };
+
+        fn scan_half(notes: &[&QuantizedNote], start: f32, end: f32, step: f32) -> (f32, Vec<u8>, f32) {
+            let mut best_pos = start;
+            let mut best_pcs = Vec::new();
+            let mut best_score = -1.0f32;
+            let mut p = start;
+            while p < end - 1e-5 {
+                let active: Vec<&QuantizedNote> = notes
+                    .iter()
+                    .filter(|n| {
+                        let ne = n.beat_start + n.beat_duration;
+                        p + 1e-5 >= n.beat_start && p < ne
+                    })
+                    .copied()
+                    .collect();
+                let mut pcs: Vec<u8> = active.iter().map(|n| n.pitch % 12).collect();
+                pcs.sort();
+                pcs.dedup();
+                let count = pcs.len();
+                if count >= 1 {
+                    let td: f32 = active.iter().map(|n| n.beat_duration).sum();
+                    let score = count as f32 * 5.0 + td * 2.0 + active.len() as f32;
+                    if score > best_score {
+                        best_score = score;
+                        best_pos = p;
+                        best_pcs = pcs;
+                    }
+                }
+                p += step;
+            }
+            (best_pos, best_pcs, best_score)
+        }
+
+        let (first_pos, first_pcs, _) = scan_half(&bar_notes, bar_start, half_bar, scan_step);
+        let (second_pos, second_pcs, _) = scan_half(&bar_notes, half_bar, bar_end, scan_step);
+
+        let mut chords_json = Vec::new();
+
+        fn chord_entry(pos: f32, pcs: &[u8], label: &str, placement: f32, notes: &[&QuantizedNote]) -> serde_json::Value {
+            let bp = notes.iter().map(|n| n.pitch).min();
+            let symbol = choose_chord_symbol(pcs, bp);
+            serde_json::json!({
+                "type": label,
+                "symbol": symbol,
+                "placed_at": placement,
+                "found_at": pos,
+                "num_pitch_classes": pcs.len(),
+                "pitch_classes": pcs,
+                "notes": notes.iter().map(|n| serde_json::json!({
+                    "id": n.id,
+                    "pitch": n.pitch,
+                    "pitch_class": n.pitch % 12,
+                    "midi_name": midi_pitch_name(n.pitch),
+                    "beat_start": n.beat_start,
+                    "beat_duration": n.beat_duration,
+                    "velocity": n.velocity,
+                    "bar_index": n.bar_index,
+                    "beat_index": n.beat_index,
+                })).collect::<Vec<_>>(),
+            })
+        }
+
+        // Primary chord from first half
+        if first_pcs.len() >= min_simultaneous {
+            let md = (first_pos - bar_start).abs().min((first_pos - half_bar).abs());
+            let place = if md > 0.3 && first_pcs.len() >= min_simultaneous { first_pos } else { bar_start };
+            let ns = notes_at(first_pos);
+            chords_json.push(chord_entry(first_pos, &first_pcs, "primary", place, &ns));
+        }
+
+        // Secondary chord from second half
+        if chords_json.len() < config.max_chords_per_bar && second_pcs.len() >= min_simultaneous {
+            let md = (second_pos - bar_start).abs().min((second_pos - half_bar).abs());
+            let place = if md > 0.3 && second_pcs.len() >= min_simultaneous { second_pos } else { half_bar };
+            let ns = notes_at(second_pos);
+            chords_json.push(chord_entry(second_pos, &second_pcs, "secondary", place, &ns));
+        }
+
+        // Fallback: downbeat
+        if chords_json.is_empty() {
+            let ns = notes_at(bar_start);
+            if ns.len() >= config.min_active_notes {
+                let mut pcs: Vec<u8> = ns.iter().map(|n| n.pitch % 12).collect();
+                pcs.sort();
+                pcs.dedup();
+                chords_json.push(chord_entry(bar_start, &pcs, "fallback", bar_start, &ns));
+            }
+        }
+
+        bars_json.push(serde_json::json!({
+            "bar": bar_idx,
+            "beat_start": bar_start,
+            "beat_end": bar_end,
+            "total_notes_in_bar": bar_notes.len(),
+            "chords": chords_json,
+        }));
+    }
+
+    let debug = serde_json::json!({
+        "beats_per_bar": beats_per_bar,
+        "chord_min_simultaneous": min_simultaneous,
+        "bars": bars_json,
+    });
+
+    if let Ok(json_str) = serde_json::to_string_pretty(&debug) {
+        let _ = std::fs::write("chord_debug.json", json_str);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -304,6 +658,7 @@ mod tests {
     fn detects_chord_progression() {
         let notes = vec![
             QuantizedNote {
+                id: 1,
                 pitch: 60,
                 beat_start: 0.0,
                 beat_duration: 2.0,
@@ -318,6 +673,7 @@ mod tests {
                 swing_feel: false,
             },
             QuantizedNote {
+                id: 2,
                 pitch: 64,
                 beat_start: 0.0,
                 beat_duration: 2.0,
@@ -332,6 +688,7 @@ mod tests {
                 swing_feel: false,
             },
             QuantizedNote {
+                id: 3,
                 pitch: 67,
                 beat_start: 0.0,
                 beat_duration: 2.0,
@@ -346,6 +703,7 @@ mod tests {
                 swing_feel: false,
             },
             QuantizedNote {
+                id: 4,
                 pitch: 62,
                 beat_start: 2.0,
                 beat_duration: 2.0,
@@ -360,6 +718,7 @@ mod tests {
                 swing_feel: false,
             },
             QuantizedNote {
+                id: 5,
                 pitch: 65,
                 beat_start: 2.0,
                 beat_duration: 2.0,
@@ -374,6 +733,7 @@ mod tests {
                 swing_feel: false,
             },
             QuantizedNote {
+                id: 6,
                 pitch: 69,
                 beat_start: 2.0,
                 beat_duration: 2.0,

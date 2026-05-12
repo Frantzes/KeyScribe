@@ -191,6 +191,34 @@ pub fn beat_at_time(time_sec: f32, tempo_map: &[TempoSegment]) -> f32 {
     0.0
 }
 
+pub fn time_at_beat(beat: f32, tempo_map: &[TempoSegment]) -> f32 {
+    if tempo_map.is_empty() {
+        return 0.0;
+    }
+
+    let target = beat;
+    for segment in tempo_map {
+        let seg_beats =
+            (segment.end_time_sec - segment.start_time_sec) / segment.beat_duration_sec.max(1.0e-3);
+        let seg_start = segment.beat_offset;
+        let seg_end = seg_start + seg_beats;
+        if target >= seg_start && target <= seg_end {
+            return segment.start_time_sec + (target - seg_start) * segment.beat_duration_sec;
+        }
+    }
+
+    if let Some(last) = tempo_map.last() {
+        let seg_beats =
+            (last.end_time_sec - last.start_time_sec) / last.beat_duration_sec.max(1.0e-3);
+        let seg_start = last.beat_offset;
+        let seg_end = seg_start + seg_beats;
+        let clamped = target.max(seg_start).min(seg_end);
+        return last.start_time_sec + (clamped - seg_start) * last.beat_duration_sec;
+    }
+
+    0.0
+}
+
 fn median_value(values: &mut [f32]) -> f32 {
     values.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
     let mid = values.len() / 2;
@@ -312,7 +340,8 @@ fn infer_signature_for_tempo_segment(
     let segment_notes: Vec<&NoteEvent> = notes
         .iter()
         .filter(|n| {
-            n.start_time >= tempo_segment.start_time_sec && n.start_time < tempo_segment.end_time_sec
+            n.start_time >= tempo_segment.start_time_sec
+                && n.start_time < tempo_segment.end_time_sec
         })
         .collect();
 
@@ -504,7 +533,11 @@ fn samples_to_segments(
         }
     }
 
-    segments.push(build_segment(current_start, duration_sec.max(current_start + 0.001), current_bpm));
+    segments.push(build_segment(
+        current_start,
+        duration_sec.max(current_start + 0.001),
+        current_bpm,
+    ));
 
     merge_short_segments(segments.as_mut_slice(), map_config.min_segment_sec);
     segments
@@ -577,6 +610,7 @@ mod tests {
         for i in 0..16 {
             let t = i as f32 * 0.5;
             out.push(NoteEvent {
+                id: (out.len() + 1) as u32,
                 pitch: 64,
                 start_time: t,
                 end_time: t + 0.15,
@@ -588,6 +622,7 @@ mod tests {
         for i in 0..16 {
             let t = base + i as f32 * 0.4;
             out.push(NoteEvent {
+                id: (out.len() + 1) as u32,
                 pitch: 67,
                 start_time: t,
                 end_time: t + 0.12,
@@ -641,6 +676,7 @@ mod tests {
         for i in 0..12 {
             let t = i as f32 * 1.5;
             notes.push(NoteEvent {
+                id: (notes.len() + 1) as u32,
                 pitch: 64,
                 start_time: t,
                 end_time: t + 0.15,
@@ -667,8 +703,7 @@ mod tests {
         );
         assert!(!signatures.is_empty());
         assert!(signatures.iter().any(|s| {
-            (s.numerator == 3 && s.denominator == 4)
-                || (s.numerator == 6 && s.denominator == 8)
+            (s.numerator == 3 && s.denominator == 4) || (s.numerator == 6 && s.denominator == 8)
         }));
     }
 }

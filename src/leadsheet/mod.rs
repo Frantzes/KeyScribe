@@ -19,7 +19,7 @@ pub use beat_tracking::{
     BeatTrackResult, CrossValidatedBeats,
 };
 pub use bpm::{detect_bpm, BpmDetectionConfig, TempoEstimate};
-pub use chord::{detect_chord_changes, ChordAnalysisConfig};
+pub use chord::{debug_chord_notes_to_json, detect_chord_changes, detect_chord_changes_per_bar, ChordAnalysisConfig};
 pub use instrument_separation::{
     blend_for_chords, blend_interleaved_stems, extract_melodic_audio, InstrumentSeparator,
     SeparatedStem, SeparationConfig, StemType,

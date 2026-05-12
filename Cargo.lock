@@ -2550,6 +2550,7 @@ dependencies = [
  "egui_plot",
  "ico",
  "image 0.25.10",
+ "musicxml",
  "ndarray 0.16.1",
  "ndarray-stats",
  "ort",
@@ -2815,6 +2816,36 @@ checksum = "bb85c154ba489f01b25c0d36ae69a87e4a1c73a72631fc6c0eb6dde34a73e44b"
 dependencies = [
  "num-traits",
  "pxfm",
+]
+
+[[package]]
+name = "musicxml"
+version = "1.1.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "335bf6a8b110bc88d0bf2ba66d31e2d508816430c5cdd566b70505735965b866"
+dependencies = [
+ "crc32fast",
+ "miniz_oxide",
+ "musicxml_internal",
+ "musicxml_macros",
+ "regex",
+]
+
+[[package]]
+name = "musicxml_internal"
+version = "1.1.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5e4097e51ea86c37057b75bbe8ba98080ea6474387f7bafcd6a0d2fe464b1252"
+
+[[package]]
+name = "musicxml_macros"
+version = "1.1.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6b191126817b79753855d079efa1edde8df37223073e7119de466e33eea83005"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 2.0.117",
 ]
 
 [[package]]

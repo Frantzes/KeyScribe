@@ -167,8 +167,23 @@ fn fold_multichannel_frame_to_stereo(frame: &[f32]) -> (f32, f32) {
     (left, right)
 }
 
-#[allow(dead_code)]
-pub fn load_audio_file(path: &Path) -> Result<AudioData> {
+struct OpenedAudio {
+    format: Box<dyn symphonia::core::formats::FormatReader>,
+    decoder: Box<dyn symphonia::core::codecs::Decoder>,
+    metadata: AudioMetadata,
+    track_id: u32,
+    _temp_path: Option<std::path::PathBuf>,
+}
+
+impl Drop for OpenedAudio {
+    fn drop(&mut self) {
+        if let Some(path) = &self._temp_path {
+            let _ = std::fs::remove_file(path);
+        }
+    }
+}
+
+fn try_open_audio(path: &Path) -> Result<OpenedAudio> {
     let file = File::open(path).with_context(|| format!("Cannot open file: {}", path.display()))?;
     let mss = MediaSourceStream::new(Box::new(file), Default::default());
 
@@ -181,17 +196,80 @@ pub fn load_audio_file(path: &Path) -> Result<AudioData> {
         )
         .context("Failed to probe audio format")?;
 
-    let mut metadata = extract_audio_metadata(&mut probed);
+    let metadata = extract_audio_metadata(&mut probed);
 
-    let format = &mut probed.format;
+    let mut format = probed.format;
     let track = format
         .default_track()
         .context("No default audio track found")?;
+    let track_id = track.id;
 
-    let mut decoder = get_codecs()
+    let decoder = get_codecs()
         .make(&track.codec_params, &DecoderOptions::default())
         .context("Failed to create decoder")?;
 
+    Ok(OpenedAudio {
+        format,
+        decoder,
+        metadata,
+        track_id,
+        _temp_path: None,
+    })
+}
+
+fn open_audio_with_fallback(path: &Path) -> Result<OpenedAudio> {
+    match try_open_audio(path) {
+        Ok(opened) => Ok(opened),
+        Err(err) => {
+            let temp_dir = std::env::temp_dir();
+            let nanos = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos();
+            let temp_file = temp_dir.join(format!("keyscribe_fallback_{}.flac", nanos));
+
+            let output = std::process::Command::new("ffmpeg")
+                .args([
+                    "-y",
+                    "-i",
+                    &path.to_string_lossy(),
+                    "-c:a",
+                    "flac",
+                    &temp_file.to_string_lossy(),
+                ])
+                .output();
+
+            match output {
+                Ok(out) if out.status.success() => {
+                    let mut opened = try_open_audio(&temp_file)
+                        .context("FFmpeg fallback decoded file, but Symphonia still failed")?;
+                    opened._temp_path = Some(temp_file);
+                    Ok(opened)
+                }
+                Ok(out) => {
+                    anyhow::bail!(
+                        "Symphonia failed: {}. FFmpeg fallback also failed: {}",
+                        err,
+                        String::from_utf8_lossy(&out.stderr)
+                    );
+                }
+                Err(ffmpeg_err) => {
+                    anyhow::bail!(
+                        "Symphonia failed: {}. FFmpeg not available or failed to execute: {}",
+                        err,
+                        ffmpeg_err
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[allow(dead_code)]
+pub fn load_audio_file(path: &Path) -> Result<AudioData> {
+    let mut opened = open_audio_with_fallback(path)?;
+
+    let track = opened.format.tracks().iter().find(|t| t.id == opened.track_id).context("Track not found")?;
     let sample_rate = track
         .codec_params
         .sample_rate
@@ -202,11 +280,11 @@ pub fn load_audio_file(path: &Path) -> Result<AudioData> {
     let mut playback_channels = 1u16;
 
     loop {
-        if let Some(revision) = format.metadata().skip_to_latest() {
-            apply_metadata_revision(&mut metadata, revision);
+        if let Some(revision) = opened.format.metadata().skip_to_latest() {
+            apply_metadata_revision(&mut opened.metadata, revision);
         }
 
-        let packet = match format.next_packet() {
+        let packet = match opened.format.next_packet() {
             Ok(packet) => packet,
             Err(SymphoniaError::IoError(_)) => break,
             Err(SymphoniaError::ResetRequired) => {
@@ -217,7 +295,7 @@ pub fn load_audio_file(path: &Path) -> Result<AudioData> {
             Err(err) => return Err(anyhow::anyhow!("Packet read error: {err}")),
         };
 
-        let decoded = match decoder.decode(&packet) {
+        let decoded = match opened.decoder.decode(&packet) {
             Ok(decoded) => decoded,
             Err(SymphoniaError::DecodeError(_)) => continue,
             Err(err) => return Err(anyhow::anyhow!("Decode error: {err}")),
@@ -259,7 +337,7 @@ pub fn load_audio_file(path: &Path) -> Result<AudioData> {
         channels: playback_channels,
         samples_interleaved: Arc::new(playback_samples),
         samples_mono: Arc::new(mono_samples),
-        metadata,
+        metadata: opened.metadata.clone(),
     })
 }
 
@@ -269,29 +347,9 @@ pub fn load_audio_file_streaming(
     cancel_flag: Arc<AtomicBool>,
     tx: Sender<StreamingAudioEvent>,
 ) -> Result<()> {
-    let file = File::open(path).with_context(|| format!("Cannot open file: {}", path.display()))?;
-    let mss = MediaSourceStream::new(Box::new(file), Default::default());
+    let mut opened = open_audio_with_fallback(path)?;
 
-    let mut probed = get_probe()
-        .format(
-            &Default::default(),
-            mss,
-            &FormatOptions::default(),
-            &MetadataOptions::default(),
-        )
-        .context("Failed to probe audio format")?;
-
-    let mut metadata = extract_audio_metadata(&mut probed);
-
-    let format = &mut probed.format;
-    let track = format
-        .default_track()
-        .context("No default audio track found")?;
-
-    let mut decoder = get_codecs()
-        .make(&track.codec_params, &DecoderOptions::default())
-        .context("Failed to create decoder")?;
-
+    let track = opened.format.tracks().iter().find(|t| t.id == opened.track_id).context("Track not found")?;
     let sample_rate = track
         .codec_params
         .sample_rate
@@ -313,7 +371,7 @@ pub fn load_audio_file_streaming(
             sample_rate,
             total_samples,
             channels: playback_channels,
-            metadata: metadata.clone(),
+            metadata: opened.metadata.clone(),
         })
         .is_err()
     {
@@ -332,11 +390,11 @@ pub fn load_audio_file_streaming(
             return Ok(());
         }
 
-        if let Some(revision) = format.metadata().skip_to_latest() {
-            apply_metadata_revision(&mut metadata, revision);
+        if let Some(revision) = opened.format.metadata().skip_to_latest() {
+            apply_metadata_revision(&mut opened.metadata, revision);
         }
 
-        let packet = match format.next_packet() {
+        let packet = match opened.format.next_packet() {
             Ok(packet) => packet,
             Err(SymphoniaError::IoError(_)) => break,
             Err(SymphoniaError::ResetRequired) => {
@@ -347,7 +405,7 @@ pub fn load_audio_file_streaming(
             Err(err) => return Err(anyhow::anyhow!("Packet read error: {err}")),
         };
 
-        let decoded = match decoder.decode(&packet) {
+        let decoded = match opened.decoder.decode(&packet) {
             Ok(decoded) => decoded,
             Err(SymphoniaError::DecodeError(_)) => continue,
             Err(err) => return Err(anyhow::anyhow!("Decode error: {err}")),
@@ -424,7 +482,7 @@ pub fn load_audio_file_streaming(
         channels: playback_channels,
         decoded_samples,
         total_samples,
-        metadata,
+        metadata: opened.metadata.clone(),
     });
 
     Ok(())
@@ -435,39 +493,21 @@ pub fn load_audio_preview_chunk(
     start_sec: f32,
     duration_sec: f32,
 ) -> Result<AudioPreviewChunk> {
-    let file = File::open(path).with_context(|| format!("Cannot open file: {}", path.display()))?;
-    let mss = MediaSourceStream::new(Box::new(file), Default::default());
+    let mut opened = open_audio_with_fallback(path)?;
 
-    let mut probed = get_probe()
-        .format(
-            &Default::default(),
-            mss,
-            &FormatOptions::default(),
-            &MetadataOptions::default(),
-        )
-        .context("Failed to probe audio format")?;
-
-    let format = &mut probed.format;
-    let (track_id, codec_params) = {
-        let track = format
-            .default_track()
-            .context("No default audio track found")?;
-        (track.id, track.codec_params.clone())
-    };
-
-    let mut decoder = get_codecs()
-        .make(&codec_params, &DecoderOptions::default())
-        .context("Failed to create decoder")?;
-
-    let sample_rate = codec_params
+    let track = opened.format.tracks().iter().find(|t| t.id == opened.track_id).context("Track not found")?;
+    let sample_rate = track
+        .codec_params
         .sample_rate
         .context("Missing sample rate in codec params")?;
-    let source_channels = codec_params
+    let source_channels = track
+        .codec_params
         .channels
         .map(|channels| channels.count())
         .unwrap_or(1)
         .max(1);
     let playback_channels = normalize_playback_channels(source_channels);
+    let track_id = opened.track_id;
 
     let duration_sec = duration_sec.clamp(0.25, 30.0);
     let target_frames = (duration_sec * sample_rate as f32).ceil().max(1.0) as usize;
@@ -481,14 +521,14 @@ pub fn load_audio_preview_chunk(
             track_id: Some(track_id),
         };
 
-        let _ = format.seek(SeekMode::Accurate, seek_target);
+        let _ = opened.format.seek(SeekMode::Accurate, seek_target);
     }
 
     let mut out = Vec::<f32>::with_capacity(target_frames * playback_channels as usize);
     let mut decoded_frames = 0usize;
 
     while decoded_frames < target_frames {
-        let packet = match format.next_packet() {
+        let packet = match opened.format.next_packet() {
             Ok(packet) => packet,
             Err(SymphoniaError::IoError(_)) => break,
             Err(SymphoniaError::ResetRequired) => {
@@ -503,7 +543,7 @@ pub fn load_audio_preview_chunk(
             continue;
         }
 
-        let decoded = match decoder.decode(&packet) {
+        let decoded = match opened.decoder.decode(&packet) {
             Ok(decoded) => decoded,
             Err(SymphoniaError::DecodeError(_)) => continue,
             Err(err) => return Err(anyhow::anyhow!("Decode error: {err}")),

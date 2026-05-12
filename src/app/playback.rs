@@ -180,59 +180,86 @@ impl KeyScribeApp {
         ))
     }
 
-    pub(super) fn listening_stem_audio(&self) -> Option<(Arc<Vec<f32>>, u16, u32)> {
+    /// Get stem playback source for the current listen selection and speed/pitch.
+    /// Caches the blended mix and optional speed/pitch transform to avoid per-seek DSP.
+    fn stem_playback_source(&mut self) -> Option<(Arc<Vec<f32>>, u16, u32)> {
         let stems = self.separated_stems.as_ref()?;
         if stems.is_empty() {
             return None;
         }
+        let sample_rate = stems.first().map(|s| s.sample_rate)?;
+        let speed = self.speed.clamp(0.25, 4.0);
 
-        let stem_sample_rate = stems.first().map(|stem| stem.sample_rate)?;
+        let current_key: Vec<usize> = self.enabled_listening_indices.iter().copied().collect();
 
-        let enabled_indices: Vec<usize> = self.enabled_listening_indices.iter().copied().collect();
-        let enabled_stems: Vec<_> = enabled_indices
-            .into_iter()
-            .filter_map(|idx| stems.get(idx).cloned())
-            .collect();
+        // Rebuild cache if stale
+        let rebuild = match &self.stem_playback_cache {
+            Some(cache) => cache.listening_key != current_key || cache.sample_rate != sample_rate,
+            None => true,
+        };
+        if rebuild {
+            let (blended, channels) = if current_key.is_empty() {
+                crate::leadsheet::blend_interleaved_stems(stems.as_slice())
+            } else if current_key.len() == 1 {
+                if let Some(s) = current_key.first().and_then(|idx| stems.get(*idx)) {
+                    (Arc::clone(&s.samples_interleaved), s.channels)
+                } else {
+                    crate::leadsheet::blend_interleaved_stems(stems.as_slice())
+                }
+            } else {
+                let enabled_stems: Vec<crate::leadsheet::SeparatedStem> = current_key
+                    .iter()
+                    .filter_map(|idx| stems.get(*idx).cloned())
+                    .collect();
+                crate::leadsheet::blend_interleaved_stems(enabled_stems.as_slice())
+            };
 
-        if enabled_stems.is_empty() {
-            // If nothing is selected for listening, blend all available stems
-            // (Standard "Original Mix" behavior)
-            let (samples, channels) = crate::leadsheet::blend_interleaved_stems(stems.as_slice());
-            Some((samples, channels, stem_sample_rate))
-        } else if enabled_stems.len() == 1 {
-            let stem = &enabled_stems[0];
-            Some((
-                Arc::clone(&stem.samples_interleaved),
-                stem.channels,
-                stem.sample_rate,
-            ))
-        } else {
-            let (samples, channels) =
-                crate::leadsheet::blend_interleaved_stems(enabled_stems.as_slice());
-            Some((samples, channels, stem_sample_rate))
-        }
-    }
-
-    pub(super) fn active_stem_audio(&self) -> Option<(Arc<Vec<f32>>, u16, u32)> {
-        self.listening_stem_audio()
-    }
-
-    /// Get speed/pitch-adjusted stem audio for playback in a single Vec<f32>.
-    /// Applies speed/pitch inline so stem selection toggling is instant.
-    fn stem_audio_with_speed_pitch(&self) -> Option<(Vec<f32>, u16, u32)> {
-        let (audio, channels, sample_rate) = self.active_stem_audio()?;
-        if speed_pitch_is_identity(self.speed, self.pitch_semitones) {
-            Some((audio.as_ref().to_vec(), channels, sample_rate))
-        } else {
-            let processed = apply_speed_and_pitch_interleaved(
-                audio.as_ref(),
+            self.stem_playback_cache = Some(StemPlaybackCache {
+                samples: blended,
+                processed_samples: None,
                 channels,
                 sample_rate,
-                self.speed,
+                listening_key: current_key,
+                processed_speed: 1.0,
+                processed_pitch: 0.0,
+            });
+        }
+
+        let cache = self.stem_playback_cache.as_mut()?;
+        if cache.samples.is_empty() {
+            return None;
+        }
+
+        if speed_pitch_is_identity(speed, self.pitch_semitones) {
+            cache.processed_samples = None;
+            return Some((
+                Arc::clone(&cache.samples),
+                cache.channels,
+                cache.sample_rate,
+            ));
+        }
+
+        let speed_bits = speed.to_bits();
+        let pitch_bits = self.pitch_semitones.to_bits();
+        let needs_processed = cache.processed_samples.is_none()
+            || cache.processed_speed.to_bits() != speed_bits
+            || cache.processed_pitch.to_bits() != pitch_bits;
+
+        if needs_processed {
+            let processed = apply_speed_and_pitch_interleaved(
+                cache.samples.as_slice(),
+                cache.channels,
+                cache.sample_rate,
+                speed,
                 self.pitch_semitones,
             );
-            Some((processed, channels, sample_rate))
+            cache.processed_samples = Some(Arc::new(processed));
+            cache.processed_speed = speed;
+            cache.processed_pitch = self.pitch_semitones;
         }
+
+        let processed = cache.processed_samples.as_ref()?;
+        Some((Arc::clone(processed), cache.channels, cache.sample_rate))
     }
 
     pub(super) fn play_from_selected(&mut self) {
@@ -256,25 +283,41 @@ impl KeyScribeApp {
         };
         let playback_rate = self.playback_rate();
 
-        let (playback_samples, channels, sample_rate) =
-            if let Some((stems_audio, ch, sr)) = self.stem_audio_with_speed_pitch() {
-                (Arc::new(stems_audio), ch, sr)
-            } else {
-                (
-                    Arc::new(self.processed_playback_samples.clone()),
-                    self.processed_playback_channels,
-                    raw.sample_rate,
-                )
-            };
+        // Stem path: reuse cached mix and optional speed/pitch transform
+        if self.separated_stems.is_some() {
+            if let Some((samples, ch, sr)) = self.stem_playback_source() {
+                if let Some(engine) = &mut self.engine {
+                    if let Err(err) = engine.play_arc_range(
+                        samples,
+                        ch,
+                        sr,
+                        self.selected_time_sec,
+                        None,
+                        playback_rate,
+                    ) {
+                        self.last_error = Some(format!("Playback error: {err}"));
+                        self.playing_preview_buffer = false;
+                        self.live_stream_playback = false;
+                    } else {
+                        self.playing_preview_buffer = false;
+                        self.live_stream_playback = self.is_audio_loading;
+                    }
+                } else {
+                    self.last_error = Some("Audio engine unavailable on this machine".to_string());
+                    self.live_stream_playback = false;
+                }
+            }
+            return;
+        }
 
+        // Non-stem path: reference existing data to avoid 100MB+ clone
+        let pos = self.selected_time_sec;
+        let sr = raw.sample_rate;
+        let ch = self.processed_playback_channels;
         if let Some(engine) = &mut self.engine {
-            if let Err(err) = engine.play_from(
-                &playback_samples,
-                channels,
-                sample_rate,
-                self.selected_time_sec,
-                playback_rate,
-            ) {
+            if let Err(err) =
+                engine.play_from(&self.processed_playback_samples, ch, sr, pos, playback_rate)
+            {
                 self.last_error = Some(format!("Playback error: {err}"));
                 self.playing_preview_buffer = false;
                 self.live_stream_playback = false;
@@ -312,7 +355,6 @@ impl KeyScribeApp {
         self.loop_selection = Some((new_start, new_end));
         self.loop_playback_enabled = true;
         self.selected_time_sec = (self.selected_time_sec + delta_sec).clamp(new_start, new_end);
-        self.update_note_probabilities(true);
 
         if self.is_playing() {
             self.play_range(self.selected_time_sec, Some(new_end));
@@ -343,7 +385,6 @@ impl KeyScribeApp {
         } else {
             target.clamp(0.0, duration)
         };
-        self.update_note_probabilities(true);
 
         if self.is_playing() {
             if self.loop_enabled {
@@ -381,22 +422,33 @@ impl KeyScribeApp {
         };
         let playback_rate = self.playback_rate();
 
-        let (playback_samples, channels, sample_rate) =
-            if let Some((stems_audio, ch, sr)) = self.stem_audio_with_speed_pitch() {
-                (Arc::new(stems_audio), ch, sr)
-            } else {
-                (
-                    Arc::new(self.processed_playback_samples.clone()),
-                    self.processed_playback_channels,
-                    raw.sample_rate,
-                )
-            };
+        // Stem path: reuse cached mix and optional speed/pitch transform
+        if self.separated_stems.is_some() {
+            if let Some((samples, ch, sr)) = self.stem_playback_source() {
+                if let Some(engine) = &mut self.engine {
+                    if let Err(err) =
+                        engine.play_arc_range(samples, ch, sr, start_sec, end_sec, playback_rate)
+                    {
+                        self.last_error = Some(format!("Playback error: {err}"));
+                        self.playing_preview_buffer = false;
+                        self.live_stream_playback = false;
+                    } else {
+                        self.playing_preview_buffer = false;
+                        self.live_stream_playback = false;
+                    }
+                }
+            }
+            return;
+        }
 
+        // Non-stem path: reference existing data to avoid 100MB+ clone
+        let sr = raw.sample_rate;
+        let ch = self.processed_playback_channels;
         if let Some(engine) = &mut self.engine {
             if let Err(err) = engine.play_range(
-                &playback_samples,
-                channels,
-                sample_rate,
+                &self.processed_playback_samples,
+                ch,
+                sr,
                 start_sec,
                 end_sec,
                 playback_rate,

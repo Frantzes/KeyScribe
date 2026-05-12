@@ -430,6 +430,9 @@ fn cross_validate_results(
     };
     let confidence = ((avg_hits - 1.0) / (source_count as f32 - 1.0).max(1.0)).clamp(0.0, 1.0);
 
+    // ---- post-process downbeats for consistency ----
+    postprocess_downbeats(&mut consensus_beats, &mut consensus_downbeats, beats_per_bar);
+
     Ok(CrossValidatedBeats {
         downbeats: consensus_downbeats,
         beats: consensus_beats,
@@ -438,6 +441,83 @@ fn cross_validate_results(
         confidence,
         source_count,
     })
+}
+
+/// Post-process beat_this downbeats to fill gaps and ensure consistent bar spacing.
+/// beat_this can sometimes miss downbeats in sections with weak percussion, leaving
+/// large gaps between downbeats that cause wonky engraving with extended measures.
+/// This function detects such gaps and inserts missing downbeats at regular intervals.
+/// Also handles anacrusis by propagating a downbeat back to time 0 when the first
+/// downbeat arrives after the music has already started.
+fn postprocess_downbeats(beats: &mut Vec<f32>, downbeats: &mut Vec<f32>, beats_per_bar: u32) {
+    if downbeats.len() < 2 || beats.len() < 4 {
+        return;
+    }
+
+    // Compute median beat interval from the full beat sequence
+    let bi: Vec<f32> = beats.windows(2).map(|w| w[1] - w[0]).filter(|&d| d > 0.001).collect();
+    if bi.is_empty() {
+        return;
+    }
+    let mut bi_sorted = bi.clone();
+    bi_sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let median_beat = bi_sorted[bi_sorted.len() / 2];
+    let bar_duration = beats_per_bar as f32 * median_beat;
+
+    // Build a new downbeat list ensuring no gap exceeds 1.5x the expected bar duration
+    let mut new_downbeats: Vec<f32> = Vec::new();
+    let tolerance = bar_duration * 1.5;
+
+    // Handle anacrusis: if the first downbeat is far from time 0, insert a
+    // downbeat at time 0 so the pickup notes have a proper bar reference.
+    if downbeats[0] > bar_duration * 0.5 {
+        new_downbeats.push(0.0);
+    }
+
+    for i in 0..downbeats.len() {
+        let current = downbeats[i];
+        new_downbeats.push(current);
+
+        if i + 1 < downbeats.len() {
+            let next = downbeats[i + 1];
+            let gap = next - current;
+            if gap > tolerance {
+                // Insert missing downbeats at regular bar intervals
+                let mut t = current + bar_duration;
+                while t + median_beat < next {
+                    new_downbeats.push(t);
+                    // Also insert the beat positions that belong to these filled bars
+                    for b in 1..beats_per_bar {
+                        let beat_t = t + b as f32 * median_beat;
+                        if beat_t < next && !beats.iter().any(|&x| (x - beat_t).abs() < median_beat * 0.3) {
+                            beats.push(beat_t);
+                        }
+                    }
+                    t += bar_duration;
+                }
+            }
+        }
+    }
+
+    // Sort and deduplicate
+    new_downbeats.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    new_downbeats.dedup_by(|a, b| (*a - *b).abs() < median_beat * 0.3);
+    *downbeats = new_downbeats;
+
+    // Also fill in beats for the pickup region
+    if downbeats.len() >= 2 && downbeats[0] < 0.001 {
+        let first_real_db = downbeats[1];
+        let mut t = median_beat;
+        while t < first_real_db - median_beat * 0.3 {
+            if !beats.iter().any(|&x| (x - t).abs() < median_beat * 0.3) {
+                beats.push(t);
+            }
+            t += median_beat;
+        }
+    }
+
+    beats.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    beats.dedup_by(|a, b| (*a - *b).abs() < median_beat * 0.3);
 }
 
 fn median_of(values: &[f32]) -> f32 {

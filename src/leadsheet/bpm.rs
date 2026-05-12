@@ -399,6 +399,7 @@ mod tests {
         for i in 0..beats {
             let start = i as f32 * beat;
             notes.push(NoteEvent {
+                id: i as u32 + 1,
                 pitch: 60,
                 start_time: start,
                 end_time: start + 0.1,

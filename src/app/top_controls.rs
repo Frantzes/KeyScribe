@@ -316,16 +316,19 @@ impl KeyScribeApp {
             .and_then(|p| p.file_stem().map(|s| s.to_string_lossy().to_string()))
             .unwrap_or_else(|| "htdemucs_6s".to_string());
 
+        let canonical_path = loaded_path.canonicalize().unwrap_or_else(|_| loaded_path.clone());
         let config = crate::leadsheet::SeparationConfig {
             model_name,
             song_hash: Some(song_hash.clone()),
-            source_path: Some(loaded_path.clone()),
+            source_path: Some(canonical_path),
             cache_dir: Some(app_cache_base_dir()),
         };
 
+        self.last_error = None;
         let (tx, rx) = mpsc::channel::<SeparationResult>();
         self.separation_rx = Some(rx);
         self.is_separating = true;
+        self.separation_attempted = false;
         self.separation_progress.store(0, Ordering::Release);
 
         let progress_atomic = Arc::clone(&self.separation_progress);
@@ -371,6 +374,7 @@ impl KeyScribeApp {
     pub(super) fn draw_preferences_menu(&mut self, ui: &mut egui::Ui) {
         setting_toggle_row(ui, &mut self.dark_mode, "Dark Mode");
         let _ = setting_toggle_row(ui, &mut self.show_note_hist_window, "Show Probability Pane");
+        let _ = setting_toggle_row(ui, &mut self.auto_separate, "Separate Instruments Automatically");
         Self::draw_toolbar_separator(ui);
 
         ui.label("Highlight Presets");

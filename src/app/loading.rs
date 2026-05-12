@@ -97,7 +97,12 @@ impl KeyScribeApp {
         )
     }
 
-    pub(super) fn start_audio_loading(&mut self, path: PathBuf, ctx: &egui::Context) {
+    pub(super) fn start_audio_loading(
+        &mut self,
+        path: PathBuf,
+        ctx: &egui::Context,
+        reset_state: bool,
+    ) {
         self.cancel_audio_loading();
         self.cancel_active_processing();
         self.stop();
@@ -137,6 +142,26 @@ impl KeyScribeApp {
         self.loading_cache_timeline_preloaded = false;
         self.loading_cache_waveform_preloaded = false;
         self.loading_preview_cache.clear();
+
+        if reset_state {
+            // Reset loop state for new audio
+            self.loop_selection = None;
+            self.loop_enabled = false;
+            self.loop_playback_enabled = false;
+            self.drag_select_anchor_sec = None;
+
+            // Clear all stem state from previous song
+            self.saved_visualize_stem_indices = None;
+            self.saved_listen_stem_indices = None;
+            self.pending_stem_indices.clear();
+            self.pending_listening_indices.clear();
+            self.show_visualize_selector = false;
+            self.show_listen_selector = false;
+            self.melody_stem_indices.clear();
+            self.chord_stem_indices.clear();
+            self.current_chord = None;
+        }
+
         if self.preprocess_audio {
             self.cache_status_message = Some("Analysis cache: precheck pending...".to_string());
             self.cache_status_message_at = Some(Instant::now());
@@ -147,9 +172,11 @@ impl KeyScribeApp {
         self.stem_colors.clear();
         self.stem_analysis_rx = None;
         self.is_separating = false;
+        self.separation_attempted = false;
         self.separation_rx = None;
         self.enabled_stem_indices.clear();
         self.enabled_listening_indices.clear();
+        self.stem_playback_cache = None;
         self.clear_note_visuals();
 
         let (tx, rx) = mpsc::channel::<StreamingAudioEvent>();

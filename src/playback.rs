@@ -1,10 +1,79 @@
-use std::time::Instant;
+use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use anyhow::{bail, Context, Result};
 use rodio::buffer::SamplesBuffer;
 use rodio::cpal::traits::{DeviceTrait, HostTrait};
 use rodio::cpal::Device;
-use rodio::{OutputStream, OutputStreamHandle, Sink};
+use rodio::{OutputStream, OutputStreamHandle, Sink, Source};
+
+// Stream samples from a shared buffer without copying.
+struct ArcSamplesSource {
+    samples: Arc<Vec<f32>>,
+    idx: usize,
+    end: usize,
+    channels: u16,
+    sample_rate: u32,
+}
+
+impl ArcSamplesSource {
+    fn new(
+        samples: Arc<Vec<f32>>,
+        start_idx: usize,
+        end_idx: usize,
+        channels: u16,
+        sample_rate: u32,
+    ) -> Self {
+        Self {
+            samples,
+            idx: start_idx,
+            end: end_idx,
+            channels,
+            sample_rate,
+        }
+    }
+}
+
+impl Iterator for ArcSamplesSource {
+    type Item = f32;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.idx >= self.end {
+            return None;
+        }
+
+        let value = self.samples[self.idx];
+        self.idx += 1;
+        Some(value)
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        let remaining = self.end.saturating_sub(self.idx);
+        (remaining, Some(remaining))
+    }
+}
+
+impl Source for ArcSamplesSource {
+    fn current_frame_len(&self) -> Option<usize> {
+        let channels = self.channels.max(1) as usize;
+        Some(self.end.saturating_sub(self.idx) / channels)
+    }
+
+    fn channels(&self) -> u16 {
+        self.channels.max(1)
+    }
+
+    fn sample_rate(&self) -> u32 {
+        self.sample_rate
+    }
+
+    fn total_duration(&self) -> Option<Duration> {
+        let channels = self.channels.max(1) as usize;
+        let frames = self.end.saturating_sub(self.idx) / channels;
+        let denom = self.sample_rate.max(1) as f32;
+        Some(Duration::from_secs_f32(frames as f32 / denom))
+    }
+}
 
 #[derive(Debug, Clone)]
 pub struct AudioOutputDeviceOption {
@@ -157,6 +226,68 @@ impl AudioEngine {
         sink.set_volume(self.volume.clamp(0.0, 1.5));
         let data = samples[start_idx..end_idx].to_vec();
         let source = SamplesBuffer::new(channels, sample_rate, data);
+
+        sink.append(source);
+        sink.play();
+
+        self.duration_sec = if let Some(end) = end_pos_sec {
+            end.max(start_pos_sec)
+        } else {
+            let played_frames = end_frame.saturating_sub(start_frame);
+            start_pos_sec + (played_frames as f32 / sample_rate as f32) * timeline_rate
+        };
+        self.start_pos_sec = start_pos_sec;
+        self.timeline_rate = timeline_rate;
+        self.started_at = Some(Instant::now());
+        self.is_playing = true;
+        self.sink = Some(sink);
+
+        Ok(())
+    }
+
+    pub fn play_arc_range(
+        &mut self,
+        samples: Arc<Vec<f32>>,
+        channels: u16,
+        sample_rate: u32,
+        start_pos_sec: f32,
+        end_pos_sec: Option<f32>,
+        timeline_rate: f32,
+    ) -> Result<()> {
+        self.stop();
+
+        if samples.is_empty() || sample_rate == 0 {
+            return Ok(());
+        }
+
+        let channels = channels.max(1);
+        let channels_usize = channels as usize;
+        let frame_count = samples.len() / channels_usize;
+        if frame_count == 0 {
+            return Ok(());
+        }
+
+        let timeline_rate = timeline_rate.clamp(0.25, 4.0);
+        let start_frame = ((start_pos_sec.max(0.0) / timeline_rate) * sample_rate as f32) as usize;
+        if start_frame >= frame_count {
+            return Ok(());
+        }
+        let start_idx = start_frame * channels_usize;
+
+        let mut end_frame = frame_count;
+        if let Some(end) = end_pos_sec {
+            end_frame = (((end.max(start_pos_sec) / timeline_rate) * sample_rate as f32) as usize)
+                .min(frame_count);
+        }
+        let end_idx = end_frame * channels_usize;
+
+        if end_idx <= start_idx {
+            return Ok(());
+        }
+
+        let sink = Sink::try_new(&self.stream_handle).context("Failed to create playback sink")?;
+        sink.set_volume(self.volume.clamp(0.0, 1.5));
+        let source = ArcSamplesSource::new(samples, start_idx, end_idx, channels, sample_rate);
 
         sink.append(source);
         sink.play();

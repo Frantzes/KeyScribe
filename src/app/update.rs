@@ -78,15 +78,17 @@ impl eframe::App for KeyScribeApp {
         }
 
         self.poll_audio_loading(ctx);
-        
-        // Auto-run separation once audio is loaded if not already done
-        if self.audio_raw.is_some() && self.separated_stems.is_none() && !self.is_separating && !self.is_audio_loading {
+
+        // Auto-run separation once audio is loaded (or hash is available) if not already done.
+        // We can do this in parallel with initial full-mix transcription.
+        if self.auto_separate && self.audio_raw.is_some() && self.loaded_audio_hash.is_some() && self.separated_stems.is_none() && !self.is_separating && !self.separation_attempted {
             self.run_instrument_separation();
         }
 
         self.poll_processing_result();
         self.poll_separation_result();
         self.poll_stem_analysis_result();
+        self.poll_sheet_preview(ctx);
         self.poll_sheet_rendering(ctx);
         self.sync_playhead_from_engine();
 
@@ -514,342 +516,380 @@ impl eframe::App for KeyScribeApp {
                 });
 
                 ui.add_space(UI_VSPACE_TIGHT);
-                ui.horizontal_wrapped(|ui| {
-                    if ui
-                        .add_enabled(
-                            self.audio_raw.is_some(),
-                            egui::Button::new("Separate Instruments"),
-                        )
-                        .clicked()
-                    {
-                        self.run_instrument_separation();
-                    }
+                if !self.auto_separate {
+                    ui.horizontal_wrapped(|ui| {
+                        if ui
+                            .add_enabled(
+                                self.audio_raw.is_some(),
+                                egui::Button::new("Separate Instruments"),
+                            )
+                            .clicked()
+                        {
+                            self.run_instrument_separation();
+                        }
 
-                    if self.separated_stems.is_some() {
-                        ui.label(egui::RichText::new("Stem audio is loaded. Use the waveform tab controls to preview or enable instruments.").weak());
-                    } else {
-                        ui.label(egui::RichText::new("Run separation to load instrument stems.").weak());
-                    }
-                });
+                        if self.separated_stems.is_some() {
+                            ui.label(egui::RichText::new("Stem audio is loaded. Use the waveform tab controls to preview or enable instruments.").weak());
+                        } else {
+                            ui.label(egui::RichText::new("Run separation to load instrument stems.").weak());
+                        }
+                    });
+                }
 
                 self.draw_main_content_tabs(ui);
                 ui.add_space(UI_VSPACE_TIGHT);
                 draw_horizontal_separator(ui, 0.0);
                 ui.add_space(UI_VSPACE_TIGHT);
 
-                if self.main_content_tab == MainContentTab::SheetMusic {
-                    self.draw_sheet_music_view(
-                        ui,
-                        interaction_ready,
-                        interaction_duration,
-                        default_stack_spacing_y,
-                        waveform_visual_gap,
-                    );
-                    ui.spacing_mut().item_spacing.y = default_stack_spacing_y;
-                    return;
-                }
+                // Absolute layout stability: calculate exact rects for content and footer
+                let full_avail_h = ui.available_height().max(0.0);
+                let full_avail_w = ui.available_width();
+                let media_h = media_controls_height_for_width(full_avail_w);
+                let gap = waveform_visual_gap;
+                let footer_total_h = media_h + gap * 2.0;
+                let content_h = (full_avail_h - footer_total_h).max(0.0);
 
-                // Compute waveform/media heights from the remaining space after speed/pitch controls.
-                let remaining_stack_h = ui.available_height().max(0.0);
-                let media_height = media_controls_height_for_width(ui.available_width())
-                    .min((remaining_stack_h - waveform_visual_gap * 2.0).max(0.0));
-                let waveform_height =
-                    (remaining_stack_h - (media_height + waveform_visual_gap * 2.0)).max(0.0);
+                let start_pos = ui.cursor().min;
+                let content_rect = egui::Rect::from_min_size(start_pos, egui::vec2(full_avail_w, content_h));
+                let footer_rect = egui::Rect::from_min_size(
+                    egui::pos2(start_pos.x, content_rect.bottom() + gap),
+                    egui::vec2(full_avail_w, media_h)
+                );
 
-                Plot::new("waveform_plot")
-                    .height(waveform_height)
-                    .allow_scroll(false)
-                    .allow_zoom(false)
-                    .allow_drag(false)
-                    .allow_boxed_zoom(false)
-                    .show_grid(false)
-                    .show_x(false)
-                    .show_y(false)
-                    .show_axes([false, false])
-                    .include_y(-1.05)
-                    .include_y(1.05)
-                    .show(ui, |plot_ui| {
-                        let highlight = self.highlight_color;
-                        let loop_bg = egui::Color32::from_rgba_unmultiplied(
-                            highlight.r(),
-                            highlight.g(),
-                            highlight.b(),
-                            32,
+                // 1. Content Area (Strictly bounded)
+                ui.allocate_ui_at_rect(content_rect, |ui| {
+                    ui.spacing_mut().item_spacing.y = 0.0;
+                    if self.main_content_tab == MainContentTab::SheetMusic {
+                        self.draw_sheet_music_view(
+                            ui,
+                            interaction_ready,
+                            interaction_duration,
+                            default_stack_spacing_y,
+                            waveform_visual_gap,
+                            content_h,
                         );
-                        let loop_wave_active = egui::Color32::from_rgb(
-                            highlight.r().saturating_add(24),
-                            highlight.g().saturating_add(24),
-                            highlight.b().saturating_add(24),
-                        );
-                        let loop_wave_dim = egui::Color32::from_rgb(
-                            highlight.r().saturating_sub(42),
-                            highlight.g().saturating_sub(42),
-                            highlight.b().saturating_sub(42),
-                        );
-                        let loop_edge = egui::Color32::from_rgb(
-                            highlight.r().saturating_add(18),
-                            highlight.g().saturating_add(18),
-                            highlight.b().saturating_add(18),
-                        );
-
-                        if let Some((a, b)) = self.loop_selection {
-                            let start = a.min(b) as f64;
-                            let end = a.max(b) as f64;
-
-                            let highlight = Polygon::new(PlotPoints::from(vec![
-                                [start, -1.05],
-                                [end, -1.05],
-                                [end, 1.05],
-                                [start, 1.05],
-                            ]))
-                            .fill_color(loop_bg)
-                            .stroke(egui::Stroke::new(1.0, loop_edge));
-                            plot_ui.polygon(highlight);
-                        }
-
-                        if let Some((a, b)) = self.loop_selection {
-                            let start = a.min(b);
-                            let end = a.max(b);
-                            self.refresh_loop_waveform_cache(start, end);
-
-                            if !self.loop_waveform_cache_pre.is_empty() {
-                                plot_ui.line(
-                                    Line::new(PlotPoints::from_iter(
-                                        self.loop_waveform_cache_pre.iter().copied(),
-                                    ))
-                                    .color(loop_wave_dim),
+                    } else {
+                        Plot::new("waveform_plot")
+                            .height(content_h)
+                            .allow_scroll(false)
+                            .allow_zoom(false)
+                            .allow_drag(false)
+                            .allow_boxed_zoom(false)
+                            .show_grid(false)
+                            .show_x(false)
+                            .show_y(false)
+                            .show_axes([false, false])
+                            .include_y(-1.05)
+                            .include_y(1.05)
+                            .show(ui, |plot_ui| {
+                                let highlight = self.highlight_color;
+                                let loop_bg = egui::Color32::from_rgba_unmultiplied(
+                                    highlight.r(),
+                                    highlight.g(),
+                                    highlight.b(),
+                                    32,
                                 );
-                            }
-                            if !self.loop_waveform_cache_mid.is_empty() {
-                                plot_ui.line(
-                                    Line::new(PlotPoints::from_iter(
-                                        self.loop_waveform_cache_mid.iter().copied(),
-                                    ))
-                                    .color(loop_wave_active),
+                                let loop_wave_active = egui::Color32::from_rgb(
+                                    highlight.r().saturating_add(24),
+                                    highlight.g().saturating_add(24),
+                                    highlight.b().saturating_add(24),
                                 );
-                            }
-                            if !self.loop_waveform_cache_post.is_empty() {
-                                plot_ui.line(
-                                    Line::new(PlotPoints::from_iter(
-                                        self.loop_waveform_cache_post.iter().copied(),
-                                    ))
-                                    .color(loop_wave_dim),
+                                let loop_wave_dim = egui::Color32::from_rgb(
+                                    highlight.r().saturating_sub(42),
+                                    highlight.g().saturating_sub(42),
+                                    highlight.b().saturating_sub(42),
                                 );
-                            }
-                        } else {
-                            let line =
-                                Line::new(PlotPoints::from_iter(self.waveform.iter().copied()));
-                            plot_ui.line(line.color(self.highlight_color));
-                        }
-
-                        plot_ui.vline(
-                            VLine::new(self.selected_time_sec as f64)
-                                .color(accent_soft(self.highlight_color)),
-                        );
-
-                        if let Some((a, b)) = self.loop_selection {
-                            let start = a.min(b);
-                            let end = a.max(b);
-                            plot_ui.vline(VLine::new(start as f64).color(loop_edge));
-                            plot_ui.vline(VLine::new(end as f64).color(loop_edge));
-                        }
-
-                        // Keep Y scale fixed and clamp X so navigation stays within audio bounds.
-                        // On a fresh load, force full-track bounds first and clamp from those values.
-                        let mut b = if self.waveform_reset_view {
-                            self.waveform_reset_view = false;
-                            PlotBounds::from_min_max([0.0, -1.05], [plot_duration as f64, 1.05])
-                        } else {
-                            plot_ui.plot_bounds()
-                        };
-
-                        let pointer = plot_ui.pointer_coordinate();
-                        let hovered = plot_ui.response().hovered();
-                        let drag_started = plot_ui.response().drag_started();
-                        let dragged = plot_ui.response().dragged();
-                        let drag_stopped = plot_ui.response().drag_stopped();
-                        let clicked = plot_ui.response().clicked();
-                        let (
-                            raw_scroll,
-                            smooth_scroll,
-                            shift_held,
-                            ctrl_held,
-                            zoom_delta,
-                            pointer_delta,
-                        ) = plot_ui.ctx().input(|i| {
-                            (
-                                i.raw_scroll_delta,
-                                i.smooth_scroll_delta,
-                                i.modifiers.shift,
-                                i.modifiers.ctrl,
-                                i.zoom_delta_2d(),
-                                i.pointer.delta(),
-                            )
-                        });
-                        let touch_navigation = self.is_touch_platform();
-
-                        let wheel_y = if raw_scroll.y.abs() > f32::EPSILON {
-                            raw_scroll.y
-                        } else if smooth_scroll.y.abs() > f32::EPSILON {
-                            smooth_scroll.y
-                        } else {
-                            0.0
-                        };
-
-                        let wheel_x = if raw_scroll.x.abs() > f32::EPSILON {
-                            raw_scroll.x
-                        } else if smooth_scroll.x.abs() > f32::EPSILON {
-                            smooth_scroll.x
-                        } else {
-                            0.0
-                        };
-
-                        if hovered {
-                            let span = (b.max()[0] - b.min()[0]).max(0.001);
-
-                            if touch_navigation && !self.touch_loop_select_mode && dragged {
-                                let drag_width = plot_ui.response().rect.width().max(1.0) as f64;
-                                let shift_amount = -(pointer_delta.x as f64) * (span / drag_width);
-                                b = PlotBounds::from_min_max(
-                                    [b.min()[0] + shift_amount, b.min()[1]],
-                                    [b.max()[0] + shift_amount, b.max()[1]],
+                                let loop_edge = egui::Color32::from_rgb(
+                                    highlight.r().saturating_add(18),
+                                    highlight.g().saturating_add(18),
+                                    highlight.b().saturating_add(18),
                                 );
-                            } else if shift_held
-                                && (wheel_y.abs() > f32::EPSILON || wheel_x.abs() > f32::EPSILON)
-                            {
-                                let dominant_wheel = if wheel_x.abs() > wheel_y.abs() {
-                                    wheel_x
-                                } else {
-                                    wheel_y
-                                };
-                                let shift_amount = -(dominant_wheel as f64) * 0.0015 * span;
-                                b = PlotBounds::from_min_max(
-                                    [b.min()[0] + shift_amount, b.min()[1]],
-                                    [b.max()[0] + shift_amount, b.max()[1]],
-                                );
-                            }
 
-                            let touch_pinch =
-                                touch_navigation && (zoom_delta.y - 1.0).abs() > f32::EPSILON;
-                            if ctrl_held || touch_pinch {
-                                let zoom_from_wheel = if ctrl_held && wheel_y.abs() > f32::EPSILON {
-                                    if wheel_y > 0.0 {
-                                        0.88
-                                    } else {
-                                        1.14
-                                    }
-                                } else {
-                                    1.0
-                                };
+                                if let Some((a, b)) = self.loop_selection {
+                                    let start = a.min(b) as f64;
+                                    let end = a.max(b) as f64;
 
-                                let zoom_from_input = if (zoom_delta.y - 1.0).abs() > f32::EPSILON {
-                                    (1.0 / zoom_delta.y as f64).clamp(0.7, 1.4)
-                                } else {
-                                    1.0
-                                };
-
-                                let zoom = zoom_from_wheel * zoom_from_input;
-
-                                if (zoom - 1.0).abs() > f64::EPSILON {
-                                    let min_span = (plot_duration as f64 / 400.0).max(0.02);
-                                    let max_span = plot_duration as f64;
-                                    let new_span = (span * zoom).clamp(min_span, max_span);
-
-                                    let center_x = pointer
-                                        .map(|p| p.x)
-                                        .unwrap_or((b.min()[0] + b.max()[0]) * 0.5)
-                                        .clamp(0.0, plot_duration as f64);
-
-                                    let left_ratio =
-                                        ((center_x - b.min()[0]) / span).clamp(0.0, 1.0);
-                                    let new_min = center_x - left_ratio * new_span;
-                                    let new_max = new_min + new_span;
-                                    b = PlotBounds::from_min_max(
-                                        [new_min, b.min()[1]],
-                                        [new_max, b.max()[1]],
-                                    );
+                                    let highlight = Polygon::new(PlotPoints::from(vec![
+                                        [start, -1.05],
+                                        [end, -1.05],
+                                        [end, 1.05],
+                                        [start, 1.05],
+                                    ]))
+                                    .fill_color(loop_bg)
+                                    .stroke(egui::Stroke::new(1.0, loop_edge));
+                                    plot_ui.polygon(highlight);
                                 }
-                            }
-                        }
 
-                        let mut x_span = (b.max()[0] - b.min()[0]).max(0.001);
-                        let max_span = plot_duration as f64;
-                        if x_span > max_span {
-                            x_span = max_span;
-                        }
-
-                        let min_x = if x_span >= max_span {
-                            0.0
-                        } else {
-                            b.min()[0].clamp(0.0, max_span - x_span)
-                        };
-                        let max_x = (min_x + x_span).min(max_span);
-
-                        plot_ui.set_plot_bounds(PlotBounds::from_min_max(
-                            [min_x, -1.05],
-                            [max_x, 1.05],
-                        ));
-
-                        let allow_loop_drag = !touch_navigation || self.touch_loop_select_mode;
-                        if !allow_loop_drag {
-                            self.drag_select_anchor_sec = None;
-                        }
-
-                        if interaction_ready && allow_loop_drag && drag_started {
-                            self.drag_select_anchor_sec = pointer
-                                .map(|p| p.x.clamp(0.0, interaction_duration as f64) as f32)
-                                .or(Some(self.selected_time_sec));
-                        }
-
-                        if interaction_ready && allow_loop_drag && dragged {
-                            if let (Some(anchor), Some(p)) = (
-                                self.drag_select_anchor_sec,
-                                pointer.map(|p| p.x.clamp(0.0, interaction_duration as f64) as f32),
-                            ) {
-                                self.loop_selection = Some((anchor, p));
-                            }
-                        }
-
-                        if interaction_ready && allow_loop_drag && drag_stopped {
-                            if let Some((a, b)) = self.loop_selection {
-                                if (a - b).abs() < LOOP_MIN_DURATION_SEC {
-                                    self.loop_selection = None;
-                                    self.loop_playback_enabled = false;
-                                } else {
+                                if let Some((a, b)) = self.loop_selection {
                                     let start = a.min(b);
                                     let end = a.max(b);
-                                    self.selected_time_sec = start;
-                                    self.loop_enabled = true;
-                                    self.loop_playback_enabled = true;
-                                    self.play_range(start, Some(end));
-                                }
-                            }
-                            self.drag_select_anchor_sec = None;
-                        }
+                                    self.refresh_loop_waveform_cache(start, end);
 
-                        if interaction_ready && clicked {
-                            if let Some(pointer) = pointer {
-                                self.selected_time_sec =
-                                    pointer.x.clamp(0.0, interaction_duration as f64) as f32;
-                                self.loop_selection = None;
-                                self.loop_playback_enabled = false;
-                                self.update_note_probabilities(true);
-                                if self.is_playing() {
-                                    self.play_from_selected();
+                                    if !self.loop_waveform_cache_pre.is_empty() {
+                                        plot_ui.line(
+                                            Line::new(PlotPoints::from_iter(
+                                                self.loop_waveform_cache_pre.iter().copied(),
+                                            ))
+                                            .color(loop_wave_dim),
+                                        );
+                                    }
+                                    if !self.loop_waveform_cache_mid.is_empty() {
+                                        plot_ui.line(
+                                            Line::new(PlotPoints::from_iter(
+                                                self.loop_waveform_cache_mid.iter().copied(),
+                                            ))
+                                            .color(loop_wave_active),
+                                        );
+                                    }
+                                    if !self.loop_waveform_cache_post.is_empty() {
+                                        plot_ui.line(
+                                            Line::new(PlotPoints::from_iter(
+                                                self.loop_waveform_cache_post.iter().copied(),
+                                            ))
+                                            .color(loop_wave_dim),
+                                        );
+                                    }
+                                } else {
+                                    let line = Line::new(PlotPoints::from_iter(
+                                        self.waveform.iter().copied(),
+                                    ));
+                                    plot_ui.line(line.color(self.highlight_color));
                                 }
-                            }
-                        }
-                    });
 
-                ui.add_space(waveform_visual_gap);
-                ui.scope(|ui| {
-                    ui.spacing_mut().item_spacing.y = default_stack_spacing_y;
-                    draw_media_controls(self, ui, interaction_ready, interaction_duration);
+                                plot_ui.vline(
+                                    VLine::new(self.selected_time_sec as f64)
+                                        .color(accent_soft(self.highlight_color)),
+                                );
+
+                                if let Some((a, b)) = self.loop_selection {
+                                    let start = a.min(b);
+                                    let end = a.max(b);
+                                    plot_ui.vline(VLine::new(start as f64).color(loop_edge));
+                                    plot_ui.vline(VLine::new(end as f64).color(loop_edge));
+                                }
+
+                                // Keep Y scale fixed and clamp X so navigation stays within audio bounds.
+                                let mut b = if self.waveform_reset_view {
+                                    self.waveform_reset_view = false;
+                                    PlotBounds::from_min_max(
+                                        [0.0, -1.05],
+                                        [plot_duration as f64, 1.05],
+                                    )
+                                } else {
+                                    plot_ui.plot_bounds()
+                                };
+
+                                let pointer = plot_ui.pointer_coordinate();
+                                let hovered = plot_ui.response().hovered();
+                                let drag_started = plot_ui.response().drag_started();
+                                let dragged = plot_ui.response().dragged();
+                                let drag_stopped = plot_ui.response().drag_stopped();
+                                let clicked = plot_ui.response().clicked();
+                                let (
+                                    raw_scroll,
+                                    smooth_scroll,
+                                    shift_held,
+                                    ctrl_held,
+                                    zoom_delta,
+                                    pointer_delta,
+                                ) = plot_ui.ctx().input(|i| {
+                                    (
+                                        i.raw_scroll_delta,
+                                        i.smooth_scroll_delta,
+                                        i.modifiers.shift,
+                                        i.modifiers.ctrl,
+                                        i.zoom_delta_2d(),
+                                        i.pointer.delta(),
+                                    )
+                                });
+                                let touch_navigation = self.is_touch_platform();
+
+                                let wheel_y = if raw_scroll.y.abs() > f32::EPSILON {
+                                    raw_scroll.y
+                                } else if smooth_scroll.y.abs() > f32::EPSILON {
+                                    smooth_scroll.y
+                                } else {
+                                    0.0
+                                };
+
+                                let wheel_x = if raw_scroll.x.abs() > f32::EPSILON {
+                                    raw_scroll.x
+                                } else if smooth_scroll.x.abs() > f32::EPSILON {
+                                    smooth_scroll.x
+                                } else {
+                                    0.0
+                                };
+
+                                if hovered {
+                                    let span = (b.max()[0] - b.min()[0]).max(0.001);
+
+                                    if touch_navigation
+                                        && !self.touch_loop_select_mode
+                                        && dragged
+                                    {
+                                        let drag_width = plot_ui.response().rect.width().max(1.0)
+                                            as f64;
+                                        let shift_amount =
+                                            -(pointer_delta.x as f64) * (span / drag_width);
+                                        b = PlotBounds::from_min_max(
+                                            [b.min()[0] + shift_amount, b.min()[1]],
+                                            [b.max()[0] + shift_amount, b.max()[1]],
+                                        );
+                                    } else if shift_held
+                                        && (wheel_y.abs() > f32::EPSILON
+                                            || wheel_x.abs() > f32::EPSILON)
+                                    {
+                                        let dominant_wheel = if wheel_x.abs() > wheel_y.abs() {
+                                            wheel_x
+                                        } else {
+                                            wheel_y
+                                        };
+                                        let shift_amount =
+                                            -(dominant_wheel as f64) * 0.0015 * span;
+                                        b = PlotBounds::from_min_max(
+                                            [b.min()[0] + shift_amount, b.min()[1]],
+                                            [b.max()[0] + shift_amount, b.max()[1]],
+                                        );
+                                    }
+
+                                    let touch_pinch = touch_navigation
+                                        && (zoom_delta.y - 1.0).abs() > f32::EPSILON;
+                                    if ctrl_held || touch_pinch {
+                                        let zoom_from_wheel =
+                                            if ctrl_held && wheel_y.abs() > f32::EPSILON {
+                                                if wheel_y > 0.0 {
+                                                    0.88
+                                                } else {
+                                                    1.14
+                                                }
+                                            } else {
+                                                1.0
+                                            };
+
+                                        let zoom_from_input =
+                                            if (zoom_delta.y - 1.0).abs() > f32::EPSILON {
+                                                (1.0 / zoom_delta.y as f64).clamp(0.7, 1.4)
+                                            } else {
+                                                1.0
+                                            };
+
+                                        let zoom = zoom_from_wheel * zoom_from_input;
+
+                                        if (zoom - 1.0).abs() > f64::EPSILON {
+                                            let min_span =
+                                                (plot_duration as f64 / 400.0).max(0.02);
+                                            let max_span = plot_duration as f64;
+                                            let new_span =
+                                                (span * zoom).clamp(min_span, max_span);
+
+                                            let center_x = pointer
+                                                .map(|p| p.x)
+                                                .unwrap_or((b.min()[0] + b.max()[0]) * 0.5)
+                                                .clamp(0.0, plot_duration as f64);
+
+                                            let left_ratio = ((center_x - b.min()[0]) / span)
+                                                .clamp(0.0, 1.0);
+                                            let new_min = center_x - left_ratio * new_span;
+                                            let new_max = new_min + new_span;
+                                            b = PlotBounds::from_min_max(
+                                                [new_min, b.min()[1]],
+                                                [new_max, b.max()[1]],
+                                            );
+                                        }
+                                    }
+                                }
+
+                                let mut x_span = (b.max()[0] - b.min()[0]).max(0.001);
+                                let max_span = plot_duration as f64;
+                                if x_span > max_span {
+                                    x_span = max_span;
+                                }
+
+                                let min_x = if x_span >= max_span {
+                                    0.0
+                                } else {
+                                    b.min()[0].clamp(0.0, max_span - x_span)
+                                };
+                                let max_x = (min_x + x_span).min(max_span);
+
+                                plot_ui.set_plot_bounds(PlotBounds::from_min_max(
+                                    [min_x, -1.05],
+                                    [max_x, 1.05],
+                                ));
+
+                                let allow_loop_drag =
+                                    !touch_navigation || self.touch_loop_select_mode;
+                                if !allow_loop_drag {
+                                    self.drag_select_anchor_sec = None;
+                                }
+
+                                if interaction_ready && allow_loop_drag && drag_started {
+                                    self.drag_select_anchor_sec = pointer
+                                        .map(|p| {
+                                            p.x.clamp(0.0, interaction_duration as f64) as f32
+                                        })
+                                        .or(Some(self.selected_time_sec));
+                                }
+
+                                if interaction_ready && allow_loop_drag && dragged {
+                                    if let (Some(anchor), Some(p)) = (
+                                        self.drag_select_anchor_sec,
+                                        pointer.map(|p| {
+                                            p.x.clamp(0.0, interaction_duration as f64) as f32
+                                        }),
+                                    ) {
+                                        self.loop_selection = Some((anchor, p));
+                                    }
+                                }
+
+                                if interaction_ready && allow_loop_drag && drag_stopped {
+                                    if let Some((a, b)) = self.loop_selection {
+                                        if (a - b).abs() < LOOP_MIN_DURATION_SEC {
+                                            self.loop_selection = None;
+                                            self.loop_playback_enabled = false;
+                                        } else {
+                                            let start = a.min(b);
+                                            let end = a.max(b);
+                                            self.selected_time_sec = start;
+                                            self.loop_enabled = true;
+                                            self.loop_playback_enabled = true;
+                                            self.play_range(start, Some(end));
+                                        }
+                                    }
+                                    self.drag_select_anchor_sec = None;
+                                }
+
+                                if interaction_ready && clicked {
+                                    if let Some(pointer) = pointer {
+                                        self.selected_time_sec = pointer
+                                            .x
+                                            .clamp(0.0, interaction_duration as f64)
+                                            as f32;
+                                        self.loop_selection = None;
+                                        self.loop_playback_enabled = false;
+                                        if self.is_playing() {
+                                            self.play_from_selected();
+                                        }
+                                    }
+                                }
+                            });
+                    }
                 });
-                ui.add_space(waveform_visual_gap);
-                ui.spacing_mut().item_spacing.y = default_stack_spacing_y;
-            });
-        self.waveform_panel_height = waveform_central.response.rect.height().clamp(120.0, 5000.0);
+
+                // 2. Media Footer (Pinned to bottom)
+                ui.allocate_ui_at_rect(footer_rect, |ui| {
+                    ui.scope(|ui| {
+                        ui.spacing_mut().item_spacing.y = default_stack_spacing_y;
+                        draw_media_controls(self, ui, interaction_ready, interaction_duration);
+                    });
+                });
+
+                // Finish layout by advancing cursor past footer
+                ui.advance_cursor_after_rect(egui::Rect::from_min_max(
+                    start_pos,
+                    egui::pos2(start_pos.x + full_avail_w, footer_rect.bottom() + gap)
+                ));
+                });        self.waveform_panel_height = waveform_central.response.rect.height().clamp(120.0, 5000.0);
 
         #[cfg(feature = "desktop-ui")]
         if hovered_valid_drop.is_some() && self.audio_raw.is_some() {

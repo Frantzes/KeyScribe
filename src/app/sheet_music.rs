@@ -1,17 +1,19 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fmt::Write;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::mpsc::TryRecvError;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use super::*;
 use crate::leadsheet::{
-    cross_validate_beat_sources, generate_lead_sheet_enhanced, generate_lead_sheet_foundation,
-    generate_lead_sheet_with_tempo_map, tempo_map_from_beats, Articulation, BeatTrackConfig,
-    ChordSymbolChange, CrossValidatedBeats, LeadSheetFoundation, LeadSheetPresetConfig, NoteEvent,
-    QuantizedNote, SwingStyle, TimeSignatureSegment,
+    cross_validate_beat_sources, debug_chord_notes_to_json, detect_chord_changes_per_bar, generate_lead_sheet_enhanced,
+    generate_lead_sheet_foundation, generate_lead_sheet_with_tempo_map, quantize_notes_with_rhythm_map,
+    tempo_map_from_beats, Articulation, BeatTrackConfig, ChordSymbolChange,
+    CrossValidatedBeats, LeadSheetFoundation, LeadSheetPresetConfig, NoteEvent, QuantizedNote,
+    SwingStyle, TimeSignatureSegment,
 };
-use verovioxide::{Options, Png, Svg, Toolkit};
+
 #[cfg(test)]
 use crate::leadsheet::TempoSegment;
 
@@ -24,25 +26,103 @@ const MIN_SHEET_NOTE_FRAMES: usize = 2;
 const SHEET_SWING_BIAS: bool = true;
 
 impl KeyScribeApp {
+    fn estimate_sheet_cursor_offset_sec(
+        note_events: &[NoteEvent],
+        foundation: &LeadSheetFoundation,
+    ) -> f32 {
+        if note_events.is_empty()
+            || foundation.quantized_notes.is_empty()
+            || foundation.tempo_map.is_empty()
+        {
+            return 0.0;
+        }
+
+        let mut by_id: HashMap<u32, f32> = HashMap::with_capacity(note_events.len());
+        for note in note_events {
+            if note.start_time.is_finite() {
+                by_id.insert(note.id, note.start_time.max(0.0));
+            }
+        }
+
+        let mut offsets: Vec<f32> = Vec::new();
+        for note in &foundation.quantized_notes {
+            let Some(start_time) = by_id.get(&note.id) else {
+                continue;
+            };
+            let expected_time = crate::leadsheet::tempo_map::time_at_beat(
+                note.beat_start,
+                foundation.tempo_map.as_slice(),
+            );
+            if expected_time.is_finite() {
+                let delta = *start_time - expected_time;
+                if delta.abs() <= 2.0 {
+                    offsets.push(delta);
+                }
+            }
+        }
+
+        if offsets.len() < 4 {
+            return 0.0;
+        }
+
+        offsets.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        let mid = offsets.len() / 2;
+        if offsets.len() % 2 == 0 {
+            (offsets[mid - 1] + offsets[mid]) * 0.5
+        } else {
+            offsets[mid]
+        }
+    }
+
+    fn active_note_id_for_time(note_events: &[NoteEvent], time_sec: f32) -> Option<u32> {
+        let mut best: Option<(f32, u32)> = None;
+        for note in note_events {
+            if time_sec >= note.start_time && time_sec < note.end_time {
+                let start = note.start_time;
+                if best.map_or(true, |(prev, _)| start < prev) {
+                    best = Some((start, note.id));
+                }
+            }
+        }
+        best.map(|(_, id)| id)
+    }
+
     pub(super) fn draw_main_content_tabs(&mut self, ui: &mut egui::Ui) {
         ui.horizontal(|ui| {
             ui.selectable_value(&mut self.main_content_tab, MainContentTab::Waveform, "Waveform");
             ui.selectable_value(
                 &mut self.main_content_tab,
                 MainContentTab::SheetMusic,
-                "Sheet Music",
+                "Sheet Music (Experimental, WIP)",
             );
 
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 if let Some(stems) = self.separated_stems.clone() {
+                    let is_analyzing = self.stem_analysis_rx.is_some();
+                    let analysis_ready = !self.stem_analyses.is_empty();
+
+                    if is_analyzing {
+                        self.show_visualize_selector = false;
+                        self.show_listen_selector = false;
+                    }
+
                     // --- Visualization Selector ---
-                    let visualize_btn_text = format!(
-                        "Visualize: {} / {}",
-                        self.enabled_stem_indices.len(),
-                        stems.len()
-                    );
+                    let visualize_btn_text = if is_analyzing {
+                        "Analyzing stems...".to_string()
+                    } else if self.enabled_stem_indices.is_empty() {
+                        "Visualize: Original Mix".to_string()
+                    } else {
+                        format!(
+                            "Visualize: {} / {}",
+                            self.enabled_stem_indices.len(),
+                            stems.len()
+                        )
+                    };
                     
-                    let visualize_resp = ui.add(egui::Button::new(visualize_btn_text).min_size(egui::vec2(220.0, 0.0)));
+                    let visualize_resp = ui.add_enabled(
+                        !is_analyzing && analysis_ready,
+                        egui::Button::new(visualize_btn_text).min_size(egui::vec2(220.0, 0.0))
+                    );
                     if visualize_resp.clicked() {
                         self.show_visualize_selector = !self.show_visualize_selector;
                         if self.show_visualize_selector {
@@ -65,11 +145,11 @@ impl KeyScribeApp {
                                     ui.vertical(|ui| {
                                         ui.label("Toggle instrument visualization");
                                         ui.horizontal(|ui| {
+                                            if ui.button("Original Mix").clicked() {
+                                                self.pending_stem_indices.clear();
+                                            }
                                             if ui.button("All").clicked() {
                                                 self.pending_stem_indices = (0..stems.len()).collect();
-                                            }
-                                            if ui.button("None").clicked() {
-                                                self.pending_stem_indices.clear();
                                             }
                                         });
                                         ui.add_space(UI_VSPACE_TIGHT);
@@ -138,16 +218,23 @@ impl KeyScribeApp {
                     ui.add_space(UI_VSPACE_COMPACT);
 
                     // --- Listening Selector ---
-                    let listen_btn_text = format!(
-                        "Listen: {}",
-                        if self.enabled_listening_indices.is_empty() { 
-                            "Original Mix".to_string() 
-                        } else { 
-                            format!("{}/{}", self.enabled_listening_indices.len(), stems.len()) 
-                        },
-                    );
+                    let listen_btn_text = if is_analyzing {
+                        "Analyzing stems...".to_string()
+                    } else {
+                        format!(
+                            "Listen: {}",
+                            if self.enabled_listening_indices.is_empty() { 
+                                "Original Mix".to_string() 
+                            } else { 
+                                format!("{}/{}", self.enabled_listening_indices.len(), stems.len()) 
+                            },
+                        )
+                    };
 
-                    let listen_resp = ui.add(egui::Button::new(listen_btn_text).min_size(egui::vec2(180.0, 0.0)));
+                    let listen_resp = ui.add_enabled(
+                        !is_analyzing && analysis_ready,
+                        egui::Button::new(listen_btn_text).min_size(egui::vec2(180.0, 0.0))
+                    );
                     if listen_resp.clicked() {
                         self.show_listen_selector = !self.show_listen_selector;
                         if self.show_listen_selector {
@@ -253,392 +340,359 @@ impl KeyScribeApp {
     pub(super) fn draw_sheet_music_view(
         &mut self,
         ui: &mut egui::Ui,
-        interaction_ready: bool,
-        interaction_duration: f32,
-        default_stack_spacing_y: f32,
-        vertical_gap: f32,
+        _interaction_ready: bool,
+        _interaction_duration: f32,
+        _default_stack_spacing_y: f32,
+        _vertical_gap: f32,
+        content_height: f32,
     ) {
-        ui.horizontal(|ui| {
-            // Mode selector
-            let mode_label = format!("Mode: {}", self.sheet_music_mode.label());
-            egui::ComboBox::from_id_source("sheet_mode")
-                .selected_text(&mode_label)
-                .show_ui(ui, |ui| {
-                    for mode in &[SheetMusicMode::LeadSheet, SheetMusicMode::PianoGrandStaff, SheetMusicMode::SingleStaff] {
-                        let label = mode.label();
-                        let selected = self.sheet_music_mode == *mode;
-                        if ui.selectable_label(selected, label).clicked() {
-                            self.sheet_music_mode = *mode;
-                            self.sheet_preview_cache_key = None;
-                            self.sheet_engraving_cache_key = None;
-                            self.sheet_engraving_pages.clear();
-                        }
-                    }
-                });
-
-            ui.separator();
-
-            // Melody source selector
-            let mel_label = match self.melody_stem_index {
-                Some(i) => format!("Melody: {}", self.stem_label(i)),
-                None => "Melody: Full Mix".to_string(),
-            };
-            egui::ComboBox::from_id_source("melody_source")
-                .selected_text(&mel_label)
-                .show_ui(ui, |ui| {
-                    let is_none = self.melody_stem_index.is_none();
-                    if ui.selectable_label(is_none, "Full Mix").clicked() {
-                        self.melody_stem_index = None;
-                        self.sheet_preview_cache_key = None;
-                        self.sheet_engraving_cache_key = None;
-                        self.sheet_engraving_pages.clear();
-                    }
-                    if let Some(stems) = self.separated_stems.as_ref() {
-                        for (i, stem) in stems.iter().enumerate() {
-                            let selected = self.melody_stem_index == Some(i);
-                            if ui.selectable_label(selected, stem.stem_type.display_name().as_ref()).clicked() {
-                                self.melody_stem_index = Some(i);
-                                self.sheet_preview_cache_key = None;
-                                self.sheet_engraving_cache_key = None;
-                                self.sheet_engraving_pages.clear();
-                            }
-                        }
-                    }
-                });
-
-            // Chord source selector
-            let chord_label = if self.chord_skip {
-                "Chords: off".to_string()
-            } else {
-                match self.chord_stem_index {
-                    Some(i) => format!("Chords: {}", self.stem_label(i)),
-                    None => "Chords: Full Mix".to_string(),
-                }
-            };
-            egui::ComboBox::from_id_source("chord_source")
-                .selected_text(&chord_label)
-                .show_ui(ui, |ui| {
-                    let is_off = self.chord_skip;
-                    if ui.selectable_label(is_off, "No chords").clicked() {
-                        self.chord_skip = true;
-                        self.chord_stem_index = None;
-                        self.sheet_preview_cache_key = None;
-                        self.sheet_engraving_cache_key = None;
-                        self.sheet_engraving_pages.clear();
-                    }
-                    let is_none = !self.chord_skip && self.chord_stem_index.is_none();
-                    if ui.selectable_label(is_none, "Full Mix").clicked() {
-                        self.chord_skip = false;
-                        self.chord_stem_index = None;
-                        self.sheet_preview_cache_key = None;
-                        self.sheet_engraving_cache_key = None;
-                        self.sheet_engraving_pages.clear();
-                    }
-                    if let Some(stems) = self.separated_stems.as_ref() {
-                        for (i, stem) in stems.iter().enumerate() {
-                            let selected = !self.chord_skip && self.chord_stem_index == Some(i);
-                            if ui.selectable_label(selected, stem.stem_type.display_name().as_ref()).clicked() {
-                                self.chord_skip = false;
-                                self.chord_stem_index = Some(i);
-                                self.sheet_preview_cache_key = None;
-                                self.sheet_engraving_cache_key = None;
-                                self.sheet_engraving_pages.clear();
-                            }
-                        }
-                    }
-                });
-        });
-
-        // BPM override (empty = auto-detect)
-        ui.add_space(UI_VSPACE_TIGHT);
-        ui.horizontal(|ui| {
-            ui.label("BPM:");
-            let bpm_resp = ui.add(
-                egui::TextEdit::singleline(&mut self.bpm_input_str)
-                    .desired_width(50.0)
-                    .hint_text("Auto"),
-            );
-            if bpm_resp.lost_focus() {
-                if self.bpm_input_str.trim().is_empty() {
-                    self.manual_bpm = None;
-                } else if let Ok(bpm) = self.bpm_input_str.trim().parse::<f32>() {
-                    self.manual_bpm = Some(bpm.clamp(20.0, 300.0));
-                }
-            }
-            if self.manual_bpm.is_some() {
-                if ui.button("×2").clicked() {
-                    let base = self.manual_bpm.unwrap_or(120.0);
-                    self.manual_bpm = Some((base * 2.0).clamp(20.0, 300.0));
-                }
-                if ui.button("÷2").clicked() {
-                    let base = self.manual_bpm.unwrap_or(120.0);
-                    self.manual_bpm = Some((base / 2.0).clamp(20.0, 300.0));
-                }
-                if ui.button("Clear").clicked() {
-                    self.manual_bpm = None;
-                }
-            } else {
-                ui.label(egui::RichText::new("Auto").color(egui::Color32::GRAY).weak());
-            }
-        });
-
-        ui.add_space(UI_VSPACE_TIGHT);
-        ui.horizontal(|ui| {
-            ui.label("Feel:");
-            let current_swing = self.manual_swing;
-            egui::ComboBox::from_id_source("swing_combo")
-                .selected_text(match current_swing {
-                    None => "Auto",
-                    Some(crate::leadsheet::types::SwingStyle::Straight) => "Straight (Even)",
-                    Some(crate::leadsheet::types::SwingStyle::Swing) => "Swung 8ths",
-                    Some(crate::leadsheet::types::SwingStyle::Triplet) => "Swung 16ths / Triplet",
-                })
-                .show_ui(ui, |ui| {
-                    if ui.selectable_label(current_swing == None, "Auto").clicked() {
-                        self.manual_swing = None;
-                        self.sheet_preview_cache_key = None;
-                        self.sheet_engraving_pages.clear();
-                    }
-                    if ui.selectable_label(current_swing == Some(crate::leadsheet::types::SwingStyle::Straight), "Straight (Even)").clicked() {
-                        self.manual_swing = Some(crate::leadsheet::types::SwingStyle::Straight);
-                        self.sheet_preview_cache_key = None;
-                        self.sheet_engraving_pages.clear();
-                    }
-                    if ui.selectable_label(current_swing == Some(crate::leadsheet::types::SwingStyle::Swing), "Swung 8ths").clicked() {
-                        self.manual_swing = Some(crate::leadsheet::types::SwingStyle::Swing);
-                        self.sheet_preview_cache_key = None;
-                        self.sheet_engraving_pages.clear();
-                    }
-                    if ui.selectable_label(current_swing == Some(crate::leadsheet::types::SwingStyle::Triplet), "Swung 16ths / Triplet").clicked() {
-                        self.manual_swing = Some(crate::leadsheet::types::SwingStyle::Triplet);
-                        self.sheet_preview_cache_key = None;
-                        self.sheet_engraving_pages.clear();
-                    }
-                });
-        });
-
-        // Note range filter for melody
-        ui.add_space(UI_VSPACE_TIGHT);
-        ui.horizontal(|ui| {
-            ui.label("Note range:");
-            let min_resp = ui.add(
-                egui::TextEdit::singleline(&mut self.melody_min_input_str)
-                    .desired_width(30.0)
-                    .hint_text("min"),
-            );
-            if min_resp.lost_focus() {
-                self.melody_min_note = parse_note_input(&self.melody_min_input_str);
-                self.sheet_preview_cache_key = None;
-                self.sheet_engraving_pages.clear();
-            }
-            ui.label("-");
-            let max_resp = ui.add(
-                egui::TextEdit::singleline(&mut self.melody_max_input_str)
-                    .desired_width(30.0)
-                    .hint_text("max"),
-            );
-            if max_resp.lost_focus() {
-                self.melody_max_note = parse_note_input(&self.melody_max_input_str);
-                self.sheet_preview_cache_key = None;
-                self.sheet_engraving_pages.clear();
-            }
-            // Show parsed MIDI numbers as hint
-            let min_hint = self.melody_min_note.and_then(midi_note_name_opt);
-            let max_hint = self.melody_max_note.and_then(midi_note_name_opt);
-            match (min_hint, max_hint) {
-                (Some(a), Some(b)) => { ui.label(egui::RichText::new(format!("{}–{}", a, b)).weak()); }
-                (Some(a), None) => { ui.label(egui::RichText::new(format!("{}–", a)).weak()); }
-                (None, Some(b)) => { ui.label(egui::RichText::new(format!("–{}", b)).weak()); }
-                _ => {}
-            }
-            if self.melody_min_note.is_some() || self.melody_max_note.is_some() {
-                if ui.button("Clear range").clicked() {
-                    self.melody_min_note = None;
-                    self.melody_max_note = None;
-                    self.sheet_preview_cache_key = None;
-                    self.sheet_engraving_pages.clear();
-                }
-            }
-        });
-
-        // Generate button
-        // Validate note range inputs
-        let mut range_error: Option<String> = None;
-        if !self.melody_min_input_str.trim().is_empty() && self.melody_min_note.is_none() {
-            range_error = Some(format!("Invalid min note: '{}'", self.melody_min_input_str.trim()));
-        } else if !self.melody_max_input_str.trim().is_empty() && self.melody_max_note.is_none() {
-            range_error = Some(format!("Invalid max note: '{}'", self.melody_max_input_str.trim()));
-        } else if let (Some(min), Some(max)) = (self.melody_min_note, self.melody_max_note) {
-            if min > max {
-                range_error = Some("Min note is above max note".to_string());
-            }
+        // Show config modal if open
+        if self.sheet_config_modal_open {
+            self.draw_sheet_config_modal(ui);
         }
 
-        if let Some(ref err) = range_error {
-            ui.colored_label(egui::Color32::from_rgb(224, 112, 112), err);
-        }
+        let has_engraving = !self.sheet_engraving_pages.is_empty()
+            || self.sheet_preview_cache.is_some();
 
-        ui.add_space(UI_VSPACE_TIGHT);
-        ui.horizontal(|ui| {
-            if ui.button("Generate Sheet Music").clicked() {
-                self.sheet_preview_cache_key = None;
-                self.sheet_engraving_cache_key = None;
-                self.refresh_sheet_preview_if_needed();
-                if let Some(preview) = self.sheet_preview_cache.as_ref().cloned() {
-                    let file_stem = self.export_file_stem();
-                    let engraving_config = SheetEngravingConfig {
-                        allow_triplets: !SHEET_SWING_BIAS,
-                        is_lead_sheet: self.sheet_music_mode.is_lead_sheet(),
-                    };
-                    let musicxml = build_musicxml_document(
-                        file_stem.as_str(),
-                        &preview.foundation,
-                        engraving_config,
-                    );
-                    if let Some(key) = self.current_sheet_preview_key() {
-                        self.start_sheet_render(ui.ctx(), &musicxml, key);
-                    }
-                }
-            }
-            if self.is_processing || !self.note_visuals_ready() {
-                ui.label(
-                    egui::RichText::new("(waiting for transcription...)")
-                        .color(egui::Color32::GRAY),
+        ui.vertical(|ui| {
+            ui.spacing_mut().item_spacing.y = 0.0;
+
+            if !has_engraving {
+                let (rect, resp) = ui.allocate_exact_size(
+                    egui::vec2(ui.available_width(), content_height),
+                    egui::Sense::click(),
                 );
-            }
-        });
 
-        let preview = self.sheet_preview_cache.clone();
-        let preview_error = self.sheet_preview_error.clone();
-        let engraving_error = self.sheet_engraving_error.clone();
+                // Draw the background box
+                ui.painter().rect(
+                    rect,
+                    egui::Rounding::same(8.0),
+                    ui.visuals().extreme_bg_color,
+                    egui::Stroke::new(2.0, ui.visuals().widgets.noninteractive.bg_stroke.color),
+                );
 
-        ui.horizontal_wrapped(|ui| {
-            if let Some(data) = preview.as_ref() {
-                let used_bpm = data.foundation.tempo.bpm;
-                let source = data.bpm_source.as_str();
-                let manual_label = if self.manual_bpm.is_some() { " (manual)" } else { "" };
-                ui.label(format!(
-                    "BPM: {:.1}{} | from {} | Segments: {} | Chords: {} | Notes: {} | Gate: {:.2}",
-                    used_bpm,
-                    manual_label,
-                    source,
-                    data.foundation.tempo_map.len(),
-                    data.foundation.chord_changes.len(),
-                    data.note_count,
-                    data.threshold
-                ));
-            } else {
-                ui.label("Sheet preview unavailable for the current transcription.");
-            }
-
-            ui.separator();
-
-            let can_export = preview.is_some();
-            if ui
-                .add_enabled(can_export, egui::Button::new("Export MusicXML"))
-                .clicked()
-            {
-                self.export_sheet_musicxml();
-            }
-            if ui
-                .add_enabled(can_export, egui::Button::new("Export Engraved PDF"))
-                .clicked()
-            {
-                self.export_sheet_pdf();
-            }
-        });
-
-        if let Some(err) = preview_error.as_deref() {
-            ui.colored_label(ERROR_RED, err);
-        }
-        if let Some(err) = engraving_error.as_deref() {
-            ui.colored_label(ERROR_RED, err);
-        }
-
-        let remaining_stack_h = ui.available_height().max(0.0);
-        let media_height = media_controls_height_for_width(ui.available_width())
-            .min((remaining_stack_h - vertical_gap * 2.0).max(0.0));
-        let content_height = (remaining_stack_h - (media_height + vertical_gap * 2.0)).max(0.0);
-
-        ui.group(|ui| {
-            ui.set_min_height(content_height);
-            if let Some(data) = preview.as_ref() {
-                let current_beat = data.foundation.beat_at_time(self.selected_time_sec.max(0.0));
-                if self.sheet_engraving_pages.is_empty() {
-                    ui.add_space(16.0);
-                    ui.centered_and_justified(|ui| {
-                        ui.label("Engraving is being prepared. Try reprocessing if this persists.");
+                if self.sheet_preview_result_rx.is_some() {
+                    ui.allocate_ui_at_rect(rect, |ui| {
+                        ui.vertical_centered(|ui| {
+                            ui.add_space(content_height * 0.4);
+                            ui.add(egui::Spinner::new().size(32.0));
+                            ui.add_space(10.0);
+                            ui.label(
+                                egui::RichText::new("Analyzing audio and generating sheet music...")
+                                    .strong(),
+                            );
+                        });
                     });
                 } else {
-                    let sensitivity = self.key_color_sensitivity.clamp(0.0, 2.0);
-                    let threshold = if sensitivity > 0.0 {
-                        (NOTE_HIGHLIGHT_ACTIVATION_THRESHOLD / sensitivity).clamp(0.0, 1.0)
-                    } else {
-                        1.0
-                    };
-                    let active_notes: Vec<u8> = self
-                        .note_probs_smoothed
-                        .iter()
-                        .enumerate()
-                        .filter(|(_, p)| **p >= threshold)
-                        .map(|(i, _)| (PIANO_LOW_MIDI as usize + i) as u8)
-                        .collect();
-                    draw_scrollable_engraved_preview(
-                        ui,
-                        self.sheet_engraving_pages.as_slice(),
-                        current_beat,
-                        self.highlight_color,
-                        &active_notes,
-                    );
+                    // ---- large clickable placeholder ----
+                    let text = "Click to configure sheet music";
+                    let text_font = egui::FontId::proportional(20.0);
+                    let text_color = ui.visuals().weak_text_color();
+                    let galley = ui.painter().layout_no_wrap(text.to_owned(), text_font, text_color);
+                    let galley_pos =
+                        rect.center() - egui::vec2(galley.size().x / 2.0, galley.size().y / 2.0);
+                    ui.painter().galley(galley_pos, galley, text_color);
+                    if resp.clicked() {
+                        self.sheet_config_modal_open = true;
+                    }
+                }
+            } else {
+                let preview = self.sheet_preview_cache.clone();
+
+                // Row 1: Status + Re-generate + Updating Spinner
+                ui.horizontal(|ui| {
+                    ui.label(egui::RichText::new("Sheet music generated").strong());
+                    if ui.button("Generate again").clicked() {
+                        self.sheet_config_modal_open = true;
+                    }
+                    
+                    if self.sheet_preview_result_rx.is_some() {
+                        ui.add_space(12.0);
+                        ui.add(egui::Spinner::new().size(14.0));
+                        ui.label(egui::RichText::new("Updating...").weak());
+                    }
+                });
+
+                ui.add_space(4.0);
+
+                // Row 2: Export actions
+                ui.horizontal(|ui| {
+                    let can_export = preview.is_some();
+                    if ui.add_enabled(can_export, egui::Button::new("Export MusicXML")).clicked() {
+                        self.export_sheet_musicxml(ui.ctx());
+                    }
+                    if ui.add_enabled(can_export, egui::Button::new("Export Engraved PDF")).clicked() {
+                        self.export_sheet_pdf(ui.ctx());
+                    }
+                    if ui.add_enabled(can_export, egui::Button::new("Open in MuseScore")).clicked() {
+                        self.open_in_musescore(ui.ctx());
+                    }
+                });
+
+                ui.add_space(4.0);
+
+                // Error reporting
+                if let Some(err) = self.sheet_preview_error.as_deref() {
+                    ui.colored_label(ERROR_RED, err);
+                }
+                if let Some(err) = self.sheet_engraving_error.as_deref() {
+                    ui.colored_label(ERROR_RED, err);
                 }
 
-                ui.add_space(UI_VSPACE_TIGHT);
-                draw_horizontal_separator(ui, 0.0);
-                ui.add_space(UI_VSPACE_TIGHT);
-
-                egui::ScrollArea::vertical()
-                    .max_height((content_height * 0.30).max(80.0))
-                    .show(ui, |ui| {
-                        egui::Grid::new("sheet_note_table")
-                            .striped(true)
-                            .num_columns(4)
-                            .show(ui, |ui| {
-                                ui.label("Beat");
-                                ui.label("Duration");
-                                ui.label("Pitch");
-                                ui.label("Velocity");
-                                ui.end_row();
-
-                                for note in data
-                                    .foundation
-                                    .quantized_notes
-                                    .iter()
-                                    .take(SHEET_NOTE_TABLE_LIMIT)
-                                {
-                                    ui.label(format!("{:.3}", note.beat_start));
-                                    ui.label(format!("{:.3}", note.beat_duration));
-                                    ui.label(midi_note_name(note.pitch));
-                                    ui.label(note.velocity.to_string());
-                                    ui.end_row();
-                                }
-                            });
-                    });
-            } else {
-                ui.add_space(24.0);
-                ui.centered_and_justified(|ui| {
-                    ui.label(
-                        "Need stable transcription data before sheet engraving is possible.\nTry reprocessing or adjusting key sensitivity.",
-                    );
-                });
+                // Score Area - Fills all remaining space
+                if let Some(data) = preview.as_ref() {
+                    let playback_time = (self.selected_time_sec
+                        + self.visualization_timing_offset_ms / 1000.0)
+                        .max(0.0);
+                    let active_note_id =
+                        Self::active_note_id_for_time(&data.melody_events, playback_time);
+                    let cursor_time = (playback_time - data.cursor_offset_sec).max(0.0);
+                    let current_beat = data.foundation.beat_at_time(cursor_time);
+                    
+                    if self.sheet_engraving_pages.is_empty() && self.sheet_engraving_error.is_none() {
+                        ui.centered_and_justified(|ui| {
+                            ui.label("Engraving is being prepared...");
+                        });
+                    } else {
+                        draw_scrollable_engraved_preview(
+                            ui,
+                            self.sheet_engraving_pages.as_slice(),
+                            current_beat,
+                            active_note_id,
+                            self.highlight_color,
+                        );
+                    }
+                }
             }
         });
+    }
 
-        ui.add_space(vertical_gap);
-        ui.scope(|ui| {
-            ui.spacing_mut().item_spacing.y = default_stack_spacing_y;
-            draw_media_controls(self, ui, interaction_ready, interaction_duration);
-        });
-        ui.add_space(vertical_gap);
+    fn draw_sheet_config_modal(&mut self, ui: &egui::Ui) {
+        let ctx = ui.ctx().clone();
+        egui::Window::new("Sheet Music Configuration")
+            .id(egui::Id::new("sheet_config_modal"))
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
+            .show(&ctx, |ui| {
+                egui::Grid::new("sheet_config_grid")
+                    .num_columns(2)
+                    .spacing(egui::vec2(12.0, 6.0))
+                    .striped(true)
+                    .show(ui, |ui| {
+                        // Mode
+                        ui.label("Mode").on_hover_text("Lead Sheet: single staff with melody + chords. Piano Grand Staff: both hands. Single Staff: one staff.");
+                        ui.horizontal(|ui| {
+                            for mode in &[SheetMusicMode::LeadSheet, SheetMusicMode::PianoGrandStaff, SheetMusicMode::SingleStaff] {
+                                ui.selectable_value(&mut self.sheet_music_mode, *mode, mode.label());
+                            }
+                        });
+                        ui.end_row();
+
+                        // Melody source
+                        ui.label("Melody source").on_hover_text("Which stems to use for melody extraction. Empty = Full Mix (all enabled stems combined).");
+                        let mel_label = if self.melody_stem_indices.is_empty() {
+                            "Full Mix".to_string()
+                        } else if let Some(stems) = self.separated_stems.as_ref() {
+                            self.melody_stem_indices.iter()
+                                .filter_map(|i| stems.get(*i))
+                                .map(|s| s.stem_type.display_name())
+                                .collect::<Vec<_>>()
+                                .join(", ")
+                        } else {
+                            format!("{} stem(s)", self.melody_stem_indices.len())
+                        };
+                        let mel_btn = ui.button(mel_label);
+                        if mel_btn.clicked() {
+                            self.melody_stem_selector_open = !self.melody_stem_selector_open;
+                            self.chord_stem_selector_open = false;
+                        }
+                        if self.melody_stem_selector_open {
+                            let popup_id = ui.make_persistent_id("modal_melody_selector");
+                            egui::Area::new(popup_id)
+                                .order(egui::Order::Foreground)
+                                .fixed_pos(mel_btn.rect.left_bottom() + egui::vec2(0.0, 4.0))
+                                .show(ui.ctx(), |ui| {
+                                    egui::Frame::popup(ui.style()).show(ui, |ui| {
+                                        ui.set_min_width(180.0);
+                                        ui.horizontal(|ui| {
+                                            if ui.button("Full Mix").clicked() { self.melody_stem_indices.clear(); }
+                                            if let Some(stems) = self.separated_stems.as_ref() {
+                                                if ui.button("All").clicked() { self.melody_stem_indices = (0..stems.len()).collect(); }
+                                            }
+                                            if ui.button("None").clicked() { self.melody_stem_indices.clear(); }
+                                        });
+                                        if let Some(stems) = self.separated_stems.as_ref() {
+                                            for (i, stem) in stems.iter().enumerate() {
+                                                let mut enabled = self.melody_stem_indices.contains(&i);
+                                                if ui.checkbox(&mut enabled, stem.stem_type.display_name()).changed() {
+                                                    if enabled { self.melody_stem_indices.insert(i); } else { self.melody_stem_indices.remove(&i); }
+                                                }
+                                            }
+                                        }
+                                        if ui.button("Done").clicked() { self.melody_stem_selector_open = false; }
+                                    });
+                                });
+                        }
+                        ui.end_row();
+
+                        // Chord source
+                        ui.label("Chord source").on_hover_text("Which stems to use for chord detection. Empty = Full Mix. 'Off' disables chord symbols.");
+                        let chord_label = if self.chord_skip {
+                            "Off".to_string()
+                        } else if self.chord_stem_indices.is_empty() {
+                            "Full Mix".to_string()
+                        } else if let Some(stems) = self.separated_stems.as_ref() {
+                            self.chord_stem_indices.iter()
+                                .filter_map(|i| stems.get(*i))
+                                .map(|s| s.stem_type.display_name())
+                                .collect::<Vec<_>>()
+                                .join(", ")
+                        } else {
+                            format!("{} stem(s)", self.chord_stem_indices.len())
+                        };
+                        let chord_btn = ui.button(chord_label);
+                        if chord_btn.clicked() {
+                            self.chord_stem_selector_open = !self.chord_stem_selector_open;
+                            self.melody_stem_selector_open = false;
+                        }
+                        if self.chord_stem_selector_open {
+                            let popup_id = ui.make_persistent_id("modal_chord_selector");
+                            egui::Area::new(popup_id)
+                                .order(egui::Order::Foreground)
+                                .fixed_pos(chord_btn.rect.left_bottom() + egui::vec2(0.0, 4.0))
+                                .show(ui.ctx(), |ui| {
+                                    egui::Frame::popup(ui.style()).show(ui, |ui| {
+                                        ui.set_min_width(180.0);
+                                        ui.horizontal(|ui| {
+                                            if ui.button("Off").clicked() { self.chord_skip = true; self.chord_stem_indices.clear(); }
+                                            if ui.button("Full Mix").clicked() { self.chord_skip = false; self.chord_stem_indices.clear(); }
+                                            if let Some(stems) = self.separated_stems.as_ref() {
+                                                if ui.button("All").clicked() { self.chord_skip = false; self.chord_stem_indices = (0..stems.len()).collect(); }
+                                            }
+                                        });
+                                        if let Some(stems) = self.separated_stems.as_ref() {
+                                            for (i, stem) in stems.iter().enumerate() {
+                                                let mut enabled = self.chord_stem_indices.contains(&i);
+                                                if ui.checkbox(&mut enabled, stem.stem_type.display_name()).changed() {
+                                                    self.chord_skip = false;
+                                                    if enabled { self.chord_stem_indices.insert(i); } else { self.chord_stem_indices.remove(&i); }
+                                                }
+                                            }
+                                        }
+                                        if ui.button("Done").clicked() { self.chord_stem_selector_open = false; }
+                                    });
+                                });
+                        }
+                        ui.end_row();
+
+                        // BPM
+                        ui.label("Tempo (BPM)").on_hover_text("Override detected tempo. Empty = auto-detect from audio.");
+                        ui.horizontal(|ui| {
+                            let mut bpm_invalid = false;
+                            if !self.bpm_input_str.trim().is_empty() && self.manual_bpm.is_none() {
+                                bpm_invalid = true;
+                            }
+                            let bpm_resp = ui.add(
+                                egui::TextEdit::singleline(&mut self.bpm_input_str)
+                                    .desired_width(60.0)
+                                    .hint_text("Auto")
+                                    .text_color(if bpm_invalid { egui::Color32::RED } else { egui::Color32::WHITE }),
+                            );
+                            if bpm_resp.lost_focus() {
+                                let trimmed = self.bpm_input_str.trim().to_string();
+                                if trimmed.is_empty() {
+                                    self.manual_bpm = None;
+                                } else if let Ok(bpm) = trimmed.parse::<f32>() {
+                                    let clamped = bpm.clamp(30.0, 400.0);
+                                    self.manual_bpm = Some(clamped);
+                                    self.bpm_input_str = format!("{:.0}", clamped);
+                                } else {
+                                    self.manual_bpm = None;
+                                }
+                            }
+                            if bpm_invalid {
+                                ui.label(egui::RichText::new("invalid").color(egui::Color32::RED).weak());
+                            }
+                            if self.manual_bpm.is_some() {
+                                if ui.button("×2").clicked() {
+                                    let base = self.manual_bpm.unwrap_or(120.0);
+                                    let clamped = (base * 2.0).clamp(30.0, 400.0);
+                                    self.manual_bpm = Some(clamped);
+                                    self.bpm_input_str = format!("{:.0}", clamped);
+                                }
+                                if ui.button("÷2").clicked() {
+                                    let base = self.manual_bpm.unwrap_or(120.0);
+                                    let clamped = (base / 2.0).clamp(30.0, 400.0);
+                                    self.manual_bpm = Some(clamped);
+                                    self.bpm_input_str = format!("{:.0}", clamped);
+                                }
+                                if ui.button("Clear").clicked() {
+                                    self.manual_bpm = None;
+                                    self.bpm_input_str.clear();
+                                }
+                            }
+                        });
+                        ui.end_row();
+
+                        // Feel
+                        ui.label("Rhythmic feel").on_hover_text("Override swing detection. 'Auto' detects from audio. 'Straight' forces even 8ths. 'Swing' forces swung 8ths.");
+                        ui.horizontal(|ui| {
+                            let feels = [
+                                (None, "Auto"),
+                                (Some(crate::leadsheet::SwingStyle::Straight), "Straight"),
+                                (Some(crate::leadsheet::SwingStyle::Swing), "Swing"),
+                                (Some(crate::leadsheet::SwingStyle::Triplet), "Triplet"),
+                            ];
+                            for (val, label) in &feels {
+                                let selected = self.manual_swing == *val;
+                                if ui.selectable_label(selected, *label).clicked() {
+                                    self.manual_swing = *val;
+                                }
+                            }
+                        });
+                        ui.end_row();
+
+                        // Polyphony
+                        ui.label("Polyphony").on_hover_text("Monophonic: single note line. Polyphonic: preserves chords. Heuristic applies skyline + near-note continuity with outlier suppression.");
+                        ui.horizontal(|ui| {
+                            let mono = self.melody_mode == MelodyMode::Monophonic;
+                            if ui.selectable_label(mono, "Monophonic").clicked() {
+                                self.melody_mode = MelodyMode::Monophonic;
+                            }
+                            if ui.selectable_label(!mono, "Polyphonic").clicked() {
+                                self.melody_mode = MelodyMode::Polyphonic;
+                            }
+                            if mono {
+                                let mut h = self.melody_heuristic;
+                                if ui.checkbox(&mut h, "Heuristic").changed() {
+                                    self.melody_heuristic = h;
+                                }
+                                if self.melody_heuristic {
+                                    ui.add(
+                                        egui::Slider::new(&mut self.melody_outlier_semitones, 3u8..=24u8)
+                                            .text("σ"),
+                                    ).on_hover_text("Outlier threshold: melody jumps larger than this many semitones from the rolling median are suppressed. Lower = smoother line, higher = allows more leaps");
+                                }
+                            }
+                        });
+                        ui.end_row();
+                    });
+
+                ui.add_space(UI_VSPACE_MEDIUM);
+                ui.horizontal(|ui| {
+                    if ui.button("Cancel").clicked() {
+                        self.sheet_config_modal_open = false;
+                    }
+                    if ui.button("Generate Sheet Music").clicked() {
+                        self.sheet_config_modal_open = false;
+                        self.sheet_preview_cache_key = None;
+                        self.sheet_engraving_cache_key = None;
+                        self.sheet_engraving_pages.clear();
+                        self.refresh_sheet_preview_if_needed(ui.ctx());
+                    }
+                });
+            });
     }
 
     fn sheet_preview_threshold(&self) -> f32 {
@@ -686,6 +740,22 @@ impl KeyScribeApp {
         let note_min_bits = self.melody_min_note.map(|m| m as u32).unwrap_or(0);
         let note_max_bits = self.melody_max_note.map(|m| m as u32).unwrap_or(0);
 
+        // Encode melody stem indices as bitmask
+        let mut melody_stem_bits = 0u64;
+        for &idx in &self.melody_stem_indices {
+            if idx < 64 {
+                melody_stem_bits |= 1 << idx;
+            }
+        }
+
+        // Encode chord stem indices as bitmask
+        let mut chord_stem_bits = 0u64;
+        for &idx in &self.chord_stem_indices {
+            if idx < 64 {
+                chord_stem_bits |= 1 << idx;
+            }
+        }
+
         Some(SheetPreviewCacheKey {
             timeline_ptr: Arc::as_ptr(&self.note_timeline) as usize,
             timeline_len: self.note_timeline.len(),
@@ -693,15 +763,19 @@ impl KeyScribeApp {
             threshold_bits: self.sheet_preview_threshold().to_bits(),
             separation_selection_bits: separation_bits,
             mode_bits: self.sheet_music_mode as u8,
-            melody_stem_bit: self.melody_stem_index.map(|i| i as u8),
-            chord_stem_bit: self.chord_stem_index.map(|i| i as u8),
+            melody_stem_bits,
+            chord_stem_bits,
             swing_style_bit: self.manual_swing.map(|s| s as u8),
             stem_analysis_key: stem_key,
             melody_note_range_bits: (note_min_bits << 8) | note_max_bits,
+            melody_mode_bits: (self.melody_mode as u8 as u32) << 24
+                | ((self.melody_heuristic as u8 as u32) << 23)
+                | (self.melody_outlier_semitones as u32) << 16,
+            use_musescore: self.sheet_use_musescore,
         })
     }
 
-    fn refresh_sheet_preview_if_needed(&mut self) {
+    fn refresh_sheet_preview_if_needed(&mut self, ctx: &egui::Context) {
         let Some(key) = self.current_sheet_preview_key() else {
             self.sheet_preview_cache_key = None;
             self.sheet_preview_cache = None;
@@ -716,22 +790,287 @@ impl KeyScribeApp {
             return;
         }
 
-        match self.build_sheet_preview() {
-            Ok(preview) => {
-                self.sheet_preview_cache_key = Some(key);
-                self.sheet_preview_cache = Some(preview);
-                self.sheet_preview_error = None;
-                self.sheet_engraving_cache_key = None;
-                self.sheet_engraving_pages.clear();
-                self.sheet_engraving_error = None;
+        if self.sheet_preview_result_rx.is_some() {
+            return;
+        }
+
+        self.start_sheet_preview_build(ctx, key);
+    }
+
+    fn start_sheet_preview_build(&mut self, ctx: &egui::Context, key: SheetPreviewCacheKey) {
+        let threshold = self.sheet_preview_threshold();
+
+        // Extract melody notes from the selected melody source(s) or combined timeline
+        let melody_events = self.extract_notes_for_stems(&self.melody_stem_indices, threshold);
+        if melody_events.is_empty() {
+            if !self.melody_stem_indices.is_empty() {
+                self.sheet_preview_error = Some("Selected melody stem analysis not yet ready. Please wait for per-stem analysis to complete.".to_string());
+            } else {
+                self.sheet_preview_error = Some("Not enough note events to infer tempo and sheet layout.".to_string());
             }
-            Err(err) => {
-                self.sheet_preview_cache_key = Some(key);
-                self.sheet_preview_cache = None;
-                self.sheet_preview_error = Some(err);
-                self.sheet_engraving_cache_key = None;
-                self.sheet_engraving_pages.clear();
-                self.sheet_engraving_error = None;
+            self.sheet_preview_cache_key = Some(key);
+            self.sheet_preview_cache = None;
+            return;
+        }
+        if melody_events.len() < 4 {
+            self.sheet_preview_error = Some("Not enough note events to infer tempo and sheet layout.".to_string());
+            self.sheet_preview_cache_key = Some(key);
+            self.sheet_preview_cache = None;
+            return;
+        }
+
+        let stems = self.separated_stems.as_ref();
+        let sample_rate = stems
+            .and_then(|s| s.first().map(|st| st.sample_rate))
+            .or_else(|| self.audio_raw.as_ref().map(|r| r.sample_rate))
+            .unwrap_or(44100);
+
+        let bass_audio: Option<Vec<f32>> = stems.and_then(|stems| {
+            stems
+                .iter()
+                .find(|s| s.stem_type == StemType::Bass)
+                .map(|s| s.samples_mono.to_vec())
+        });
+        let drum_audio: Option<Vec<f32>> = stems.and_then(|stems| {
+            stems
+                .iter()
+                .find(|s| s.stem_type == StemType::Drums)
+                .map(|s| s.samples_mono.to_vec())
+        });
+        let full_mix: Option<Vec<f32>> =
+            self.audio_raw.as_ref().map(|r| r.samples_mono.to_vec());
+
+        let chord_notes = if !self.chord_skip && !self.chord_stem_indices.is_empty() {
+            Some(self.extract_notes_for_stems(&self.chord_stem_indices, threshold))
+        } else {
+            None
+        };
+
+        let job = SheetPreviewJob {
+            key,
+            threshold,
+            melody_events,
+            melody_mode: self.melody_mode,
+            melody_outlier_semitones: self.melody_outlier_semitones,
+            melody_heuristic: self.melody_heuristic,
+            bass_audio,
+            drum_audio,
+            full_mix,
+            sample_rate,
+            manual_bpm: self.manual_bpm,
+            chord_skip: self.chord_skip,
+            chord_notes,
+            source_duration: self.source_duration(),
+        };
+
+        let (tx, rx) = std::sync::mpsc::channel::<(SheetPreviewCacheKey, Result<SheetPreviewData, String>)>();
+        self.sheet_preview_result_rx = Some(rx);
+
+        let ctx = ctx.clone();
+        thread::spawn(move || {
+            let result = Self::run_preview_background(job);
+            let _ = tx.send(result);
+            ctx.request_repaint();
+        });
+    }
+
+    fn run_preview_background(job: SheetPreviewJob) -> (SheetPreviewCacheKey, Result<SheetPreviewData, String>) {
+        let threshold = job.threshold;
+        let melody_events = job.melody_events;
+
+        // Reduce melody based on selected mode
+        let note_events = match job.melody_mode {
+            MelodyMode::Polyphonic => melody_events,
+            MelodyMode::Monophonic if !job.melody_heuristic => {
+                extract_melody_skyline(&melody_events, job.melody_outlier_semitones)
+            }
+            MelodyMode::Monophonic => {
+                extract_melody_heuristic(&melody_events, job.melody_outlier_semitones)
+            }
+        };
+
+        if note_events.len() < 4 {
+            return (job.key, Err("Not enough melody notes after reduction.".to_string()));
+        }
+
+        let (beat_track, bpm_source) = if job.sample_rate > 0 {
+            let beat_config = BeatTrackConfig::default();
+            match cross_validate_beat_sources(
+                job.bass_audio.as_deref(),
+                job.drum_audio.as_deref(),
+                job.full_mix.as_deref(),
+                job.sample_rate,
+                &beat_config,
+            ) {
+                Ok(cv) => {
+                    let src = if cv.source_count > 1 {
+                        format!("BeatThis cross-validated ({} sources)", cv.source_count)
+                    } else {
+                        "BeatThis ML".to_string()
+                    };
+                    (Some(cv), src)
+                }
+                Err(e) => {
+                    eprintln!("BeatThis Python execution failed: {:?}", e);
+                    let duration = job.source_duration;
+                    match crate::leadsheet::detect_beats_from_stems(
+                        job.bass_audio.as_deref(),
+                        job.drum_audio.as_deref(),
+                        job.full_mix.as_deref(),
+                        job.sample_rate,
+                        duration,
+                    ) {
+                        Some((bt, src)) => (Some(bt.into()), src),
+                        None => (None, "Note onsets (fallback)".to_string()),
+                    }
+                }
+            }
+        } else {
+            (None, "Unknown".to_string())
+        };
+
+        let beat_track = beat_track.or_else(|| {
+            crate::leadsheet::detect_beats_from_notes(&note_events).map(CrossValidatedBeats::from)
+        });
+
+        let beat_track = if let Some(manual_bpm) = job.manual_bpm {
+            let beat_duration = 60.0 / manual_bpm.clamp(30.0, 400.0);
+            let duration = job.source_duration;
+            let total_sec = duration.max(10.0) + 2.0;
+            let mut beats: Vec<f32> = Vec::new();
+            let mut t = 0.0f32;
+            while t <= total_sec + 1e-3 {
+                beats.push(t);
+                t += beat_duration;
+            }
+            let downbeats: Vec<f32> = beats.iter().step_by(4).copied().collect();
+            Some(CrossValidatedBeats {
+                beats,
+                downbeats,
+                beats_per_bar: 4,
+                bpm: manual_bpm,
+                confidence: 1.0,
+                source_count: 1,
+            })
+        } else {
+            beat_track
+        };
+
+        let mut config = LeadSheetPresetConfig::default();
+        config.quantization.min_duration_beats = 0.5;
+        config.quantization.grids = vec![1.0, 0.5];
+        config.quantization.duration_grids = vec![1.0, 0.5];
+        config.chord_analysis.skip = job.chord_skip;
+        let mut foundation = None;
+
+        if let Some(bt) = beat_track.as_ref() {
+            foundation = generate_lead_sheet_enhanced(
+                &note_events,
+                bt.beats.as_slice(),
+                bt.downbeats.as_slice(),
+                bt.beats_per_bar,
+                &config,
+            );
+        }
+
+        let fallback_bt = beat_track.as_ref().map(|bt| bt.clone().into());
+        let foundation_res = foundation
+            .or_else(|| {
+                fallback_bt.as_ref().and_then(|bt: &crate::leadsheet::BeatTrackResult| {
+                    tempo_map_from_beats(bt.beats.as_slice()).and_then(|(tempo, tempo_map)| {
+                        generate_lead_sheet_with_tempo_map(
+                            &note_events,
+                            tempo,
+                            tempo_map,
+                            &config,
+                        )
+                    })
+                })
+            })
+            .or_else(|| generate_lead_sheet_foundation(&note_events, &config))
+            .ok_or_else(|| {
+                "Tempo-map detection/quantization failed for the current selection.".to_string()
+            });
+
+        let mut foundation = match foundation_res {
+            Ok(f) => f,
+            Err(e) => return (job.key, Err(e)),
+        };
+
+        if foundation.quantized_notes.is_empty() {
+            return (job.key, Err("No quantized notes available for engraving.".to_string()));
+        }
+
+        if !job.chord_skip {
+            if let Some(chord_notes) = job.chord_notes {
+                if chord_notes.len() >= 4 {
+                    let chord_quantized = quantize_notes_with_rhythm_map(
+                        &chord_notes,
+                        foundation.tempo_map.as_slice(),
+                        foundation.time_signature_segments.as_slice(),
+                        &config.quantization,
+                    );
+                    if !chord_quantized.is_empty() {
+                        let mut chord_config = config.chord_analysis;
+                        chord_config.skip = false;
+                        foundation.chord_changes =
+                            detect_chord_changes_per_bar(chord_quantized.as_slice(), foundation.beats_per_bar, chord_config);
+                        debug_chord_notes_to_json(chord_quantized.as_slice(), foundation.beats_per_bar, chord_config);
+                    }
+                }
+            }
+        }
+
+        let bpm_source = if job.manual_bpm.is_some() {
+            "Manual".to_string()
+        } else {
+            bpm_source
+        };
+
+        let cursor_offset_sec = Self::estimate_sheet_cursor_offset_sec(&note_events, &foundation);
+        let note_count = note_events.len();
+        let melody_events = note_events;
+
+        (job.key, Ok(SheetPreviewData {
+            foundation,
+            note_count,
+            threshold,
+            bpm_source,
+            cursor_offset_sec,
+            melody_events,
+        }))
+    }
+
+    pub(super) fn poll_sheet_preview(&mut self, ctx: &egui::Context) {
+        let Some(rx) = &self.sheet_preview_result_rx else { return };
+        match rx.try_recv() {
+            Ok((key, result)) => {
+                self.sheet_preview_result_rx = None;
+                match result {
+                    Ok(preview) => {
+                        self.sheet_preview_cache_key = Some(key);
+                        self.sheet_preview_cache = Some(preview.clone());
+                        self.sheet_preview_error = None;
+                        self.sheet_engraving_cache_key = None;
+                        self.sheet_engraving_pages.clear();
+                        self.sheet_engraving_error = None;
+                        
+                        // Automatically trigger engraving now that we have the foundation
+                        self.refresh_engraved_preview_if_needed(ctx, &preview);
+                    }
+                    Err(err) => {
+                        self.sheet_preview_cache_key = Some(key);
+                        self.sheet_preview_cache = None;
+                        self.sheet_preview_error = Some(err);
+                        self.sheet_engraving_cache_key = None;
+                        self.sheet_engraving_pages.clear();
+                        self.sheet_engraving_error = None;
+                    }
+                }
+            }
+            Err(TryRecvError::Empty) => {}
+            Err(TryRecvError::Disconnected) => {
+                self.sheet_preview_result_rx = None;
             }
         }
     }
@@ -754,13 +1093,14 @@ impl KeyScribeApp {
         let engraving_config = SheetEngravingConfig {
             allow_triplets: !SHEET_SWING_BIAS,
             is_lead_sheet: self.sheet_music_mode.is_lead_sheet(),
+            single_staff: self.sheet_music_mode == SheetMusicMode::SingleStaff,
         };
         let musicxml = build_musicxml_document(
             file_stem.as_str(),
             &preview.foundation,
             engraving_config,
         );
-        let total_beats = total_beats_for_foundation(&preview.foundation);
+        let _total_beats = total_beats_for_foundation(&preview.foundation);
 
         // Submit engraving job to background thread
         self.start_sheet_render(ctx, &musicxml, key);
@@ -907,212 +1247,44 @@ impl KeyScribeApp {
         }
     }
 
-    fn build_sheet_preview(&mut self) -> Result<SheetPreviewData, String> {
-        let threshold = self.sheet_preview_threshold();
-
-        // Extract melody notes from the selected melody source (or combined timeline)
-        let melody_events = self.extract_notes_for_stem(self.melody_stem_index, threshold);
-        if melody_events.is_empty() {
-            if self.melody_stem_index.is_some() {
-                return Err("Selected melody stem analysis not yet ready. Please wait for per-stem analysis to complete.".to_string());
-            }
-            return Err("Not enough note events to infer tempo and sheet layout.".to_string());
-        }
-        if melody_events.len() < 4 {
-            return Err("Not enough note events to infer tempo and sheet layout.".to_string());
-        }
-
-        // Apply note range filter
-        let melody_events: Vec<NoteEvent> = melody_events
-            .into_iter()
-            .filter(|n| {
-                let above_min = self.melody_min_note.map(|m| n.pitch >= m).unwrap_or(true);
-                let below_max = self.melody_max_note.map(|m| n.pitch <= m).unwrap_or(true);
-                above_min && below_max
-            })
-            .collect();
-        if melody_events.len() < 4 {
-            return Err("Not enough notes in the selected range. Widen the note range.".to_string());
-        }
-
-        // For lead sheet: reduce melody to monophonic
-        let note_events = if self.sheet_music_mode.is_lead_sheet() {
-            reduce_to_monophonic_melody(&melody_events)
-        } else {
-            melody_events
-        };
-
-        if note_events.len() < 4 {
-            return Err("Not enough melody notes after reduction.".to_string());
-        }
-
-        // Cross-validated beat/downbeat detection via beat-this on drums + bass
-        // Falls back: beat-this on full mix → autocorrelation on stems → note-onset
-        let stems = self.separated_stems.as_ref();
-        let sample_rate = stems
-            .and_then(|s| s.first().map(|st| st.sample_rate))
-            .or_else(|| self.audio_raw.as_ref().map(|r| r.sample_rate));
-
-        let (beat_track, bpm_source) = if let Some(sr) = sample_rate {
-            let bass_audio: Option<&[f32]> = stems.and_then(|stems| {
-                stems
-                    .iter()
-                    .find(|s| s.stem_type == StemType::Bass)
-                    .map(|s| s.samples_mono.as_ref().as_slice())
-            });
-            let drum_audio: Option<&[f32]> = stems.and_then(|stems| {
-                stems
-                    .iter()
-                    .find(|s| s.stem_type == StemType::Drums)
-                    .map(|s| s.samples_mono.as_ref().as_slice())
-            });
-            let full_mix: Option<&[f32]> =
-                self.audio_raw.as_ref().map(|r| r.samples_mono.as_slice());
-            let beat_config = BeatTrackConfig::default();
-            match cross_validate_beat_sources(
-                bass_audio,
-                drum_audio,
-                full_mix,
-                sr,
-                &beat_config,
-            ) {
-                Ok(cv) => {
-                    let src = if cv.source_count > 1 {
-                        format!("BeatThis cross-validated ({} sources)", cv.source_count)
-                    } else {
-                        "BeatThis ML".to_string()
-                    };
-                    (Some(cv), src)
-                }
-                Err(e) => {
-                    // Fallback to autocorrelation on stems if ML model unavailable
-                    eprintln!("BeatThis Python execution failed: {:?}", e);
-                    let duration = self.source_duration();
-                    match crate::leadsheet::detect_beats_from_stems(
-                        bass_audio,
-                        drum_audio,
-                        full_mix,
-                        sr,
-                        duration,
-                    ) {
-                        Some((bt, src)) => (Some(bt.into()), src),
-                        None => (None, "Note onsets (fallback)".to_string()),
+    /// Extract note events from selected stem timelines, or from the combined
+    /// visualization timeline if no stems are selected.
+    fn extract_notes_for_stems(
+        &self,
+        stem_indices: &std::collections::BTreeSet<usize>,
+        threshold: f32,
+    ) -> Vec<NoteEvent> {
+        let mut next_id: u32 = 1;
+        if !stem_indices.is_empty() {
+            // When specific stems are selected, merge their analyses
+            let mut all_events: Vec<NoteEvent> = Vec::new();
+            for &idx in stem_indices {
+                if let Some(analysis) = self.stem_analyses.iter().find(|a| a.stem_index == idx) {
+                    if !analysis.timeline.is_empty() && analysis.step_sec > 0.0 {
+                        all_events.extend(Self::extract_events_from_timeline_data(
+                            &analysis.timeline,
+                            analysis.step_sec,
+                            threshold,
+                            &mut next_id,
+                        ));
                     }
                 }
             }
-        } else {
-            (None, "Unknown".to_string())
-        };
-
-        // Fallback: use note-onset BPM if audio-based detection failed
-        let beat_track = beat_track.or_else(|| {
-            crate::leadsheet::detect_beats_from_notes(&note_events).map(CrossValidatedBeats::from)
-        });
-
-        // Apply manual BPM override if set
-        let beat_track = if let Some(manual_bpm) = self.manual_bpm {
-            let beat_duration = 60.0 / manual_bpm.clamp(20.0, 300.0);
-            let duration = self.source_duration();
-            let total_sec = duration.max(10.0) + 2.0;
-            let mut beats: Vec<f32> = Vec::new();
-            let mut t = 0.0f32;
-            while t <= total_sec + 1e-3 {
-                beats.push(t);
-                t += beat_duration;
-            }
-            let downbeats: Vec<f32> = beats.iter().step_by(4).copied().collect();
-            Some(CrossValidatedBeats {
-                beats,
-                downbeats,
-                beats_per_bar: 4,
-                bpm: manual_bpm,
-                confidence: 1.0,
-                source_count: 1,
-            })
-        } else {
-            beat_track
-        };
-
-        let mut config = LeadSheetPresetConfig::default();
-        config.quantization.min_duration_beats = 0.25;
-        config.quantization.grids = vec![1.0, 0.5, 0.25];
-        config.quantization.duration_grids = vec![4.0, 3.0, 2.0, 1.5, 1.0, 0.75, 0.5, 0.25];
-        config.chord_analysis.skip = self.chord_skip;
-        let mut foundation = None;
-
-        if let Some(bt) = beat_track.as_ref() {
-            foundation = generate_lead_sheet_enhanced(
-                &note_events,
-                bt.beats.as_slice(),
-                bt.downbeats.as_slice(),
-                bt.beats_per_bar,
-                &config,
-            );
-        }
-
-        let fallback_bt = beat_track.as_ref().map(|bt| bt.clone().into());
-        let foundation = foundation
-            .or_else(|| {
-                fallback_bt.as_ref().and_then(|bt: &crate::leadsheet::BeatTrackResult| {
-                    tempo_map_from_beats(bt.beats.as_slice()).and_then(|(tempo, tempo_map)| {
-                        generate_lead_sheet_with_tempo_map(
-                            &note_events,
-                            tempo,
-                            tempo_map,
-                            &config,
-                        )
-                    })
-                })
-            })
-            .or_else(|| generate_lead_sheet_foundation(&note_events, &config))
-            .ok_or_else(|| {
-                "Tempo-map detection/quantization failed for the current selection.".to_string()
-            })?;
-
-        if foundation.quantized_notes.is_empty() {
-            return Err("No quantized notes available for engraving.".to_string());
-        }
-
-        let bpm_source = if self.manual_bpm.is_some() {
-            "Manual".to_string()
-        } else {
-            bpm_source
-        };
-
-        Ok(SheetPreviewData {
-            foundation,
-            note_count: note_events.len(),
-            threshold,
-            bpm_source,
-        })
-    }
-
-    /// Extract note events from a specific stem's timeline, or from the combined
-    /// visualization timeline if no stem is selected.
-    fn extract_notes_for_stem(
-        &self,
-        stem_index: Option<usize>,
-        threshold: f32,
-    ) -> Vec<NoteEvent> {
-        if let Some(idx) = stem_index {
-            // When a specific stem is selected, ONLY use that stem's analysis.
-            // Never fall back to the combined timeline — that would silently
-            // include notes from other stems and ignore the user's choice.
-            if let Some(analysis) = self.stem_analyses.iter().find(|a| a.stem_index == idx) {
-                if !analysis.timeline.is_empty() && analysis.step_sec > 0.0 {
-                    return Self::extract_events_from_timeline_data(
-                        &analysis.timeline,
-                        analysis.step_sec,
-                        threshold,
-                    );
-                }
+            if !all_events.is_empty() {
+                all_events.sort_by(|a, b| {
+                    a.start_time
+                        .partial_cmp(&b.start_time)
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                        .then_with(|| a.pitch.cmp(&b.pitch))
+                });
+                return all_events;
             }
             // Analysis not ready yet — return empty instead of using wrong data
             return Vec::new();
         }
-        // "Full Mix" mode: use combined timeline if available, else all non-drums stems
+        // "Full Mix" mode: use combined timeline if available, else all enabled stems
         if !self.stem_analyses.is_empty() && self.note_timeline.is_empty() {
-            // Combine ALL non-drums stem analyses into one polyphonic view
+            // Combine ALL enabled stem analyses into one polyphonic view
             let mut all_events: Vec<NoteEvent> = Vec::new();
             for analysis in &self.stem_analyses {
                 if !self.enabled_stem_indices.contains(&analysis.stem_index) {
@@ -1125,6 +1297,7 @@ impl KeyScribeApp {
                     &analysis.timeline,
                     analysis.step_sec,
                     threshold,
+                    &mut next_id,
                 ));
             }
             all_events.sort_by(|a, b| {
@@ -1143,6 +1316,7 @@ impl KeyScribeApp {
         timeline: &[Vec<f32>],
         step_sec: f32,
         threshold: f32,
+        next_id: &mut u32,
     ) -> Vec<NoteEvent> {
         if timeline.is_empty() || step_sec <= 0.0 {
             return Vec::new();
@@ -1173,12 +1347,14 @@ impl KeyScribeApp {
                     }
                     let velocity = (max_prob * 127.0).round().clamp(1.0, 127.0) as u8;
                     out.push(NoteEvent {
+                        id: *next_id,
                         pitch: (PIANO_LOW_MIDI as usize + note_idx) as u8,
                         start_time,
                         end_time,
                         velocity,
                         channel: None,
                     });
+                    *next_id = next_id.saturating_add(1);
                     max_prob = 0.0;
                 }
             }
@@ -1189,12 +1365,14 @@ impl KeyScribeApp {
                 let end_time = end_time.max(start_time + step_sec);
                 let velocity = (max_prob * 127.0).round().clamp(1.0, 127.0) as u8;
                 out.push(NoteEvent {
+                    id: *next_id,
                     pitch: (PIANO_LOW_MIDI as usize + note_idx) as u8,
                     start_time,
                     end_time,
                     velocity,
                     channel: None,
                 });
+                *next_id = next_id.saturating_add(1);
             }
         }
 
@@ -1240,6 +1418,7 @@ impl KeyScribeApp {
 
                     let velocity = (max_prob * 127.0).round().clamp(1.0, 127.0) as u8;
                     out.push(NoteEvent {
+                        id: (out.len() + 1) as u32,
                         pitch: (PIANO_LOW_MIDI as usize + note_idx) as u8,
                         start_time,
                         end_time,
@@ -1258,6 +1437,7 @@ impl KeyScribeApp {
                 if end_time - start_time >= min_duration_sec {
                     let velocity = (max_prob * 127.0).round().clamp(1.0, 127.0) as u8;
                     out.push(NoteEvent {
+                        id: (out.len() + 1) as u32,
                         pitch: (PIANO_LOW_MIDI as usize + note_idx) as u8,
                         start_time,
                         end_time,
@@ -1279,17 +1459,8 @@ impl KeyScribeApp {
         out
     }
 
-    fn trigger_sheet_regenerate(&mut self, ctx: &egui::Context) {
-        self.sheet_preview_cache_key = None;
-        self.sheet_engraving_cache_key = None;
-        self.refresh_sheet_preview_if_needed();
-        if let Some(preview) = self.sheet_preview_cache.as_ref().cloned() {
-            self.refresh_engraved_preview_if_needed(ctx, &preview);
-        }
-    }
-
-    fn export_sheet_musicxml(&mut self) {
-        self.refresh_sheet_preview_if_needed();
+    fn export_sheet_musicxml(&mut self, ctx: &egui::Context) {
+        self.refresh_sheet_preview_if_needed(ctx);
         let Some(preview) = self.sheet_preview_cache.as_ref() else {
             self.last_error = Some("No sheet preview available to export.".to_string());
             return;
@@ -1299,6 +1470,7 @@ impl KeyScribeApp {
         let engraving_config = SheetEngravingConfig {
             allow_triplets: !SHEET_SWING_BIAS,
             is_lead_sheet: self.sheet_music_mode.is_lead_sheet(),
+            single_staff: self.sheet_music_mode == SheetMusicMode::SingleStaff,
         };
         let xml = build_musicxml_document(
             file_stem.as_str(),
@@ -1315,8 +1487,8 @@ impl KeyScribeApp {
         }
     }
 
-    fn export_sheet_pdf(&mut self) {
-        self.refresh_sheet_preview_if_needed();
+    fn export_sheet_pdf(&mut self, ctx: &egui::Context) {
+        self.refresh_sheet_preview_if_needed(ctx);
         let Some(preview) = self.sheet_preview_cache.as_ref() else {
             self.last_error = Some("No sheet preview available to export.".to_string());
             return;
@@ -1326,6 +1498,7 @@ impl KeyScribeApp {
         let engraving_config = SheetEngravingConfig {
             allow_triplets: !SHEET_SWING_BIAS,
             is_lead_sheet: self.sheet_music_mode.is_lead_sheet(),
+            single_staff: self.sheet_music_mode == SheetMusicMode::SingleStaff,
         };
         let xml = build_musicxml_document(
             file_stem.as_str(),
@@ -1354,6 +1527,67 @@ impl KeyScribeApp {
                 ));
             }
         }
+    }
+
+    fn open_in_musescore(&mut self, ctx: &egui::Context) {
+        self.refresh_sheet_preview_if_needed(ctx);
+        let Some(preview) = self.sheet_preview_cache.as_ref() else {
+            self.last_error = Some("No sheet preview available to open.".to_string());
+            return;
+        };
+
+        let file_stem = self.export_file_stem();
+        let engraving_config = SheetEngravingConfig {
+            allow_triplets: !SHEET_SWING_BIAS,
+            is_lead_sheet: self.sheet_music_mode.is_lead_sheet(),
+            single_staff: self.sheet_music_mode == SheetMusicMode::SingleStaff,
+        };
+        let xml = build_musicxml_document(
+            file_stem.as_str(),
+            &preview.foundation,
+            engraving_config,
+        );
+
+        let temp_path = match write_temp_musicxml("keyscribe", &xml) {
+            Ok(p) => p,
+            Err(e) => {
+                self.last_error = Some(format!("Failed to write temp MusicXML: {e}"));
+                return;
+            }
+        };
+
+        let mut commands = vec![
+            "musescore4".to_string(),
+            "MuseScore4".to_string(),
+            "mscore".to_string(),
+            "MuseScore3".to_string(),
+            "MuseScore".to_string(),
+        ];
+
+        if cfg!(windows) {
+            if let Ok(program_files) = std::env::var("ProgramFiles") {
+                commands.push(format!("{}\\MuseScore 4\\bin\\MuseScore4.exe", program_files));
+                commands.push(format!("{}\\MuseScore 3\\bin\\MuseScore3.exe", program_files));
+            }
+            if let Ok(program_files_x86) = std::env::var("ProgramFiles(x86)") {
+                commands.push(format!("{}\\MuseScore 4\\bin\\MuseScore4.exe", program_files_x86));
+                commands.push(format!("{}\\MuseScore 3\\bin\\MuseScore3.exe", program_files_x86));
+            }
+        }
+
+        for cmd in &commands {
+            match Command::new(cmd).arg(temp_path.as_os_str()).spawn() {
+                Ok(_) => {
+                    self.last_error = None;
+                    return;
+                }
+                Err(_) => {}
+            }
+        }
+
+        self.last_error = Some(
+            "MuseScore was not found. Install MuseScore and ensure its CLI executable is on PATH.".to_string(),
+        );
     }
 
     fn export_file_stem(&self) -> String {
@@ -1412,7 +1646,7 @@ fn parse_svg_note_positions(svg_str: &str) -> Vec<NotePosition> {
         Ok(d) => d,
         Err(_) => return Vec::new(),
     };
-    let svg_node = match doc.root().descendants().find(|n| n.has_tag_name("svg")) {
+    let svg_node = match doc.root().descendants().find(|n| n.has_tag_name("svg") && n.attribute("viewBox").is_some()) {
         Some(n) => n,
         None => return Vec::new(),
     };
@@ -1427,18 +1661,83 @@ fn parse_svg_note_positions(svg_str: &str) -> Vec<NotePosition> {
         return Vec::new();
     }
 
+    // Parse page-margin offset from the outermost <g class="page-margin"> transform
+    let mut margin_ox = 0.0f32;
+    let mut margin_oy = 0.0f32;
+    for node in doc.descendants() {
+        if node.has_tag_name("g")
+            && node.attribute("class").map_or(false, |c| c == "page-margin")
+        {
+            if let Some(t) = node.attribute("transform") {
+                let t = t.trim();
+                if let Some(inner) = t.strip_prefix("translate(") {
+                    if let Some(paren) = inner.find(')') {
+                        let coords: Vec<f32> = inner[..paren]
+                            .split(|c| c == ',' || c == ' ')
+                            .filter_map(|s| {
+                                let s = s.trim();
+                                if s.is_empty() { None } else { s.parse().ok() }
+                            })
+                            .collect();
+                        if coords.len() >= 2 {
+                            margin_ox = coords[0];
+                            margin_oy = coords[1];
+                        }
+                    }
+                }
+            }
+            break;
+        }
+    }
+
     let mut positions = Vec::new();
     for node in doc.descendants() {
         if !node.has_tag_name("g") {
             continue;
         }
         let id = match node.attribute("id") {
-            Some(id) if id.starts_with('n') => id,
+            Some(id) => {
+                if let Some(pos) = id.find('n') {
+                    // Safety check to ensure it's our note ID (starts with n followed by digit)
+                    if id[pos + 1..]
+                        .chars()
+                        .next()
+                        .map(|c| c.is_ascii_digit())
+                        .unwrap_or(false)
+                    {
+                        &id[pos..]
+                    } else {
+                        continue;
+                    }
+                } else {
+                    continue;
+                }
+            }
             _ => continue,
         };
-        let pitch = match id[1..].split('_').next().and_then(|s| s.parse::<u8>().ok()) {
-            Some(p) if p >= 21 && p <= 108 => p,
-            _ => continue,
+        let parts: Vec<&str> = id[1..].split('_').collect();
+        let (note_id, pitch, tick, duration_ticks) = if parts.len() >= 4 {
+            let note_id = match parts[0].parse::<u32>().ok() {
+                Some(id) => id,
+                None => continue,
+            };
+            let pitch = match parts[1].parse::<u8>().ok() {
+                Some(p) if p >= 21 && p <= 108 => p,
+                _ => continue,
+            };
+            let tick = parts[2].parse::<i32>().ok().unwrap_or(0);
+            let duration_ticks = parts[3].parse::<i32>().ok().unwrap_or(0);
+            (note_id, pitch, tick, duration_ticks)
+        } else if parts.len() >= 3 {
+            let pitch = match parts[0].parse::<u8>().ok() {
+                Some(p) if p >= 21 && p <= 108 => p,
+                _ => continue,
+            };
+            let tick = parts[1].parse::<i32>().ok().unwrap_or(0);
+            let duration_ticks = parts[2].parse::<i32>().ok().unwrap_or(0);
+            (0, pitch, tick, duration_ticks)
+        } else {
+            continue;
         };
 
         // Try data-bounding-box first (most accurate)
@@ -1446,133 +1745,155 @@ fn parse_svg_note_positions(svg_str: &str) -> Vec<NotePosition> {
             let parts: Vec<f32> = bbox.split_whitespace().filter_map(|s| s.parse().ok()).collect();
             if parts.len() >= 4 && parts[2] > 0.0 && parts[3] > 0.0 {
                 positions.push(NotePosition {
-                    x: parts[0] / svg_w,
-                    y: parts[1] / svg_h,
+                    note_id,
+                    x: (parts[0] + margin_ox) / svg_w,
+                    y: (parts[1] + margin_oy) / svg_h,
                     w: parts[2] / svg_w,
                     h: parts[3] / svg_h,
                     pitch,
+                    tick,
+                    duration_ticks,
                 });
                 continue;
             }
         }
 
+        // Try bounding-box <rect> child (Verovio's svg-bounding-box option)
+        if let Some(rect) = node.children().find(|n| n.has_tag_name("rect")) {
+            let rx = rect.attribute("x").and_then(|s| s.parse::<f32>().ok());
+            let ry = rect.attribute("y").and_then(|s| s.parse::<f32>().ok());
+            let rw = rect.attribute("width").and_then(|s| s.parse::<f32>().ok());
+            let rh = rect.attribute("height").and_then(|s| s.parse::<f32>().ok());
+            if let (Some(rx), Some(ry), Some(rw), Some(rh)) = (rx, ry, rw, rh) {
+                if rw > 0.0 && rh > 0.0 {
+                    positions.push(NotePosition {
+                        note_id,
+                        x: (rx + margin_ox) / svg_w,
+                        y: (ry + margin_oy) / svg_h,
+                        w: rw / svg_w,
+                        h: rh / svg_h,
+                        pitch,
+                        tick,
+                        duration_ticks,
+                    });
+                    continue;
+                }
+            }
+        }
+
         // Fallback: find the first <use> element (note head) for x,y
+        // Skip if this element already has a bbox child (avoids duplicating positions)
+        let has_bbox_child = node.children().any(|n| {
+            n.has_tag_name("g") && n.attribute("id").map_or(false, |id| id.contains("bbox-"))
+        });
+        if !has_bbox_child {
         if let Some(use_node) = node.descendants().find(|n| n.has_tag_name("use")) {
+            // Verovio uses transform="translate(x,y)" instead of x/y attributes
             let nx = use_node.attribute("x").and_then(|s| s.parse::<f32>().ok());
             let ny = use_node.attribute("y").and_then(|s| s.parse::<f32>().ok());
-            if let (Some(nx), Some(ny)) = (nx, ny) {
-                // Note heads ~12x12 SVG units
-                let note_w = 14.0 / svg_w;
-                let note_h = 14.0 / svg_h;
-                positions.push(NotePosition {
-                    x: (nx - 7.0) / svg_w,
-                    y: (ny - 7.0) / svg_h,
-                    w: note_w,
-                    h: note_h,
-                    pitch,
-                });
+            let coords = match (nx, ny) {
+                (Some(x), Some(y)) => Some((x, y)),
+                _ => {
+                    use_node.attribute("transform").and_then(|t| {
+                        let t = t.trim();
+                        if t.starts_with("translate(") {
+                            let inner = t.trim_start_matches("translate(");
+                            if let Some(paren) = inner.find(')') {
+                                let coords: Vec<f32> = inner[..paren]
+                                    .split(|c| c == ',' || c == ' ')
+                                    .filter_map(|s| {
+                                        let s = s.trim();
+                                        if s.is_empty() { None } else { s.parse().ok() }
+                                    })
+                                    .collect();
+                                if coords.len() >= 2 {
+                                    Some((coords[0], coords[1]))
+                                } else {
+                                    None
+                                }
+                            } else {
+                                None
+                            }
+                        } else {
+                            None
+                        }
+                    })
+                }
+            };
+            if let Some((ncx, ncy)) = coords {
+                if ncx > 0.0 && ncy > 0.0 {
+                    let note_w = 14.0 / svg_w;
+                    let note_h = 14.0 / svg_h;
+                    positions.push(NotePosition {
+                        note_id,
+                        x: (ncx - 7.0) / svg_w,
+                        y: (ncy + margin_oy - 7.0) / svg_h,
+                        w: note_w,
+                        h: note_h,
+                        pitch,
+                        tick,
+                        duration_ticks,
+                    });
+                }
             }
+        }
         }
     }
     positions
 }
 
-fn render_engraved_pages_with_verovioxide(
-    ctx: &egui::Context,
-    musicxml: &str,
-    cache_key: &SheetPreviewCacheKey,
-    _total_beats: f32,
-) -> Result<Vec<EngravedSheetPage>, String> {
-    let mut toolkit = Toolkit::new().map_err(|err| format!("verovioxide init failed: {err}"))?;
-    toolkit
-        .load_data(musicxml)
-        .map_err(|err| format!("verovioxide could not parse MusicXML: {err}"))?;
-
-    let opts = Options::builder()
-        .svg_bounding_boxes(true)
-        .build();
-    toolkit.set_options(&opts)
-        .map_err(|err| format!("verovioxide options failed: {err}"))?;
-
-    let svg_pages: Vec<String> = toolkit
-        .render(Svg::all_pages())
-        .map_err(|err| format!("verovioxide SVG render failed: {err}"))?;
-
-    let dpi_scale = ctx.pixels_per_point().max(1.0);
-    let render_w = ((3000.0 * dpi_scale).ceil() as u32).min(4096);
-    let png_pages: Vec<Vec<u8>> = toolkit
-        .render(Png::all_pages().width(render_w).white_background())
-        .map_err(|err| format!("verovioxide PNG render failed: {err}"))?;
-
-    if png_pages.is_empty() {
-        return Err("verovioxide returned zero rendered pages.".to_string());
-    }
-
-    let page_count = png_pages.len().max(1);
-    let mut pages = Vec::with_capacity(page_count);
-
-    for (page_idx, page_bytes) in png_pages.into_iter().enumerate() {
-        let rgba = image::load_from_memory(page_bytes.as_slice())
-            .map_err(|err| format!("failed decoding rendered PNG page {}: {err}", page_idx + 1))?
-            .to_rgba8();
-
-        let width_px = rgba.width() as usize;
-        let height_px = rgba.height() as usize;
-        if width_px == 0 || height_px == 0 {
-            continue;
-        }
-
-        let color_image =
-            egui::ColorImage::from_rgba_unmultiplied([width_px, height_px], rgba.as_raw());
-        let texture = ctx.load_texture(
-            format!(
-                "sheet-engraved-{}-{}-{}-{}",
-                cache_key.timeline_ptr,
-                cache_key.timeline_len,
-                cache_key.timeline_step_bits,
-                page_idx
-            ),
-            color_image,
-            egui::TextureOptions::LINEAR,
-        );
-
-        let note_positions = if page_idx < svg_pages.len() {
-            parse_svg_note_positions(&svg_pages[page_idx])
-        } else {
-            Vec::new()
-        };
-
-        pages.push(EngravedSheetPage {
-            texture,
-            width_px,
-            height_px,
-            note_positions,
-            beat_start: 0.0,
-            beat_end: 0.0,
-        });
-    }
-
-    if pages.is_empty() {
-        Err("verovioxide returned pages, but no valid PNG image could be decoded.".to_string())
-    } else {
-        Ok(pages)
-    }
-}
-
 fn draw_scrollable_engraved_preview(
     ui: &mut egui::Ui,
     pages: &[EngravedSheetPage],
-    _current_beat: f32,
+    current_beat: f32,
+    active_note_id: Option<u32>,
     accent: egui::Color32,
-    active_notes: &[u8],
 ) {
     if pages.is_empty() {
         ui.label("No engraved pages available for preview.");
         return;
     }
 
-    let highlight_fill = egui::Color32::from_rgba_unmultiplied(accent.r(), accent.g(), accent.b(), 200);
-    let highlight_stroke = egui::Color32::from_rgba_unmultiplied(accent.r(), accent.g(), accent.b(), 255);
+    let cursor_color = egui::Color32::from_rgba_unmultiplied(accent.r(), accent.g(), accent.b(), 200);
+
+    let current_tick = (current_beat * MUSICXML_DIVISIONS as f32).round() as i32;
+
+    // First, find the global active note or bounding notes for rest interpolation
+    let mut global_active_count = 0usize;
+    let mut active_pages = Vec::new();
+    
+    // Also track the best predecessor and successor across all pages if no active note
+    let mut best_prev: Option<(usize, &NotePosition)> = None;
+    let mut best_next: Option<(usize, &NotePosition)> = None;
+
+    for (p_idx, page) in pages.iter().enumerate() {
+        let mut has_active = false;
+        for np in &page.note_positions {
+            let is_active = if let Some(id) = active_note_id {
+                np.note_id == id
+            } else {
+                current_tick >= np.tick && current_tick < np.tick + np.duration_ticks
+            };
+
+            if is_active {
+                has_active = true;
+                global_active_count += 1;
+            } else {
+                if np.tick + np.duration_ticks <= current_tick {
+                    if best_prev.map_or(true, |(_, p)| np.tick + np.duration_ticks > p.tick + p.duration_ticks) {
+                        best_prev = Some((p_idx, np));
+                    }
+                } else if np.tick > current_tick {
+                    if best_next.map_or(true, |(_, n)| np.tick < n.tick) {
+                        best_next = Some((p_idx, np));
+                    }
+                }
+            }
+        }
+        if has_active {
+            active_pages.push(p_idx);
+        }
+    }
 
     egui::ScrollArea::vertical()
         .id_source("sheet_music_scroll")
@@ -1589,28 +1910,141 @@ fn draw_scrollable_engraved_preview(
                     .fit_to_exact_size(egui::vec2(target_width, target_height));
                 let response = ui.add(image);
 
-                // Draw note highlights
-                if !active_notes.is_empty() {
-                    let active_set: std::collections::BTreeSet<u8> =
-                        active_notes.iter().copied().collect();
-                    for np in &page.note_positions {
-                        if active_set.contains(&np.pitch) {
-                            let rx = response.rect.left() + np.x * target_width;
-                            let ry = response.rect.top() + np.y * target_height;
-                            let rw = np.w * target_width;
-                            let rh = np.h * target_height;
-                            let note_rect = egui::Rect::from_min_size(
-                                egui::pos2(rx, ry),
-                                egui::vec2(rw, rh),
-                            );
-                            ui.painter().rect_filled(note_rect, 2.0, highlight_fill);
-                            ui.painter().rect_stroke(
-                                note_rect,
-                                2.0,
-                                egui::Stroke::new(1.5, highlight_stroke),
-                            );
+                let mut cursor_x: Option<f32> = None;
+                let mut active_center_y: f32 = 0.0;
+                let mut active_count = 0usize;
+
+                if global_active_count > 0 {
+                    if active_pages.contains(&idx) {
+                        for np in &page.note_positions {
+                            let is_active = if let Some(id) = active_note_id {
+                                np.note_id == id
+                            } else {
+                                current_tick >= np.tick && current_tick < np.tick + np.duration_ticks
+                            };
+                            
+                            if is_active {
+                                let cx = response.rect.left() + (np.x + np.w * 0.5) * target_width;
+                                cursor_x = Some(cursor_x.map_or(cx, |prev| prev.max(cx)));
+                                active_center_y += np.y + np.h * 0.5;
+                                active_count += 1;
+                            }
                         }
                     }
+                } else {
+                    // No active notes globally, this is a rest.
+                    // Interpolate between best_prev and best_next.
+                    let draw_on_this_page = match (best_prev, best_next) {
+                        (Some((p_idx, _)), Some((n_idx, _))) => idx == p_idx || (idx == n_idx && p_idx != n_idx),
+                        (Some((p_idx, _)), None) => idx == p_idx,
+                        (None, Some((n_idx, _))) => idx == n_idx,
+                        (None, None) => false,
+                    };
+
+                    if draw_on_this_page {
+                        if let (Some((p_idx, prev)), Some((n_idx, next))) = (best_prev, best_next) {
+                            if p_idx == n_idx && idx == p_idx {
+                                // Both on this page
+                                let y_diff = (prev.y - next.y).abs();
+                                if y_diff < 0.025 { // same system
+                                    let prev_end = prev.tick + prev.duration_ticks;
+                                    let gap = (next.tick - prev_end).max(1);
+                                    let t = (current_tick - prev_end).max(0) as f32 / gap as f32;
+                                    let t = t.clamp(0.0, 1.0);
+                                    
+                                    let prev_cx = response.rect.left() + (prev.x + prev.w * 0.5) * target_width;
+                                    let next_cx = response.rect.left() + (next.x + next.w * 0.5) * target_width;
+                                    
+                                    cursor_x = Some(prev_cx + t * (next_cx - prev_cx));
+                                    active_center_y += prev.y + prev.h * 0.5;
+                                    active_count += 1;
+                                } else {
+                                    // Different systems on same page
+                                    let prev_end = prev.tick + prev.duration_ticks;
+                                    let gap = (next.tick - prev_end).max(1);
+                                    let t = (current_tick - prev_end).max(0) as f32 / gap as f32;
+                                    if t < 0.5 {
+                                        cursor_x = Some(response.rect.left() + (prev.x + prev.w * 0.5) * target_width);
+                                        active_center_y += prev.y + prev.h * 0.5;
+                                        active_count += 1;
+                                    } else {
+                                        cursor_x = Some(response.rect.left() + (next.x + next.w * 0.5) * target_width);
+                                        active_center_y += next.y + next.h * 0.5;
+                                        active_count += 1;
+                                    }
+                                }
+                            } else {
+                                // On different pages. 
+                                let prev_end = prev.tick + prev.duration_ticks;
+                                let gap = (next.tick - prev_end).max(1);
+                                let t = (current_tick - prev_end).max(0) as f32 / gap as f32;
+                                if t < 0.5 && idx == p_idx {
+                                    cursor_x = Some(response.rect.left() + (prev.x + prev.w * 0.5) * target_width);
+                                    active_center_y += prev.y + prev.h * 0.5;
+                                    active_count += 1;
+                                } else if t >= 0.5 && idx == n_idx {
+                                    cursor_x = Some(response.rect.left() + (next.x + next.w * 0.5) * target_width);
+                                    active_center_y += next.y + next.h * 0.5;
+                                    active_count += 1;
+                                }
+                            }
+                        } else if let Some((p_idx, prev)) = best_prev {
+                            if idx == p_idx {
+                                cursor_x = Some(response.rect.left() + (prev.x + prev.w * 0.5) * target_width);
+                                active_center_y += prev.y + prev.h * 0.5;
+                                active_count += 1;
+                            }
+                        } else if let Some((n_idx, next)) = best_next {
+                            if idx == n_idx {
+                                cursor_x = Some(response.rect.left() + (next.x + next.w * 0.5) * target_width);
+                                active_center_y += next.y + next.h * 0.5;
+                                active_count += 1;
+                            }
+                        }
+                    }
+                }
+
+                // Draw vertical cursor line centered on the staff system
+                if let Some(x) = cursor_x {
+                    // Find the staff system containing the active notes by clustering
+                    // all note Y-centers on this page. A gap > 0.025 norm = system boundary.
+                    let mut y_centers: Vec<f32> = page.note_positions.iter()
+                        .map(|np| np.y + np.h * 0.5).collect();
+                    y_centers.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+
+                    if active_count == 0 {
+                        continue;
+                    }
+
+                    let active_y = active_center_y / active_count as f32;
+                    let gap_thresh = 0.025;
+                    let mut system_top = y_centers.first().copied().unwrap_or(0.0);
+                    let mut system_bot = system_top;
+                    let mut i = 1;
+                    while i < y_centers.len() {
+                        if y_centers[i] - y_centers[i - 1] > gap_thresh {
+                            // Check if active note falls in the just-finished system
+                            if active_y >= system_top && active_y <= system_bot {
+                                break;
+                            }
+                            system_top = y_centers[i];
+                            system_bot = y_centers[i];
+                        } else {
+                            system_bot = y_centers[i];
+                        }
+                        i += 1;
+                    }
+
+                    let pad = (system_bot - system_top) * 0.1;
+                    let sy0 = (system_top - pad).max(0.0);
+                    let sy1 = (system_bot + pad).min(1.0);
+
+                    let y0 = response.rect.top() + sy0 * target_height;
+                    let y1 = response.rect.top() + sy1 * target_height;
+                    ui.painter().line_segment(
+                        [egui::pos2(x, y0), egui::pos2(x, y1)],
+                        egui::Stroke::new(2.0, cursor_color),
+                    );
                 }
 
                 if idx + 1 < pages.len() {
@@ -1622,6 +2056,7 @@ fn draw_scrollable_engraved_preview(
 
 #[derive(Clone)]
 struct NoteSpan {
+    id: u32,
     start_tick: i32,
     end_tick: i32,
     pitch: u8,
@@ -1632,6 +2067,7 @@ struct NoteSpan {
 
 #[derive(Clone)]
 struct NoteChunk {
+    id: u32,
     start_tick_in_measure: i32,
     duration_ticks: i32,
     absolute_tick: i32,
@@ -1655,6 +2091,7 @@ struct DurationToken {
 struct SheetEngravingConfig {
     allow_triplets: bool,
     is_lead_sheet: bool,
+    single_staff: bool,
 }
 
 impl Default for SheetEngravingConfig {
@@ -1662,6 +2099,7 @@ impl Default for SheetEngravingConfig {
         Self {
             allow_triplets: !SHEET_SWING_BIAS,
             is_lead_sheet: true,
+            single_staff: false,
         }
     }
 }
@@ -1695,9 +2133,10 @@ fn build_measure_boundaries(
         };
         let mw = (seg.numerator.max(1) as i32) * MUSICXML_DIVISIONS;
 
+        let seg_limit = seg_end_tick.min(max_tick);
         let mut cursor = boundaries.last().copied().unwrap_or(0).max(seg_start_tick);
-        while cursor < seg_end_tick.min(max_tick) {
-            let next = (cursor + mw).min(seg_end_tick);
+        while cursor < seg_limit {
+            let next = (cursor + mw).min(seg_limit);
             boundaries.push(next);
             cursor = next;
         }
@@ -1729,6 +2168,7 @@ fn split_span_into_measures(
         let dur = (chunk_end - cursor).max(1);
 
         target.entry(mi as i32).or_default().push(NoteChunk {
+            id: span.id,
             start_tick_in_measure: cursor - ms,
             duration_ticks: dur,
             absolute_tick: cursor,
@@ -1843,6 +2283,19 @@ fn build_musicxml_document(
         }
     }
 
+    // Trim trailing empty measures
+    let mut last_content = -1i32;
+    for mi in 0..total_measures as i32 {
+        let has_content = chunks_by_measure.contains_key(&mi)
+            || chord_by_measure.contains_key(&mi)
+            || tempo_marks_by_measure.contains_key(&mi)
+            || swing_by_measure.contains_key(&mi);
+        if has_content {
+            last_content = mi;
+        }
+    }
+    let total_measures = (last_content + 1).max(1).min(total_measures as i32) as usize;
+
     let mut xml = String::new();
     let _ = write!(
         xml,
@@ -1867,8 +2320,8 @@ fn build_musicxml_document(
         .unwrap_or((4, 4));
     let mut prev_swing_style: Option<SwingStyle> = None;
 
-    // Determine per-measure clef for lead sheet based on average pitch
-    let measure_clefs: Vec<&'static str> = if config.is_lead_sheet {
+    // Determine per-measure clef for single-staff modes based on average pitch
+    let measure_clefs: Vec<&'static str> = if config.is_lead_sheet || config.single_staff {
         let mut clefs = Vec::with_capacity(total_measures);
         for measure_idx in 0..total_measures {
             if let Some(chunks) = chunks_by_measure.get(&(measure_idx as i32)) {
@@ -1895,40 +2348,51 @@ fn build_musicxml_document(
             current_time_sig = (num, den);
         }
 
-        if measure_idx == 0 || time_signature_change_by_measure.contains_key(&(measure_idx as i32)) {
+        let mut clef_to_write = None;
+        if config.is_lead_sheet || config.single_staff {
+            if let Some(&clef) = measure_clefs.get(measure_idx) {
+                if clef != current_clef && measure_idx > 0 {
+                    clef_to_write = Some(clef);
+                }
+            }
+        }
+
+        let has_time_sig_change = time_signature_change_by_measure.contains_key(&(measure_idx as i32));
+        if measure_idx == 0 || has_time_sig_change || clef_to_write.is_some() {
             let _ = write!(xml, "      <attributes>\n");
             if measure_idx == 0 {
                 let _ = write!(xml, "        <divisions>{}</divisions>\n", MUSICXML_DIVISIONS);
                 let _ = write!(xml, "        <key><fifths>0</fifths></key>\n");
                 if config.is_lead_sheet {
-                    // Lead sheet: always start with treble clef
                     let _ = write!(xml, "        <clef><sign>G</sign><line>2</line></clef>\n");
+                } else if config.single_staff {
+                    let first_clef = measure_clefs.first().copied().unwrap_or("G");
+                    let (sign, line) = if first_clef == "F" { ("F", 4) } else { ("G", 2) };
+                    let _ = write!(xml, "        <clef><sign>{}</sign><line>{}</line></clef>\n", sign, line);
                 } else {
                     let _ = write!(xml, "        <staves>2</staves>\n");
                     let _ = write!(xml, "        <clef number=\"1\"><sign>G</sign><line>2</line></clef>\n");
                     let _ = write!(xml, "        <clef number=\"2\"><sign>F</sign><line>4</line></clef>\n");
                 }
             }
-            let _ = write!(
-                xml,
-                "        <time><beats>{}</beats><beat-type>{}</beat-type></time>\n",
-                current_time_sig.0,
-                current_time_sig.1
-            );
+            if measure_idx == 0 || has_time_sig_change {
+                let _ = write!(
+                    xml,
+                    "        <time><beats>{}</beats><beat-type>{}</beat-type></time>\n",
+                    current_time_sig.0,
+                    current_time_sig.1
+                );
+            }
 
-            // Dynamic clef for lead sheet: switch per-measure based on avg pitch
-            if config.is_lead_sheet {
-                if let Some(&clef) = measure_clefs.get(measure_idx) {
-                    if clef != current_clef {
-                        current_clef = clef;
-                        let (sign, line) = if clef == "F" { ("F", 4) } else { ("G", 2) };
-                        let _ = write!(
-                            xml,
-                            "        <clef><sign>{}</sign><line>{}</line></clef>\n",
-                            sign, line
-                        );
-                    }
-                }
+            // Dynamic clef for single-staff modes: switch per-measure based on avg pitch
+            if let Some(clef) = clef_to_write {
+                current_clef = clef;
+                let (sign, line) = if clef == "F" { ("F", 4) } else { ("G", 2) };
+                let _ = write!(
+                    xml,
+                    "        <clef><sign>{}</sign><line>{}</line></clef>\n",
+                    sign, line
+                );
             }
 
             let _ = write!(xml, "      </attributes>\n");
@@ -1994,6 +2458,25 @@ fn build_musicxml_document(
         let mut chunks = chunks_by_measure.remove(&(measure_idx as i32)).unwrap_or_default();
         chunks.sort_by_key(|chunk| chunk.start_tick_in_measure);
 
+        // If the measure has no notes, chords, or directions, fill it with a rest
+        let has_content = !chunks.is_empty()
+            || chord_by_measure.contains_key(&(measure_idx as i32))
+            || tempo_marks_by_measure.contains_key(&(measure_idx as i32))
+            || swing_by_measure.contains_key(&(measure_idx as i32));
+        if !has_content {
+            write_rest_ticks(
+                &mut xml,
+                boundaries[measure_idx],
+                measure_ticks,
+                MUSICXML_DIVISIONS,
+                1,
+                1,
+                config,
+            );
+            let _ = write!(xml, "    </measure>\n");
+            continue;
+        }
+
         if config.is_lead_sheet {
             let voice_map = build_voice_chunks(chunks.as_slice(), 1);
             let voice_count = voice_map.len().max(1);
@@ -2003,6 +2486,7 @@ fn build_musicxml_document(
                 write_voice_sequence(
                     &mut xml,
                     voice_chunks.as_slice(),
+                    boundaries[measure_idx],
                     measure_ticks,
                     MUSICXML_DIVISIONS,
                     1,
@@ -2027,6 +2511,7 @@ fn build_musicxml_document(
                     write_voice_sequence(
                         &mut xml,
                         voice_chunks.as_slice(),
+                        boundaries[measure_idx],
                         measure_ticks,
                         MUSICXML_DIVISIONS,
                         staff,
@@ -2059,35 +2544,279 @@ fn build_musicxml_document(
     xml
 }
 
-fn reduce_to_monophonic_melody(notes: &[NoteEvent]) -> Vec<NoteEvent> {
+/// Combined heuristic: skyline (highest pitch) + near-note continuity bias + outlier filter.
+/// At each event point the highest active pitch is the base candidate, but when multiple
+/// notes are active at the same pitch range, prefers the one closest to the previous melody
+/// pitch (near-note continuity). Outliers more than `outlier_semitones` from the rolling
+/// median are suppressed.
+fn extract_melody_heuristic(notes: &[NoteEvent], outlier_semitones: u8) -> Vec<NoteEvent> {
     if notes.is_empty() {
         return Vec::new();
     }
 
-    let mut sorted = notes.to_vec();
-    sorted.sort_by(|a, b| {
-        a.start_time
-            .partial_cmp(&b.start_time)
-            .unwrap_or(std::cmp::Ordering::Equal)
-            .then_with(|| b.pitch.cmp(&a.pitch))
-    });
+    let mut events: Vec<(f32, u8, u8, bool)> = Vec::with_capacity(notes.len() * 2);
+    for n in notes {
+        if !n.start_time.is_finite() || !n.end_time.is_finite() || n.end_time <= n.start_time {
+            continue;
+        }
+        events.push((n.start_time, n.pitch, n.velocity, true));
+        events.push((n.end_time, n.pitch, n.velocity, false));
+    }
+    events.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal)
+        .then_with(|| b.3.cmp(&a.3)));
 
-    let mut melody: Vec<NoteEvent> = Vec::new();
-    for note in sorted {
-        let overlaps = melody.iter().any(|m| {
-            note.start_time < m.end_time && note.end_time > m.start_time
-        });
-        if !overlaps {
-            melody.push(note);
+    // Pre-deduplicate: for any group of note-ons at the same time, keep only the
+    // first note-on per pitch.  Multiple stems can produce identical note-ons,
+    // but different pitches must be preserved so the skyline algorithm can
+    // choose among them.
+    let time_tolerance = 0.12;
+    let mut deduped: Vec<(f32, u8, u8, bool)> = Vec::with_capacity(events.len());
+    {
+        let mut i = 0;
+        while i < events.len() {
+            let batch_time = events[i].0;
+            let mut j = i;
+            while j < events.len() && (events[j].0 - batch_time).abs() <= time_tolerance {
+                j += 1;
+            }
+            let mut seen: std::collections::HashSet<u8> = std::collections::HashSet::new();
+            for k in i..j {
+                let (time, pitch, vel, is_start) = events[k];
+                if is_start {
+                    if seen.insert(pitch) {
+                        deduped.push((time, pitch, vel, true));
+                    }
+                } else {
+                    deduped.push((time, pitch, vel, false));
+                }
+            }
+            i = j;
         }
     }
 
-    melody.sort_by(|a, b| {
-        a.start_time
-            .partial_cmp(&b.start_time)
-            .unwrap_or(std::cmp::Ordering::Equal)
-    });
-    melody
+    let events = deduped;
+    let mut active: Vec<(u8, u8)> = Vec::new();
+    let mut melody_segments: Vec<NoteEvent> = Vec::new();
+    let mut segment_start = 0.0f32;
+    let mut last_melody_pitch: Option<u8> = None;
+    let mut last_melody_vel: u8 = 90;
+    let mut pitch_history: Vec<u8> = Vec::new();
+
+    let mut i = 0;
+    while i < events.len() {
+        let batch_time = events[i].0;
+
+        let mut batch_end = i;
+        while batch_end < events.len() && (events[batch_end].0 - batch_time).abs() <= time_tolerance {
+            batch_end += 1;
+        }
+
+        // Note-offs first
+        for j in i..batch_end {
+            let (_, pitch, _, is_start) = events[j];
+            if !is_start {
+                active.retain(|a| a.0 != pitch);
+            }
+        }
+
+        // Note-ons second
+        for j in i..batch_end {
+            let (_, pitch, vel, is_start) = events[j];
+            if is_start {
+                active.push((pitch, vel));
+            }
+        }
+
+        // One melody decision per batch
+        if !active.is_empty() {
+            let max_pitch = active.iter().map(|a| a.0).max().unwrap_or(0);
+            let candidates: Vec<(u8, u8)> = active.iter().filter(|a| a.0 == max_pitch).copied().collect();
+            let best = if candidates.len() == 1 {
+                candidates[0]
+            } else {
+                let prev = last_melody_pitch.unwrap_or(max_pitch);
+                candidates.into_iter().min_by_key(|c| (c.0 as i16 - prev as i16).abs()).unwrap()
+            };
+
+            if Some(best.0) != last_melody_pitch {
+                let mut skip = false;
+                if pitch_history.len() >= 3 {
+                    let mut sorted = pitch_history.clone();
+                    sorted.sort();
+                    let median = sorted[sorted.len() / 2];
+                    let diff = (best.0 as i16 - median as i16).abs();
+                    if diff > outlier_semitones as i16 {
+                        skip = true;
+                    }
+                }
+
+                if !skip {
+                    if let Some(prev_pitch) = last_melody_pitch {
+                        if batch_time > segment_start {
+                            melody_segments.push(NoteEvent {
+                                id: (melody_segments.len() + 1) as u32,
+                                pitch: prev_pitch,
+                                start_time: segment_start,
+                                end_time: batch_time,
+                                velocity: last_melody_vel,
+                                channel: None,
+                            });
+                        }
+                    }
+
+                    segment_start = batch_time;
+                    last_melody_pitch = Some(best.0);
+                    last_melody_vel = best.1;
+                    pitch_history.push(best.0);
+                    if pitch_history.len() > 8 {
+                        pitch_history.remove(0);
+                    }
+                }
+            }
+        }
+
+        i = batch_end;
+    }
+
+    if let Some(pitch) = last_melody_pitch {
+        let end_t = events.last().map(|e| e.0).unwrap_or(segment_start + 1.0);
+        if end_t > segment_start {
+            melody_segments.push(NoteEvent {
+                id: (melody_segments.len() + 1) as u32,
+                pitch,
+                start_time: segment_start,
+                end_time: end_t,
+                velocity: last_melody_vel,
+                channel: None,
+            });
+        }
+    }
+
+    melody_segments
+}
+
+/// Pure skyline (no continuity bias) — highest pitch at each point, with outlier filter.
+fn extract_melody_skyline(notes: &[NoteEvent], outlier_semitones: u8) -> Vec<NoteEvent> {
+    if notes.is_empty() {
+        return Vec::new();
+    }
+
+    // Build event list: note-on and note-off
+    let mut events: Vec<(f32, u8, u8, bool)> = Vec::with_capacity(notes.len() * 2);
+    for n in notes {
+        if !n.start_time.is_finite() || !n.end_time.is_finite() || n.end_time <= n.start_time {
+            continue;
+        }
+        events.push((n.start_time, n.pitch, n.velocity, true));
+        events.push((n.end_time, n.pitch, n.velocity, false));
+    }
+    events.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal)
+        .then_with(|| b.3.cmp(&a.3)));
+
+    // Sweep: batch-process events within a small time tolerance so that
+    // near-simultaneous notes from different stems are treated as one group.
+    let time_tolerance = 0.15; // covers ~0.42 beats at 170 BPM (safe for 0.5-beat snap bucket)
+    let mut active: Vec<(u8, u8)> = Vec::new();
+    let mut melody_segments: Vec<NoteEvent> = Vec::new();
+    let mut segment_start = 0.0f32;
+    let mut last_melody_pitch: Option<u8> = None;
+    let mut last_melody_vel: u8 = 90;
+    let mut pitch_history: Vec<u8> = Vec::new();
+
+    let mut i = 0;
+    while i < events.len() {
+        let batch_time = events[i].0;
+
+        // Gather all events within tolerance of batch_time
+        let mut batch_end = i;
+        while batch_end < events.len() && (events[batch_end].0 - batch_time).abs() <= time_tolerance {
+            batch_end += 1;
+        }
+
+        // Process note-offs first for this batch
+        for j in i..batch_end {
+            let (_, pitch, _, is_start) = events[j];
+            if !is_start {
+                active.retain(|a| a.0 != pitch);
+            }
+        }
+
+        // Process note-ons for this batch
+        for j in i..batch_end {
+            let (_, pitch, vel, is_start) = events[j];
+            if is_start {
+                active.push((pitch, vel));
+            }
+        }
+
+        // Make one melody decision for this batch
+        if !active.is_empty() {
+            let max_pitch = active.iter().map(|a| a.0).max().unwrap_or(0);
+            let candidates: Vec<(u8, u8)> = active.iter().filter(|a| a.0 == max_pitch).copied().collect();
+            let best = if candidates.len() == 1 {
+                candidates[0]
+            } else {
+                let prev = last_melody_pitch.unwrap_or(max_pitch);
+                candidates.into_iter().min_by_key(|c| (c.0 as i16 - prev as i16).abs()).unwrap()
+            };
+
+            if Some(best.0) != last_melody_pitch {
+                // Outlier filter
+                let mut skip = false;
+                if pitch_history.len() >= 3 {
+                    let mut sorted = pitch_history.clone();
+                    sorted.sort();
+                    let median = sorted[sorted.len() / 2];
+                    let diff = (best.0 as i16 - median as i16).abs();
+                    if diff > outlier_semitones as i16 {
+                        skip = true;
+                    }
+                }
+
+                if !skip {
+                    // Emit previous segment
+                    if let Some(prev_pitch) = last_melody_pitch {
+                        if batch_time > segment_start {
+                            melody_segments.push(NoteEvent {
+                                id: (melody_segments.len() + 1) as u32,
+                                pitch: prev_pitch,
+                                start_time: segment_start,
+                                end_time: batch_time,
+                                velocity: last_melody_vel,
+                                channel: None,
+                            });
+                        }
+                    }
+
+                    segment_start = batch_time;
+                    last_melody_pitch = Some(best.0);
+                    last_melody_vel = best.1;
+                    pitch_history.push(best.0);
+                    if pitch_history.len() > 8 {
+                        pitch_history.remove(0);
+                    }
+                }
+            }
+        }
+
+        i = batch_end;
+    }
+
+    if let Some(pitch) = last_melody_pitch {
+        let end_t = events.last().map(|e| e.0).unwrap_or(segment_start + 1.0);
+        if end_t > segment_start {
+            melody_segments.push(NoteEvent {
+                id: (melody_segments.len() + 1) as u32,
+                pitch,
+                start_time: segment_start,
+                end_time: end_t,
+                velocity: last_melody_vel,
+                channel: None,
+            });
+        }
+    }
+
+    melody_segments
 }
 
 fn merge_adjacent_notes(notes: &mut Vec<NoteEvent>, step: f32) {
@@ -2123,9 +2852,8 @@ fn merge_adjacent_notes(notes: &mut Vec<NoteEvent>, step: f32) {
 }
 
 fn notes_to_spans(notes: &[QuantizedNote], config: SheetEngravingConfig) -> Vec<NoteSpan> {
-    let std_durations: [f32; 12] = [
-        4.0, 3.0, 2.0, 1.5, 1.0, 0.75, 0.5, 0.375, 0.25, 0.1875, 0.125, 0.0625,
-    ];
+    // DEBUG: whole, half, quarter, 8th only (no 16th/32nd)
+    let std_durations: [f32; 4] = [4.0, 2.0, 1.0, 0.5];
 
     fn snap_to_std(value: f32, candidates: &[f32]) -> f32 {
         let mut best = value;
@@ -2145,7 +2873,7 @@ fn notes_to_spans(notes: &[QuantizedNote], config: SheetEngravingConfig) -> Vec<
         let start_tick = (note.beat_start * MUSICXML_DIVISIONS as f32).round().max(0.0) as i32;
         let raw_dur = snap_to_std(note.beat_duration, &std_durations);
         let duration_ticks = (raw_dur * MUSICXML_DIVISIONS as f32).round().max(1.0) as i32;
-        let staff = if config.is_lead_sheet {
+        let staff = if config.is_lead_sheet || config.single_staff {
             1
         } else if note.pitch >= GRAND_STAFF_SPLIT_MIDI {
             1
@@ -2153,6 +2881,7 @@ fn notes_to_spans(notes: &[QuantizedNote], config: SheetEngravingConfig) -> Vec<
             2
         };
         out.push(NoteSpan {
+            id: note.id,
             start_tick: start_tick.max(0),
             end_tick: (start_tick + duration_ticks).max(start_tick + 1),
             pitch: note.pitch,
@@ -2163,6 +2892,23 @@ fn notes_to_spans(notes: &[QuantizedNote], config: SheetEngravingConfig) -> Vec<
     }
 
     out.sort_by_key(|n| n.start_tick);
+
+    // Deduplicate: if two NoteSpans share the same pitch and start_tick,
+    // keep only the longer one (prevents unison from monophonic reduction).
+    let mut deduped: Vec<NoteSpan> = Vec::with_capacity(out.len());
+    for span in out {
+        if let Some(last) = deduped.last_mut() {
+            if last.pitch == span.pitch && last.start_tick == span.start_tick {
+                if span.end_tick > last.end_tick {
+                    last.end_tick = span.end_tick;
+                }
+                continue;
+            }
+        }
+        deduped.push(span);
+    }
+    out = deduped;
+
     out
 }
 
@@ -2271,22 +3017,23 @@ fn chord_suffix_to_musicxml_kind(suffix: &str) -> &'static str {
 fn pc_to_step_alter(pc: u8) -> (&'static str, i8) {
     match pc % 12 {
         0 => ("C", 0),
-        1 => ("C", 1),
+        1 => ("D", -1),
         2 => ("D", 0),
-        3 => ("D", 1),
+        3 => ("E", -1),
         4 => ("E", 0),
         5 => ("F", 0),
-        6 => ("F", 1),
+        6 => ("G", -1),
         7 => ("G", 0),
-        8 => ("G", 1),
+        8 => ("A", -1),
         9 => ("A", 0),
-        10 => ("A", 1),
+        10 => ("B", -1),
         _ => ("B", 0),
     }
 }
 
 fn write_rest_ticks(
     xml: &mut String,
+    start_tick: i32,
     duration_ticks: i32,
     divisions: i32,
     staff: u8,
@@ -2294,8 +3041,14 @@ fn write_rest_ticks(
     config: SheetEngravingConfig,
 ) {
     let tokens = duration_tokens_for_ticks(duration_ticks, divisions, config);
+    let mut cursor_tick = start_tick;
     for token in tokens {
-        let _ = write!(xml, "      <note>\n");
+        let _ = write!(
+            xml,
+            "      <note id=\"r{}_{}\">\n",
+            cursor_tick,
+            token.ticks.max(1)
+        );
         let _ = write!(xml, "        <rest/>\n");
         let _ = write!(xml, "        <duration>{}</duration>\n", token.ticks.max(1));
         write_time_mod(xml, token.time_mod);
@@ -2311,66 +3064,11 @@ fn write_rest_ticks(
             let _ = write!(xml, "        </notations>\n");
         }
         let _ = write!(xml, "      </note>\n");
+        cursor_tick += token.ticks.max(1);
     }
 }
 
-fn write_note_chunk(
-    xml: &mut String,
-    chunk: &NoteChunk,
-    divisions: i32,
-    staff: u8,
-    voice: u8,
-    config: SheetEngravingConfig,
-) {
-    let note_id = format!("n{}_{}", chunk.pitch, chunk.absolute_tick);
-    if chunk.articulation == Articulation::Grace {
-        let grace_token = DurationToken {
-            ticks: 0,
-            note_type: "grace",
-            dots: 0,
-            time_mod: None,
-        };
-        write_note_element(
-            xml,
-            &note_id,
-            chunk.pitch,
-            grace_token,
-            staff,
-            voice,
-            chunk.velocity,
-            false,
-            false,
-            false,
-            chunk.articulation,
-        );
-        return;
-    }
 
-    let tokens = duration_tokens_for_ticks(chunk.duration_ticks, divisions, config);
-    for (idx, token) in tokens.iter().enumerate() {
-        let local_tie_stop = (idx > 0) || (idx == 0 && chunk.tie_stop);
-        let local_tie_start =
-            (idx + 1 < tokens.len()) || (idx + 1 == tokens.len() && chunk.tie_start);
-        let token_note_id = if tokens.len() > 1 {
-            format!("{}_t{}", note_id, idx)
-        } else {
-            note_id.clone()
-        };
-        write_note_element(
-            xml,
-            &token_note_id,
-            chunk.pitch,
-            *token,
-            staff,
-            voice,
-            chunk.velocity,
-            false,
-            local_tie_start,
-            local_tie_stop,
-            chunk.articulation,
-        );
-    }
-}
 
 fn write_note_element(
     xml: &mut String,
@@ -2384,9 +3082,10 @@ fn write_note_element(
     tie_start: bool,
     tie_stop: bool,
     articulation: Articulation,
+    beam: Option<&'static str>,
 ) {
     let (step, alter, octave) = midi_to_pitch_parts(pitch);
-    let _ = write!(xml, "      <note xml:id=\"{}\">\n", xml_escape(note_id));
+    let _ = write!(xml, "      <note id=\"{}\">\n", xml_escape(note_id));
     if is_chord {
         let _ = write!(xml, "        <chord/>\n");
     }
@@ -2408,6 +3107,14 @@ fn write_note_element(
     let _ = write!(xml, "        <type>{}</type>\n", note_type);
     for _ in 0..token.dots {
         let _ = write!(xml, "        <dot/>\n");
+    }
+    let (_, alter, _) = midi_to_pitch_parts(pitch);
+    if alter != 0 && token.note_type != "grace" {
+        let acc = match alter { -2 => "double-flat", -1 => "flat", 1 => "sharp", 2 => "double-sharp", _ => "sharp" };
+        let _ = write!(xml, "        <accidental>{}</accidental>\n", acc);
+    }
+    if let Some(b) = beam {
+        let _ = write!(xml, "        <beam number=\"1\">{}</beam>\n", b);
     }
     let _ = write!(xml, "        <voice>{}</voice>\n", voice.max(1));
     let _ = write!(xml, "        <staff>{}</staff>\n", staff.max(1));
@@ -2460,16 +3167,14 @@ fn write_note_element(
 
 fn note_type_for_ticks(ticks: i32, divisions: i32) -> (&'static str, i32, i32) {
     let d = divisions.max(1);
-    // (type_name, expected_ticks, dots)
+    // DEBUG: whole, half, quarter, 8th only (no 16th/32nd)
     let types = [
         ("whole", d * 4, 0),
         ("half", d * 2, 0),
         ("quarter", d, 0),
         ("eighth", d / 2, 0),
-        ("16th", d / 4, 0),
-        ("32nd", d / 8, 0),
     ];
-    let mut best = ("16th", d / 4, 0i32);
+    let mut best = ("quarter", d, 0i32);
     for &(name, expected, dots) in &types {
         if expected <= 0 {
             continue;
@@ -2494,115 +3199,46 @@ fn note_type_for_ticks(ticks: i32, divisions: i32) -> (&'static str, i32, i32) {
 fn duration_tokens_for_ticks(
     duration_ticks: i32,
     divisions: i32,
-    config: SheetEngravingConfig,
+    _config: SheetEngravingConfig,
 ) -> Vec<DurationToken> {
     let d = divisions.max(1);
+    let min_tick = d / 2; // smallest unit = eighth note (240 at 480 div)
+
+    // Floor to nearest 8th boundary so we never exceed the true duration
+    let total = (duration_ticks.max(0) / min_tick) * min_tick;
+    if total < min_tick {
+        return Vec::new();
+    }
+
+    // DEBUG: undotted whole, half, quarter, eighth only
     let candidates = [
-        DurationToken {
-            ticks: d * 4,
-            note_type: "whole",
-            dots: 0,
-            time_mod: None,
-        },
-        DurationToken {
-            ticks: d * 3,
-            note_type: "half",
-            dots: 1,
-            time_mod: None,
-        },
-        DurationToken {
-            ticks: d * 2,
-            note_type: "half",
-            dots: 0,
-            time_mod: None,
-        },
-        DurationToken {
-            ticks: d + d / 2,
-            note_type: "quarter",
-            dots: 1,
-            time_mod: None,
-        },
-        DurationToken {
-            ticks: d,
-            note_type: "quarter",
-            dots: 0,
-            time_mod: None,
-        },
-        DurationToken {
-            ticks: d / 2 + d / 4,
-            note_type: "eighth",
-            dots: 1,
-            time_mod: None,
-        },
-        DurationToken {
-            ticks: d / 2,
-            note_type: "eighth",
-            dots: 0,
-            time_mod: None,
-        },
-        DurationToken {
-            ticks: d / 3,
-            note_type: "eighth",
-            dots: 0,
-            time_mod: Some((3, 2)),
-        },
-        DurationToken {
-            ticks: d / 4 + d / 8,
-            note_type: "16th",
-            dots: 1,
-            time_mod: None,
-        },
-        DurationToken {
-            ticks: d / 4,
-            note_type: "16th",
-            dots: 0,
-            time_mod: None,
-        },
-        DurationToken {
-            ticks: d / 6,
-            note_type: "16th",
-            dots: 0,
-            time_mod: Some((3, 2)),
-        },
+        DurationToken { ticks: d * 4, note_type: "whole", dots: 0, time_mod: None },
+        DurationToken { ticks: d * 2, note_type: "half", dots: 0, time_mod: None },
+        DurationToken { ticks: d, note_type: "quarter", dots: 0, time_mod: None },
+        DurationToken { ticks: d / 2, note_type: "eighth", dots: 0, time_mod: None },
     ];
 
-    let mut remaining = duration_ticks.max(1);
-    let mut out = Vec::new();
+    let mut remaining = total;
 
+    let mut out = Vec::new();
     while remaining > 0 {
-        let mut chosen = None;
-        for candidate in &candidates {
-            if candidate.ticks <= 0 {
-                continue;
-            }
-            if !config.allow_triplets && candidate.time_mod.is_some() {
-                continue;
-            }
+        let mut chosen: Option<DurationToken> = None;
+        for &candidate in &candidates {
             if candidate.ticks <= remaining {
-                chosen = Some(*candidate);
+                chosen = Some(candidate);
                 break;
             }
         }
 
-        let token = chosen.unwrap_or_else(|| {
-            let (nt, _expected, _dots) = note_type_for_ticks(remaining, divisions);
-            DurationToken {
-                ticks: remaining,
-                note_type: nt,
-                dots: 0,
-                time_mod: None,
+        match chosen {
+            Some(token) => {
+                remaining -= token.ticks;
+                out.push(token);
             }
-        });
-
-        let tick = token.ticks.max(1).min(remaining);
-        out.push(DurationToken {
-            ticks: tick,
-            note_type: token.note_type,
-            dots: token.dots,
-            time_mod: token.time_mod,
-        });
-
-        remaining -= tick;
+            None => {
+                break;
+            }
+        }
     }
 
     out
@@ -2622,47 +3258,154 @@ fn build_voice_chunks(chunks: &[NoteChunk], staff: u8) -> BTreeMap<u8, Vec<NoteC
 fn write_voice_sequence(
     xml: &mut String,
     chunks: &[NoteChunk],
+    measure_start_tick: i32,
     measure_ticks: i32,
     divisions: i32,
     staff: u8,
     voice: u8,
     config: SheetEngravingConfig,
 ) {
-    let min_rest_ticks = (divisions / 4).max(1);
-    let mut cursor = 0i32;
+    let min_rest_ticks = (divisions / 2).max(1); // no rests smaller than 8th
 
-    for chunk in chunks {
-        if chunk.start_tick_in_measure > cursor {
-            let gap = chunk.start_tick_in_measure - cursor;
+    // Pre-compute beam groups for consecutive eighth notes
+    let mut beam_of_group: Vec<Option<&'static str>> = vec![None; chunks.len()];
+    {
+        let mut g = 0;
+        let mut group_positions: Vec<(usize, bool)> = Vec::new();
+        while g < chunks.len() {
+            let pos = chunks[g].start_tick_in_measure;
+            let mut ge = g;
+            let mut max_dur = 0;
+            while ge < chunks.len() && chunks[ge].start_tick_in_measure == pos {
+                max_dur = max_dur.max(chunks[ge].duration_ticks);
+                ge += 1;
+            }
+            let is_eighth = max_dur <= divisions / 2;
+            group_positions.push((g, is_eighth));
+            g = ge;
+        }
+        let mut gi = 0;
+        while gi < group_positions.len() {
+            if group_positions[gi].1 {
+                let start = gi;
+                while gi < group_positions.len() && group_positions[gi].1 { gi += 1; }
+                let end = gi;
+                if end - start >= 2 {
+                    beam_of_group[group_positions[start].0] = Some("begin");
+                    for k in (start + 1)..(end - 1) {
+                        beam_of_group[group_positions[k].0] = Some("continue");
+                    }
+                    beam_of_group[group_positions[end - 1].0] = Some("end");
+                }
+            } else {
+                gi += 1;
+            }
+        }
+    }
+
+    let mut cursor = 0i32;
+    let mut i = 0;
+
+    while i < chunks.len() {
+        if cursor >= measure_ticks {
+            break;
+        }
+
+        let nominal_pos = chunks[i].start_tick_in_measure;
+
+        // If this chunk's position is behind the cursor, shift it to the cursor
+        // (avo`ids going backwards in time within a single voice).
+        let write_pos = if nominal_pos < cursor { cursor } else { nominal_pos };
+
+        // Rest gap before write_pos
+        if write_pos > cursor {
+            let gap = write_pos.min(measure_ticks) - cursor;
             if gap >= min_rest_ticks {
                 write_rest_ticks(
                     xml,
-                    gap.min(measure_ticks - cursor),
+                    measure_start_tick + cursor,
+                    gap,
                     divisions,
                     staff,
                     voice,
                     config,
                 );
             }
-            cursor = chunk.start_tick_in_measure.min(measure_ticks);
+            cursor = write_pos.min(measure_ticks);
+            if cursor >= measure_ticks {
+                break;
+            }
         }
 
-        if cursor >= measure_ticks {
-            break;
+        // Gather all chunks starting at this *nominal* position (chord group)
+        let mut group_end = i;
+        while group_end < chunks.len() && chunks[group_end].start_tick_in_measure == nominal_pos {
+            group_end += 1;
         }
 
-        let chunk_dur = chunk.duration_ticks.min(measure_ticks - cursor);
-        if chunk_dur > 0 {
-            write_note_chunk(xml, chunk, divisions, staff, voice, config);
-            cursor = (chunk.start_tick_in_measure + chunk_dur).min(measure_ticks);
-        } else {
-            cursor = (chunk.start_tick_in_measure + chunk.duration_ticks).min(measure_ticks);
+        // Find max duration in the chord group
+        let group_dur = chunks[i..group_end]
+            .iter()
+            .map(|c| c.duration_ticks)
+            .max()
+            .unwrap_or(0);
+        let clamped_dur = group_dur.min(measure_ticks - cursor);
+
+        // Write chord: first note normal, rest as chords.
+        // ALL chord notes share the same duration (max of group) — MusicXML
+        // requires chord notes to have identical durations, otherwise
+        // renderers count each as consuming separate time.
+        for (j, chunk) in chunks[i..group_end].iter().enumerate() {
+            let is_chord = j > 0;
+            if clamped_dur > 0 {
+                let tokens = duration_tokens_for_ticks(clamped_dur, divisions, config);
+                let mut current_token_tick = chunk.absolute_tick;
+                
+                for (idx, token) in tokens.iter().enumerate() {
+                    let local_tie_stop = (idx > 0) || (idx == 0 && chunk.tie_stop);
+                    let local_tie_start = (idx + 1 < tokens.len()) || (idx + 1 == tokens.len() && chunk.tie_start);
+                    
+                    let beam = if j == 0 && idx == 0 { beam_of_group[i] } else { None };
+                    write_note_element(
+                        xml,
+                        &format!(
+                            "n{}_{}_{}_{}",
+                            chunk.id,
+                            chunk.pitch,
+                            current_token_tick,
+                            token.ticks
+                        ),
+                        chunk.pitch,
+                        *token,
+                        staff,
+                        voice,
+                        chunk.velocity,
+                        is_chord,
+                        local_tie_start,
+                        local_tie_stop,
+                        chunk.articulation,
+                        beam,
+                    );
+                    current_token_tick += token.ticks;
+                }
+            }
         }
+
+        cursor = (cursor + clamped_dur).min(measure_ticks);
+        i = group_end;
     }
 
     let remaining = measure_ticks - cursor;
     if remaining >= min_rest_ticks {
-        write_rest_ticks(xml, remaining, divisions, staff, voice, config);
+        write_rest_ticks(
+            xml,
+            measure_start_tick + cursor,
+            remaining,
+            divisions,
+            staff,
+            voice,
+            config,
+        );
     }
 }
 
@@ -2829,7 +3572,6 @@ fn export_engraved_pdf_with_musescore(musicxml_path: &Path, pdf_path: &Path) -> 
     }
 }
 
-#[allow(dead_code)]
 fn write_temp_musicxml(prefix: &str, xml: &str) -> Result<PathBuf, String> {
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -2870,6 +3612,7 @@ mod tests {
             },
             quantized_notes: vec![
                 QuantizedNote {
+                    id: 1,
                     pitch: 60,
                     beat_start: 0.0,
                     beat_duration: 1.0,
@@ -2884,6 +3627,7 @@ mod tests {
                     swing_feel: false,
                 },
                 QuantizedNote {
+                    id: 2,
                     pitch: 64,
                     beat_start: 1.0,
                     beat_duration: 1.0,
@@ -2947,6 +3691,7 @@ mod tests {
             },
             quantized_notes: vec![
                 QuantizedNote {
+                    id: 1,
                     pitch: 60,
                     beat_start: 0.0,
                     beat_duration: 0.5,
@@ -2961,6 +3706,7 @@ mod tests {
                     swing_feel: false,
                 },
                 QuantizedNote {
+                    id: 2,
                     pitch: 62,
                     beat_start: 0.5,
                     beat_duration: 0.5,
@@ -3029,6 +3775,7 @@ mod tests {
             },
             quantized_notes: vec![
                 QuantizedNote {
+                    id: 1,
                     pitch: 60,
                     beat_start: 0.0,
                     beat_duration: 1.0,
@@ -3043,6 +3790,7 @@ mod tests {
                     swing_feel: false,
                 },
                 QuantizedNote {
+                    id: 2,
                     pitch: 62,
                     beat_start: 8.0,
                     beat_duration: 1.0,
