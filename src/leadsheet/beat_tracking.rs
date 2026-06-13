@@ -100,9 +100,9 @@ pub fn run_beat_this_multi(
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
 
-    // Debug: save the raw output and errors from the Python model regardless of exit status
-    let _ = std::fs::write("beat_this_debug.json", stdout.as_ref());
-    let _ = std::fs::write("beat_this_debug.err", stderr.as_ref());
+    let temp_dir = std::env::temp_dir();
+    let _ = std::fs::write(temp_dir.join("beat_this_debug.json"), stdout.as_ref());
+    let _ = std::fs::write(temp_dir.join("beat_this_debug.err"), stderr.as_ref());
 
     if !output.status.success() {
         return Err(anyhow!(
@@ -598,8 +598,7 @@ pub fn detect_beats_from_notes(notes: &[NoteEvent]) -> Option<BeatTrackResult> {
         return None;
     }
 
-    // Downbeats: every 4th beat (standard 4/4 time)
-    let downbeats: Vec<f32> = beats.iter().step_by(4).copied().collect();
+    let downbeats: Vec<f32> = Vec::new();
 
     Some(BeatTrackResult { beats, downbeats })
 }

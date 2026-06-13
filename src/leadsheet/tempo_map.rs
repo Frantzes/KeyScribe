@@ -264,7 +264,7 @@ pub fn detect_time_signature_segments(
         });
     }
 
-    merge_adjacent_time_signatures(segments.as_mut_slice());
+    merge_adjacent_time_signatures(&mut segments);
     segments
 }
 
@@ -350,11 +350,11 @@ fn infer_signature_for_tempo_segment(
     }
 
     let candidates: [(u8, u8, f32); 5] = [
-        (2, 4, 0.88),
-        (3, 4, 0.84),
+        (2, 4, 0.92),
+        (3, 4, 0.94),
         (4, 4, 1.00),
-        (6, 8, 0.78),
-        (12, 8, 0.74),
+        (6, 8, 0.90),
+        (12, 8, 0.86),
     ];
 
     let mut best = (4u8, 4u8, 0.20f32);
@@ -434,19 +434,16 @@ fn score_time_signature_candidate(
     best_rotation_score / total_weight.max(1.0)
 }
 
-fn merge_adjacent_time_signatures(segments: &mut [TimeSignatureSegment]) {
-    if segments.len() < 2 {
-        return;
-    }
-
-    for i in 1..segments.len() {
-        let prev = segments[i - 1].clone();
-        let curr = &mut segments[i];
-        if prev.numerator == curr.numerator && prev.denominator == curr.denominator {
-            curr.start_beat = prev.start_beat;
-            curr.confidence = curr.confidence.max(prev.confidence);
+fn merge_adjacent_time_signatures(segments: &mut Vec<TimeSignatureSegment>) {
+    segments.dedup_by(|b, a| {
+        if a.numerator == b.numerator && a.denominator == b.denominator {
+            a.end_beat = b.end_beat;
+            a.confidence = a.confidence.max(b.confidence);
+            true
+        } else {
+            false
         }
-    }
+    });
 }
 
 fn collect_window_samples(

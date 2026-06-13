@@ -40,18 +40,26 @@ pub fn detect_chord_changes(
     let mut out = Vec::new();
     let mut last_symbol = String::new();
 
+    let mut sorted_notes = quantized_notes.to_vec();
+    sorted_notes.sort_by(|a, b| a.beat_start.partial_cmp(&b.beat_start).unwrap_or(std::cmp::Ordering::Equal));
+
     let mut beat = 0.0f32;
     let step = config.step_beats.max(0.25);
+    let mut note_idx = 0;
+    let mut active_notes: Vec<&QuantizedNote> = Vec::new();
+
     while beat <= max_beat + 1.0e-4 {
+        while note_idx < sorted_notes.len() && sorted_notes[note_idx].beat_start <= beat + 1.0e-5 {
+            active_notes.push(&sorted_notes[note_idx]);
+            note_idx += 1;
+        }
+
+        active_notes.retain(|n| n.beat_start + n.beat_duration > beat);
+
         let mut pcs = BTreeSet::<u8>::new();
         let mut bass_pitch: Option<u8> = None;
 
-        for note in quantized_notes {
-            let note_end = note.beat_start + note.beat_duration;
-            if beat + 1.0e-5 < note.beat_start || beat >= note_end {
-                continue;
-            }
-
+        for note in &active_notes {
             pcs.insert(note.pitch % 12);
             bass_pitch = Some(match bass_pitch {
                 Some(existing) => existing.min(note.pitch),
@@ -402,8 +410,12 @@ pub(crate) fn choose_chord_symbol(pcs: &[u8], bass_pitch: Option<u8>) -> Option<
     let mut best_score = i32::MIN;
     for root in 0u8..12u8 {
         if let Some((suffix, score, _)) = best_template_for_root(pcs, root, &TEMPLATES) {
-            if score > best_score {
-                best_score = score;
+            let bass_bonus = match bass_pitch {
+                Some(bass) if bass % 12 == root => 2,
+                _ => 0,
+            };
+            if score + bass_bonus > best_score {
+                best_score = score + bass_bonus;
                 best_root = root;
                 best_suffix = suffix;
             }
@@ -646,7 +658,8 @@ pub fn debug_chord_notes_to_json(
     });
 
     if let Ok(json_str) = serde_json::to_string_pretty(&debug) {
-        let _ = std::fs::write("chord_debug.json", json_str);
+        let temp_dir = std::env::temp_dir();
+        let _ = std::fs::write(temp_dir.join("chord_debug.json"), json_str);
     }
 }
 

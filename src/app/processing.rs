@@ -899,7 +899,7 @@ impl KeyScribeApp {
         let note_count = (PIANO_HIGH_MIDI - PIANO_LOW_MIDI + 1) as usize;
 
         // 1. Per-stem timeline combination (when individual stem analyses are available)
-        if !self.stem_analyses.is_empty() && self.separated_stems.is_some() {
+        if !self.stem_analyses.is_empty() && self.separated_stems.is_some() && !self.enabled_stem_indices.is_empty() {
             let pitch = self.pitch_semitones;
             let mut combined = vec![0.0f32; note_count];
             let mut colors = vec![self.highlight_color; note_count];
@@ -961,6 +961,12 @@ impl KeyScribeApp {
             self.note_stem_colors = colors;
         }
         // 2. Pre-computed blended timeline (original audio or blended stems when per-stem not ready)
+        else if self.enabled_stem_indices.is_empty() && !self.base_note_timeline.is_empty() && self.base_note_timeline_step_sec > 0.0 {
+            let idx = (current_time.max(0.0) / self.base_note_timeline_step_sec) as usize;
+            let idx = idx.min(self.base_note_timeline.len().saturating_sub(1));
+            self.note_probs = self.base_note_timeline[idx].clone();
+            self.note_stem_colors = vec![self.highlight_color; note_count];
+        }
         else if !self.note_timeline.is_empty() && self.note_timeline_step_sec > 0.0 {
             let idx = (current_time.max(0.0) / self.note_timeline_step_sec) as usize;
             let idx = idx.min(self.note_timeline.len().saturating_sub(1));

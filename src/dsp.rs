@@ -155,15 +155,18 @@ pub fn apply_speed_and_pitch_interleaved(
         }
     }
 
-    let mut processed_channels = Vec::with_capacity(channels);
-    for channel in separated {
-        processed_channels.push(apply_speed_and_pitch_mono(
-            &channel,
-            sample_rate,
-            speed,
-            pitch_semitones,
-        ));
-    }
+    use rayon::prelude::*;
+    let processed_channels: Vec<Vec<f32>> = separated
+        .into_par_iter()
+        .map(|channel| {
+            apply_speed_and_pitch_mono(
+                &channel,
+                sample_rate,
+                speed,
+                pitch_semitones,
+            )
+        })
+        .collect();
 
     let out_frames = processed_channels.iter().map(Vec::len).min().unwrap_or(0);
     if out_frames == 0 {

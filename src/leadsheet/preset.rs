@@ -356,7 +356,16 @@ pub fn generate_lead_sheet_enhanced(
     let time_sig_numerator = beats_per_bar as u8;
     let time_sig_denominator = 4u8;
 
-    let last_beat = aligned.last().map(|n| n.beat_index as f32).unwrap_or(4.0);
+    let last_aligned_beat = aligned.last().map(|n| n.beat_index as f32).unwrap_or(0.0);
+    let last_quantized_beat = quantized
+        .iter()
+        .map(|n| n.beat_start + n.beat_duration)
+        .fold(0.0f32, f32::max);
+    let last_track_beat = beat_times.len().saturating_sub(1) as f32;
+    let last_beat = last_aligned_beat
+        .max(last_quantized_beat)
+        .max(last_track_beat)
+        .max(4.0);
     let time_signature_segments = vec![TimeSignatureSegment {
         start_beat: 0.0,
         end_beat: last_beat.max(4.0),

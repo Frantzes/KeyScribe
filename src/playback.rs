@@ -11,9 +11,11 @@ use rodio::{OutputStream, OutputStreamHandle, Sink, Source};
 struct ArcSamplesSource {
     samples: Arc<Vec<f32>>,
     idx: usize,
+    start: usize,
     end: usize,
     channels: u16,
     sample_rate: u32,
+    fade_frames: usize,
 }
 
 impl ArcSamplesSource {
@@ -24,12 +26,15 @@ impl ArcSamplesSource {
         channels: u16,
         sample_rate: u32,
     ) -> Self {
+        let fade_frames = (sample_rate as f32 * 0.005) as usize; // 5ms fade
         Self {
             samples,
             idx: start_idx,
+            start: start_idx,
             end: end_idx,
             channels,
             sample_rate,
+            fade_frames,
         }
     }
 }
@@ -42,7 +47,21 @@ impl Iterator for ArcSamplesSource {
             return None;
         }
 
-        let value = self.samples[self.idx];
+        let mut value = self.samples[self.idx];
+        
+        let ch = self.channels.max(1) as usize;
+        let frame_idx = (self.idx - self.start) / ch;
+        let total_frames = (self.end - self.start) / ch;
+        
+        if frame_idx < self.fade_frames {
+            let fade = frame_idx as f32 / self.fade_frames as f32;
+            value *= fade;
+        } else if total_frames.saturating_sub(frame_idx) <= self.fade_frames {
+            let remain = total_frames.saturating_sub(frame_idx);
+            let fade = remain as f32 / self.fade_frames as f32;
+            value *= fade;
+        }
+
         self.idx += 1;
         Some(value)
     }
@@ -55,8 +74,7 @@ impl Iterator for ArcSamplesSource {
 
 impl Source for ArcSamplesSource {
     fn current_frame_len(&self) -> Option<usize> {
-        let channels = self.channels.max(1) as usize;
-        Some(self.end.saturating_sub(self.idx) / channels)
+        None
     }
 
     fn channels(&self) -> u16 {

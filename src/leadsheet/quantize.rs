@@ -33,12 +33,11 @@ pub struct QuantizationConfig {
 impl Default for QuantizationConfig {
     fn default() -> Self {
         Self {
-            grids: vec![1.0, 0.5],
+            grids: vec![1.0, 0.5, 0.25],
             finer_grid_improvement_threshold: 0.03,
-            // DEBUG: quarter + 8th only
-            duration_grids: vec![1.0, 0.5],
+            duration_grids: vec![4.0, 3.0, 2.0, 1.5, 1.0, 0.75, 0.5, 0.25],
             duration_finer_grid_improvement_threshold: 0.015,
-            min_duration_beats: 0.5,
+            min_duration_beats: 0.25,
         }
     }
 }
@@ -263,8 +262,8 @@ pub fn quantize_notes_with_ties(
                     beat_duration: snapped_duration,
                     velocity: note.velocity,
                     channel: note.channel,
-                    tie_start: !is_first,
-                    tie_stop: true,
+                    tie_start: true,
+                    tie_stop: !is_first,
                     confidence: 1.0,
                 });
 
@@ -287,8 +286,8 @@ pub fn quantize_notes_with_ties(
                 beat_duration: snapped_duration,
                 velocity: note.velocity,
                 channel: note.channel,
-                tie_start: true,
-                tie_stop: false,
+                tie_start: false,
+                tie_stop: true,
                 confidence: 1.0,
             });
         }
@@ -364,10 +363,19 @@ fn meter_class_at_beat(beat: f32, time_signature_segments: &[TimeSignatureSegmen
     MeterClass::SimpleQuadruple
 }
 
-fn meter_specific_grids(config: &QuantizationConfig, _meter: MeterClass) -> (Vec<f32>, Vec<f32>) {
-    // DEBUG: quarter + 8th only for all meters
-    let mut grids = vec![1.0, 0.5];
-    let mut durations = vec![1.0, 0.5];
+fn meter_specific_grids(config: &QuantizationConfig, meter: MeterClass) -> (Vec<f32>, Vec<f32>) {
+    let mut grids = match meter {
+        MeterClass::CompoundDuple | MeterClass::CompoundQuadruple => {
+            vec![1.0, 0.5, 1.0/3.0, 2.0/3.0]
+        }
+        _ => vec![1.0, 0.5, 0.25],
+    };
+    let mut durations = match meter {
+        MeterClass::CompoundDuple | MeterClass::CompoundQuadruple => {
+            vec![1.5, 1.0, 0.5, 1.0/3.0]
+        }
+        _ => vec![4.0, 3.0, 2.0, 1.5, 1.0, 0.75, 0.5, 0.25],
+    };
 
     for g in &config.grids {
         if *g > 0.0 && !grids.iter().any(|x| (*x - *g).abs() < 1.0e-5) {
@@ -437,13 +445,14 @@ fn snap_duration_with_preference(
         return value.max(min_duration_beats);
     }
 
-    let mut best = grids[0];
+    let mut best = (value / grids[0]).round() * grids[0];
     let mut best_error = (value - best).abs();
 
     for grid in grids.into_iter().skip(1) {
-        let error = (value - grid).abs();
+        let candidate = (value / grid).round() * grid;
+        let error = (value - candidate).abs();
         if error + duration_finer_grid_improvement_threshold < best_error {
-            best = grid;
+            best = candidate;
             best_error = error;
         }
     }
@@ -666,22 +675,19 @@ fn compute_next_onset_duration(
 
 fn quantize_duration(
     raw_duration: f32,
-    _subdivision: f32,
-    _swing_style: SwingStyle,
+    subdivision: f32,
+    swing_style: SwingStyle,
 ) -> f32 {
-    // DEBUG: quarter + 8th only
-    let candidates: Vec<f32> = vec![1.0, 0.5];
-
-    let mut best = candidates[0];
-    let mut best_err = (raw_duration - best).abs();
-    for &c in candidates.iter().skip(1) {
-        let err = (raw_duration - c).abs();
-        if err < best_err {
-            best = c;
-            best_err = err;
-        }
+    if !raw_duration.is_finite() {
+        return 0.5;
     }
-    best.max(0.5)
+
+    let grid = match swing_style {
+        SwingStyle::Triplet => 1.0 / 3.0,
+        _ => subdivision.max(0.25),
+    };
+    let snapped = (raw_duration / grid).round() * grid;
+    snapped.max(grid)
 }
 
 // ── Main Aligned Quantization Entry Point ──────────────────────────────────
@@ -772,14 +778,16 @@ pub fn detect_grace_notes(
         let current = &result[i];
         let next = &result[i + 1];
 
-        let (start_time, end_time) = if i < aligned.len() {
-            (aligned[i].original_start_time, aligned[i].original_end_time)
+        let matched_current = aligned.iter().find(|a| a.id == current.id);
+        let (start_time, end_time) = if let Some(a) = matched_current {
+            (a.original_start_time, a.original_end_time)
         } else {
             (current.beat_start, current.beat_start + current.beat_duration)
         };
 
-        let next_start = if i + 1 < aligned.len() {
-            aligned[i + 1].original_start_time
+        let matched_next = aligned.iter().find(|a| a.id == next.id);
+        let next_start = if let Some(a) = matched_next {
+            a.original_start_time
         } else {
             next.beat_start
         };
@@ -959,8 +967,8 @@ mod tests {
             &QuantizationConfig::default(),
         );
         assert_eq!(quantized.len(), 1);
-        // DEBUG: now snaps to 0.5 (eighth) since we removed triplet grid
-        assert!((quantized[0].beat_duration - 0.5).abs() < 0.06);
+        // DEBUG: now snaps to 0.333 (1/3 beat)
+        assert!((quantized[0].beat_duration - 1.0/3.0).abs() < 0.06);
     }
 
     #[test]
@@ -1007,8 +1015,8 @@ mod tests {
         );
         let last_segment = tied.last().unwrap();
         assert!(
-            last_segment.tie_start,
-            "Last segment should have tie_start=true"
+            last_segment.tie_stop,
+            "Last segment should have tie_stop=true"
         );
     }
 

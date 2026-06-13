@@ -198,7 +198,7 @@ fn try_open_audio(path: &Path) -> Result<OpenedAudio> {
 
     let metadata = extract_audio_metadata(&mut probed);
 
-    let mut format = probed.format;
+    let format = probed.format;
     let track = format
         .default_track()
         .context("No default audio track found")?;
@@ -278,6 +278,7 @@ pub fn load_audio_file(path: &Path) -> Result<AudioData> {
     let mut mono_samples = Vec::<f32>::new();
     let mut playback_samples = Vec::<f32>::new();
     let mut playback_channels = 1u16;
+    let mut sample_buffer: Option<SampleBuffer<f32>> = None;
 
     loop {
         if let Some(revision) = opened.format.metadata().skip_to_latest() {
@@ -302,11 +303,15 @@ pub fn load_audio_file(path: &Path) -> Result<AudioData> {
         };
 
         let channels = decoded.spec().channels.count().max(1);
-        let mut sample_buffer =
-            SampleBuffer::<f32>::new(decoded.capacity() as u64, *decoded.spec());
-        sample_buffer.copy_interleaved_ref(decoded);
+        let buf = sample_buffer.get_or_insert_with(|| {
+            SampleBuffer::<f32>::new(decoded.capacity() as u64, *decoded.spec())
+        });
+        if buf.capacity() < decoded.capacity() as usize {
+            *buf = SampleBuffer::<f32>::new(decoded.capacity() as u64, *decoded.spec());
+        }
+        buf.copy_interleaved_ref(decoded);
 
-        let data = sample_buffer.samples();
+        let data = buf.samples();
         playback_channels = normalize_playback_channels(channels);
 
         if channels <= 1 {
@@ -318,7 +323,7 @@ pub fn load_audio_file(path: &Path) -> Result<AudioData> {
                 mono_samples.push((frame[0] + frame[1]) * 0.5);
             }
         } else {
-            for frame in data.chunks(channels) {
+            for frame in data.chunks_exact(channels) {
                 let mut sum = 0.0;
                 for &ch in frame {
                     sum += ch;
@@ -384,6 +389,7 @@ pub fn load_audio_file_streaming(
     let mut pending_chunk_interleaved = Vec::<f32>::with_capacity(
         target_chunk * playback_channels as usize,
     );
+    let mut sample_buffer: Option<SampleBuffer<f32>> = None;
 
     loop {
         if cancel_flag.load(Ordering::Acquire) {
@@ -413,11 +419,16 @@ pub fn load_audio_file_streaming(
 
         let channels = decoded.spec().channels.count().max(1);
         playback_channels = normalize_playback_channels(channels);
-        let mut sample_buffer =
-            SampleBuffer::<f32>::new(decoded.capacity() as u64, *decoded.spec());
-        sample_buffer.copy_interleaved_ref(decoded);
+        
+        let buf = sample_buffer.get_or_insert_with(|| {
+            SampleBuffer::<f32>::new(decoded.capacity() as u64, *decoded.spec())
+        });
+        if buf.capacity() < decoded.capacity() as usize {
+            *buf = SampleBuffer::<f32>::new(decoded.capacity() as u64, *decoded.spec());
+        }
+        buf.copy_interleaved_ref(decoded);
 
-        let data = sample_buffer.samples();
+        let data = buf.samples();
 
         if channels <= 1 {
             pending_chunk_mono.extend_from_slice(data);
@@ -430,7 +441,7 @@ pub fn load_audio_file_streaming(
             }
             decoded_samples = decoded_samples.saturating_add(data.len() / 2);
         } else {
-            for frame in data.chunks(channels) {
+            for frame in data.chunks_exact(channels) {
                 let mut sum = 0.0;
                 for &ch in frame {
                     sum += ch;
@@ -526,6 +537,7 @@ pub fn load_audio_preview_chunk(
 
     let mut out = Vec::<f32>::with_capacity(target_frames * playback_channels as usize);
     let mut decoded_frames = 0usize;
+    let mut sample_buffer: Option<SampleBuffer<f32>> = None;
 
     while decoded_frames < target_frames {
         let packet = match opened.format.next_packet() {
@@ -550,10 +562,14 @@ pub fn load_audio_preview_chunk(
         };
 
         let channels = decoded.spec().channels.count().max(1);
-        let mut sample_buffer =
-            SampleBuffer::<f32>::new(decoded.capacity() as u64, *decoded.spec());
-        sample_buffer.copy_interleaved_ref(decoded);
-        let data = sample_buffer.samples();
+        let buf = sample_buffer.get_or_insert_with(|| {
+            SampleBuffer::<f32>::new(decoded.capacity() as u64, *decoded.spec())
+        });
+        if buf.capacity() < decoded.capacity() as usize {
+            *buf = SampleBuffer::<f32>::new(decoded.capacity() as u64, *decoded.spec());
+        }
+        buf.copy_interleaved_ref(decoded);
+        let data = buf.samples();
 
         if channels <= 1 {
             let available = data.len().min(target_frames.saturating_sub(decoded_frames));
@@ -565,7 +581,7 @@ pub fn load_audio_preview_chunk(
             decoded_frames = decoded_frames.saturating_add(available_frames);
         } else {
             let remaining = target_frames.saturating_sub(decoded_frames);
-            for frame in data.chunks(channels).take(remaining) {
+            for frame in data.chunks_exact(channels).take(remaining) {
                 let (left, right) = fold_multichannel_frame_to_stereo(frame);
                 out.push(left);
                 out.push(right);

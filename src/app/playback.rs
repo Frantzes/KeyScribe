@@ -198,27 +198,35 @@ impl KeyScribeApp {
             None => true,
         };
         if rebuild {
-            let (blended, channels) = if current_key.is_empty() {
-                crate::leadsheet::blend_interleaved_stems(stems.as_slice())
+            let (blended, channels, src_sample_rate) = if current_key.is_empty() {
+                if let Some(audio) = &self.audio_raw {
+                    (Arc::clone(&audio.samples_interleaved), audio.channels, audio.sample_rate)
+                } else {
+                    let (b, c) = crate::leadsheet::blend_interleaved_stems(stems.as_slice());
+                    (b, c, sample_rate)
+                }
             } else if current_key.len() == 1 {
                 if let Some(s) = current_key.first().and_then(|idx| stems.get(*idx)) {
-                    (Arc::clone(&s.samples_interleaved), s.channels)
+                    (Arc::clone(&s.samples_interleaved), s.channels, s.sample_rate)
                 } else {
-                    crate::leadsheet::blend_interleaved_stems(stems.as_slice())
+                    let (b, c) = crate::leadsheet::blend_interleaved_stems(stems.as_slice());
+                    (b, c, sample_rate)
                 }
             } else {
                 let enabled_stems: Vec<crate::leadsheet::SeparatedStem> = current_key
                     .iter()
                     .filter_map(|idx| stems.get(*idx).cloned())
                     .collect();
-                crate::leadsheet::blend_interleaved_stems(enabled_stems.as_slice())
+                let sr = enabled_stems.first().map(|s| s.sample_rate).unwrap_or(sample_rate);
+                let (b, c) = crate::leadsheet::blend_interleaved_stems(enabled_stems.as_slice());
+                (b, c, sr)
             };
 
             self.stem_playback_cache = Some(StemPlaybackCache {
                 samples: blended,
                 processed_samples: None,
                 channels,
-                sample_rate,
+                sample_rate: src_sample_rate,
                 listening_key: current_key,
                 processed_speed: 1.0,
                 processed_pitch: 0.0,

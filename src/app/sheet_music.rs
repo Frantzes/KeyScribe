@@ -201,8 +201,6 @@ impl KeyScribeApp {
                                                 self.enabled_stem_indices = self.pending_stem_indices.clone();
                                                 self.note_timeline = Arc::new(Vec::new());
                                                 self.note_timeline_step_sec = 0.0;
-                                                self.base_note_timeline = Arc::new(Vec::new());
-                                                self.base_note_timeline_step_sec = 0.0;
                                                 self.refresh_note_timeline_from_selected_stems_preserving();
                                                 self.show_visualize_selector = false;
                                             }
@@ -959,7 +957,8 @@ impl KeyScribeApp {
         let mut config = LeadSheetPresetConfig::default();
         config.quantization.min_duration_beats = 0.5;
         config.quantization.grids = vec![1.0, 0.5];
-        config.quantization.duration_grids = vec![1.0, 0.5];
+        // Allow sustained notes to span multiple beats in monophonic mode.
+        config.quantization.duration_grids = vec![4.0, 2.0, 1.0, 0.5];
         config.chord_analysis.skip = job.chord_skip;
         let mut foundation = None;
 
@@ -2110,6 +2109,7 @@ fn build_measure_boundaries(
     max_tick: i32,
 ) -> Vec<i32> {
     let mut boundaries: Vec<i32> = vec![0];
+    let mut last_mw = (default_beats_per_bar.max(1) as i32) * MUSICXML_DIVISIONS;
 
     if time_sigs.is_empty() {
         let mw = (default_beats_per_bar.max(1) as i32) * MUSICXML_DIVISIONS;
@@ -2132,6 +2132,9 @@ fn build_measure_boundaries(
             (seg.end_beat * MUSICXML_DIVISIONS as f32).round() as i32
         };
         let mw = (seg.numerator.max(1) as i32) * MUSICXML_DIVISIONS;
+        if mw > 0 {
+            last_mw = mw;
+        }
 
         let seg_limit = seg_end_tick.min(max_tick);
         let mut cursor = boundaries.last().copied().unwrap_or(0).max(seg_start_tick);
@@ -2142,9 +2145,36 @@ fn build_measure_boundaries(
         }
     }
 
-    let last = boundaries.last().copied().unwrap_or(0);
-    if last < max_tick {
+    let mut last = boundaries.last().copied().unwrap_or(0);
+    if last_mw <= 0 {
+        last_mw = (default_beats_per_bar.max(1) as i32) * MUSICXML_DIVISIONS;
+    }
+    while last + last_mw < max_tick {
+        last += last_mw;
+        boundaries.push(last);
+    }
+    if boundaries.last().copied().unwrap_or(0) < max_tick {
         boundaries.push(max_tick);
+    }
+
+    // Fill any large gaps in case time-signature segments ended early.
+    if last_mw > 0 && boundaries.len() >= 2 {
+        let mut filled: Vec<i32> = Vec::with_capacity(boundaries.len());
+        filled.push(boundaries[0]);
+        for pair in boundaries.windows(2) {
+            let mut current = pair[0];
+            let next = pair[1];
+            if next <= current {
+                continue;
+            }
+            while current + last_mw < next {
+                current += last_mw;
+                filled.push(current);
+            }
+            filled.push(next);
+        }
+        filled.dedup();
+        boundaries = filled;
     }
     boundaries
 }
@@ -2852,26 +2882,18 @@ fn merge_adjacent_notes(notes: &mut Vec<NoteEvent>, step: f32) {
 }
 
 fn notes_to_spans(notes: &[QuantizedNote], config: SheetEngravingConfig) -> Vec<NoteSpan> {
-    // DEBUG: whole, half, quarter, 8th only (no 16th/32nd)
-    let std_durations: [f32; 4] = [4.0, 2.0, 1.0, 0.5];
-
-    fn snap_to_std(value: f32, candidates: &[f32]) -> f32 {
-        let mut best = value;
-        let mut best_err = f32::MAX;
-        for &c in candidates {
-            let err = (value - c).abs();
-            if err < best_err {
-                best_err = err;
-                best = c;
-            }
+    fn snap_to_half_beat(value: f32) -> f32 {
+        if !value.is_finite() {
+            return 0.5;
         }
-        best
+        (value / 0.5).round() * 0.5
     }
 
     let mut out = Vec::new();
     for note in notes {
         let start_tick = (note.beat_start * MUSICXML_DIVISIONS as f32).round().max(0.0) as i32;
-        let raw_dur = snap_to_std(note.beat_duration, &std_durations);
+        // Preserve long durations so sustained melody notes do not collapse to whole notes.
+        let raw_dur = snap_to_half_beat(note.beat_duration).max(0.5);
         let duration_ticks = (raw_dur * MUSICXML_DIVISIONS as f32).round().max(1.0) as i32;
         let staff = if config.is_lead_sheet || config.single_staff {
             1

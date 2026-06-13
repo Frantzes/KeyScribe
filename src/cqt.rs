@@ -86,7 +86,7 @@ impl CQTransform {
             let mut kernel = vec![Complex::new(0.0, 0.0); kernel_len];
 
             for n in 0..kernel_len {
-                let t = n as f32 / sample_rate;
+                let t = (n as f32 - kernel_len as f32 / 2.0) / sample_rate;
                 // Gaussian window
                 let alpha = 2.0 * PI * bandwidth;
                 let window = (-alpha * t * t).exp();
@@ -107,9 +107,30 @@ impl CQTransform {
     /// Returns magnitude spectrogram of shape (num_bins, num_frames)
     pub fn compute(&self, samples: &[f32]) -> Vec<Vec<f32>> {
         let num_bins = self.config.num_bins();
-        let num_frames = samples.len();
+        let max_kernel_len = self.kernels.iter().map(|k| k.len()).max().unwrap_or(0);
+        
+        let valid_frames = if samples.len() >= max_kernel_len {
+            samples.len() - max_kernel_len + 1
+        } else {
+            0
+        };
+        let mut result = vec![vec![0.0; valid_frames]; num_bins];
+        
+        if valid_frames == 0 {
+            return result;
+        }
 
-        let mut result = vec![vec![0.0; num_frames]; num_bins];
+        let fft_size = (samples.len() + max_kernel_len - 1).next_power_of_two();
+        let mut planner = rustfft::FftPlanner::new();
+        let fft = planner.plan_fft_forward(fft_size);
+        let ifft = planner.plan_fft_inverse(fft_size);
+        let inv_fft_size = 1.0 / fft_size as f32;
+
+        let mut signal_complex = vec![Complex::new(0.0, 0.0); fft_size];
+        for (i, &s) in samples.iter().enumerate() {
+            signal_complex[i] = Complex::new(s, 0.0);
+        }
+        fft.process(&mut signal_complex);
 
         for (k, kernel) in self.kernels.iter().enumerate() {
             let kernel_len = kernel.len();
@@ -117,17 +138,22 @@ impl CQTransform {
                 continue;
             }
 
+            let mut kernel_complex = vec![Complex::new(0.0, 0.0); fft_size];
+            kernel_complex[0] = kernel[0];
+            for m in 1..kernel_len {
+                kernel_complex[fft_size - m] = kernel[m];
+            }
+            fft.process(&mut kernel_complex);
+
+            let mut product = vec![Complex::new(0.0, 0.0); fft_size];
+            for i in 0..fft_size {
+                product[i] = signal_complex[i] * kernel_complex[i];
+            }
+            ifft.process(&mut product);
+
             let norm_inv = self.kernel_norm_inv[k];
-
-            // Convolve samples with kernel
-            for n in 0..(samples.len() - kernel_len) {
-                let mut sum = Complex::new(0.0, 0.0);
-                for m in 0..kernel_len {
-                    sum += samples[n + m] * kernel[m];
-                }
-
-                let magnitude = sum.norm() * norm_inv;
-                result[k][n] = magnitude;
+            for n in 0..valid_frames {
+                result[k][n] = product[n].norm() * inv_fft_size * norm_inv;
             }
         }
 

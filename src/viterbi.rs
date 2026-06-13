@@ -60,93 +60,19 @@ impl ViterbiDecoder {
             return vec![];
         }
 
-        let log_likelihoods: Vec<Vec<f32>> = note_probs_sequence
-            .iter()
-            .map(|frame| {
-                frame
-                    .iter()
-                    .map(|&p| {
-                        let scaled = p * self.config.likelihood_scale;
-                        if scaled > 0.0 {
-                            scaled.ln()
-                        } else {
-                            f32::NEG_INFINITY
-                        }
-                    })
-                    .collect()
-            })
-            .collect();
-
-        let mut transition_penalties = vec![vec![0.0f32; num_notes]; num_notes];
-        for current_note in 0..num_notes {
-            for prev_note in 0..num_notes {
-                let note_distance = ((current_note as i32 - prev_note as i32).abs()) as f32;
-                transition_penalties[current_note][prev_note] =
-                    self.config.transition_cost * note_distance;
-            }
-        }
-
-        // Compute forward pass with Viterbi algorithm
-        let mut viterbi_matrices = vec![vec![f32::NEG_INFINITY; num_notes]; num_frames];
-        let mut backpointers = vec![vec![0usize; num_notes]; num_frames];
-
-        // Initialize first frame
-        for note in 0..num_notes {
-            viterbi_matrices[0][note] = log_likelihoods[0][note];
-        }
-
-        // Forward pass
-        for frame in 1..num_frames {
-            for current_note in 0..num_notes {
-                let observation = log_likelihoods[frame][current_note];
-                let mut best_prev_score = f32::NEG_INFINITY;
-                let mut best_prev_note = 0;
-
-                for prev_note in 0..num_notes {
-                    let score = viterbi_matrices[frame - 1][prev_note]
-                        - transition_penalties[current_note][prev_note]
-                        + observation;
-
-                    if score > best_prev_score {
-                        best_prev_score = score;
-                        best_prev_note = prev_note;
-                    }
-                }
-
-                viterbi_matrices[frame][current_note] = best_prev_score;
-                backpointers[frame][current_note] = best_prev_note;
-            }
-        }
-
-        // Backward pass: extract best path
-        let mut best_path = vec![0usize; num_frames];
-
-        // Find best ending state
-        let mut best_end_note = 0;
-        let mut best_end_score = f32::NEG_INFINITY;
-        for note in 0..num_notes {
-            if viterbi_matrices[num_frames - 1][note] > best_end_score {
-                best_end_score = viterbi_matrices[num_frames - 1][note];
-                best_end_note = note;
-            }
-        }
-
-        best_path[num_frames - 1] = best_end_note;
-
-        // Backtrack
-        for frame in (1..num_frames).rev() {
-            best_path[frame - 1] = backpointers[frame][best_path[frame]];
-        }
-
-        // Convert decoded path to binary note activations with confidence thresholding
         let mut result = vec![vec![false; num_notes]; num_frames];
 
-        for frame in 0..num_frames {
-            let active_note = best_path[frame];
-
-            // Apply confidence threshold
-            if note_probs_sequence[frame][active_note] >= self.config.confidence_threshold {
-                result[frame][active_note] = true;
+        for note in 0..num_notes {
+            let note_probs: Vec<f32> = note_probs_sequence
+                .iter()
+                .map(|frame| frame[note])
+                .collect();
+            let states = binary_viterbi_decode(&note_probs, &self.config);
+            for (frame, &active) in states.iter().enumerate() {
+                // Apply confidence threshold
+                if active && note_probs[frame] >= self.config.confidence_threshold {
+                    result[frame][note] = true;
+                }
             }
         }
 
@@ -192,17 +118,11 @@ impl ViterbiDecoder {
                 }
             }
 
-            // Find best note
-            let best_note = note_scores
-                .iter()
-                .enumerate()
-                .max_by(|a, b| a.1.partial_cmp(b.1).unwrap_or(std::cmp::Ordering::Equal))
-                .map(|(idx, _)| idx)
-                .unwrap_or(0);
-
-            // Apply to first frame if confidence is high
-            if note_scores[best_note] > self.config.confidence_threshold * window.len() as f32 {
-                result[start_frame][best_note] = true;
+            // Find best notes
+            for note in 0..num_notes {
+                if note_scores[note] > self.config.confidence_threshold * window.len() as f32 {
+                    result[start_frame][note] = true;
+                }
             }
         }
 
@@ -367,4 +287,59 @@ mod tests {
         assert_eq!(onsets[0], vec![1, 4]);
         assert_eq!(onsets[1], vec![3]);
     }
+}
+
+fn binary_viterbi_decode(note_probs: &[f32], config: &ViterbiConfig) -> Vec<bool> {
+    let num_frames = note_probs.len();
+    if num_frames == 0 {
+        return vec![];
+    }
+
+    let mut viterbi = vec![[f32::NEG_INFINITY; 2]; num_frames];
+    let mut backpointers = vec![[0usize; 2]; num_frames];
+
+    let p_on = (note_probs[0] * config.likelihood_scale).clamp(1e-10, 1.0);
+    let p_off = ((1.0 - note_probs[0]) * config.likelihood_scale).clamp(1e-10, 1.0);
+    viterbi[0][0] = p_off.ln();
+    viterbi[0][1] = p_on.ln();
+
+    let trans_cost = config.transition_cost;
+
+    for frame in 1..num_frames {
+        let p_on = (note_probs[frame] * config.likelihood_scale).clamp(1e-10, 1.0);
+        let p_off = ((1.0 - note_probs[frame]) * config.likelihood_scale).clamp(1e-10, 1.0);
+        let obs_off = p_off.ln();
+        let obs_on = p_on.ln();
+
+        let cost_00 = viterbi[frame - 1][0];
+        let cost_10 = viterbi[frame - 1][1] - trans_cost;
+        if cost_00 > cost_10 {
+            viterbi[frame][0] = cost_00 + obs_off;
+            backpointers[frame][0] = 0;
+        } else {
+            viterbi[frame][0] = cost_10 + obs_off;
+            backpointers[frame][0] = 1;
+        }
+
+        let cost_01 = viterbi[frame - 1][0] - trans_cost;
+        let cost_11 = viterbi[frame - 1][1];
+        if cost_01 > cost_11 {
+            viterbi[frame][1] = cost_01 + obs_on;
+            backpointers[frame][1] = 0;
+        } else {
+            viterbi[frame][1] = cost_11 + obs_on;
+            backpointers[frame][1] = 1;
+        }
+    }
+
+    let mut path = vec![false; num_frames];
+    let mut best_state = if viterbi[num_frames - 1][1] > viterbi[num_frames - 1][0] { 1 } else { 0 };
+    path[num_frames - 1] = best_state == 1;
+
+    for frame in (1..num_frames).rev() {
+        best_state = backpointers[frame][best_state];
+        path[frame - 1] = best_state == 1;
+    }
+
+    path
 }

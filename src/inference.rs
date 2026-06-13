@@ -137,15 +137,27 @@ impl BasicPitchInference {
         let out_len = ((samples.len() as f64) * ratio).round().max(1.0) as usize;
         let mut out = Vec::with_capacity(out_len);
 
+        let downsample_factor = if ratio < 1.0 { (1.0 / ratio).ceil() as usize } else { 1 };
+
         for i in 0..out_len {
             let src_pos = (i as f64) / ratio;
-            let idx0 = src_pos.floor() as usize;
-            let idx1 = (idx0 + 1).min(samples.len() - 1);
+            let idx0 = (src_pos.floor() as usize).min(samples.len().saturating_sub(1));
+            let idx1 = (idx0 + 1).min(samples.len().saturating_sub(1));
             let frac = (src_pos - idx0 as f64) as f32;
 
-            let s0 = samples[idx0];
-            let s1 = samples[idx1];
-            out.push(s0 + (s1 - s0) * frac);
+            if ratio < 1.0 && downsample_factor > 1 {
+                let start_idx = idx0.saturating_sub(downsample_factor / 2);
+                let end_idx = (start_idx + downsample_factor).min(samples.len());
+                let mut sum = 0.0;
+                for j in start_idx..end_idx {
+                    sum += samples[j];
+                }
+                out.push(sum / (end_idx - start_idx).max(1) as f32);
+            } else {
+                let s0 = samples[idx0];
+                let s1 = samples[idx1];
+                out.push(s0 + (s1 - s0) * frac);
+            }
         }
 
         out

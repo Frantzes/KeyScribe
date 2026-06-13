@@ -40,8 +40,20 @@ pub fn detect_bpm(notes: &[NoteEvent], config: BpmDetectionConfig) -> Option<Tem
         return None;
     }
 
-    let primary = best_candidate_from_autocorrelation(&onsets, config)?;
-    let resolved = resolve_harmonic_ambiguity(primary, &onsets, config);
+    let duration = *onsets.last().unwrap();
+    let bin_size = config.onset_bin_size_sec.max(0.001);
+    let signal_len = (duration / bin_size).ceil() as usize + 2;
+
+    let mut onset_bins = Vec::with_capacity(onsets.len());
+    let mut signal = vec![false; signal_len + 1];
+    for &t in &onsets {
+        let idx = ((t / bin_size).round() as usize).min(signal_len);
+        signal[idx] = true;
+        onset_bins.push(idx);
+    }
+
+    let primary = best_candidate_from_autocorrelation(&onsets, &signal, &onset_bins, config)?;
+    let resolved = resolve_harmonic_ambiguity(primary, &onsets, &signal, &onset_bins, config);
 
     let beat_duration_sec = 60.0 / resolved.bpm;
     let confidence = (resolved.raw_score / onsets.len() as f32).clamp(0.0, 1.0);
@@ -84,6 +96,8 @@ fn collect_onsets(notes: &[NoteEvent]) -> Vec<f32> {
 
 fn best_candidate_from_autocorrelation(
     onsets: &[f32],
+    signal: &[bool],
+    onset_bins: &[usize],
     config: BpmDetectionConfig,
 ) -> Option<TempoCandidate> {
     let period_min = 60.0 / config.max_bpm;
@@ -94,15 +108,6 @@ fn best_candidate_from_autocorrelation(
     }
 
     let bin_size = config.onset_bin_size_sec.max(0.001);
-    let signal_len = (duration / bin_size).ceil() as usize + 2;
-
-    let mut onset_bins = Vec::with_capacity(onsets.len());
-    let mut signal = vec![false; signal_len + 1];
-    for &t in onsets {
-        let idx = ((t / bin_size).round() as usize).min(signal_len);
-        signal[idx] = true;
-        onset_bins.push(idx);
-    }
 
     let lag_min = ((period_min / bin_size).round() as usize).max(1);
     let lag_max = ((period_max / bin_size).round() as usize).max(lag_min + 1);
@@ -169,38 +174,27 @@ fn autocorrelation_lag_score(
     score
 }
 
-fn autocorrelation_score_for_bpm(onsets: &[f32], bpm: f32, config: BpmDetectionConfig) -> f32 {
-    if onsets.is_empty() || bpm <= 0.0 {
-        return 0.0;
-    }
-
-    let duration = match onsets.last() {
-        Some(v) => *v,
-        None => return 0.0,
-    };
-    if duration <= 0.0 {
+fn autocorrelation_score_for_bpm(
+    bpm: f32,
+    signal: &[bool],
+    onset_bins: &[usize],
+    config: BpmDetectionConfig,
+) -> f32 {
+    if bpm <= 0.0 || signal.is_empty() {
         return 0.0;
     }
 
     let bin_size = config.onset_bin_size_sec.max(0.001);
-    let signal_len = (duration / bin_size).ceil() as usize + 2;
-    let mut onset_bins = Vec::with_capacity(onsets.len());
-    let mut signal = vec![false; signal_len + 1];
-
-    for &t in onsets {
-        let idx = ((t / bin_size).round() as usize).min(signal_len);
-        signal[idx] = true;
-        onset_bins.push(idx);
-    }
-
     let lag = ((60.0 / bpm) / bin_size).round() as usize;
     let tol_bins = ((0.02 / bin_size).round() as usize).max(1);
-    autocorrelation_lag_score(&signal, &onset_bins, lag.max(1), tol_bins)
+    autocorrelation_lag_score(signal, onset_bins, lag.max(1), tol_bins)
 }
 
 fn resolve_harmonic_ambiguity(
     primary: TempoCandidate,
     onsets: &[f32],
+    signal: &[bool],
+    onset_bins: &[usize],
     config: BpmDetectionConfig,
 ) -> TempoCandidate {
     let mut candidates = vec![primary];
@@ -209,7 +203,7 @@ fn resolve_harmonic_ambiguity(
     if half_bpm >= config.min_bpm {
         candidates.push(TempoCandidate {
             bpm: half_bpm,
-            raw_score: autocorrelation_score_for_bpm(onsets, half_bpm, config),
+            raw_score: autocorrelation_score_for_bpm(half_bpm, signal, onset_bins, config),
         });
     }
 
@@ -217,7 +211,7 @@ fn resolve_harmonic_ambiguity(
     if double_bpm <= config.max_bpm {
         candidates.push(TempoCandidate {
             bpm: double_bpm,
-            raw_score: autocorrelation_score_for_bpm(onsets, double_bpm, config),
+            raw_score: autocorrelation_score_for_bpm(double_bpm, signal, onset_bins, config),
         });
     }
 
@@ -376,7 +370,19 @@ pub fn detect_bpm_from_audio(
     }
 
     let resolved = if pseudo_onsets.len() >= 3 {
-        resolve_harmonic_ambiguity(primary, &pseudo_onsets, config)
+        let duration = *pseudo_onsets.last().unwrap();
+        let bin_size = config.onset_bin_size_sec.max(0.001);
+        let signal_len = (duration / bin_size).ceil() as usize + 2;
+
+        let mut onset_bins = Vec::with_capacity(pseudo_onsets.len());
+        let mut signal_arr = vec![false; signal_len + 1];
+        for &t in &pseudo_onsets {
+            let idx = ((t / bin_size).round() as usize).min(signal_len);
+            signal_arr[idx] = true;
+            onset_bins.push(idx);
+        }
+
+        resolve_harmonic_ambiguity(primary, &pseudo_onsets, &signal_arr, &onset_bins, config)
     } else {
         primary
     };

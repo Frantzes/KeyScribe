@@ -41,7 +41,7 @@ signalsmith-stretch = "0.1.3"
 musicxml = "1.1"
 
 # HFSFormer pipeline dependencies
-ort = "2.0.0-rc.12"
+ort = "=2.0.0-rc.12"
 ndarray = "0.16"
 ndarray-stats = "0.5"
 crossbeam-channel = "0.5"
