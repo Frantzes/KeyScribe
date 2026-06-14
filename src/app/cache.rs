@@ -76,11 +76,28 @@ impl KeyScribeApp {
                 continue;
             }
 
-            // Strict pass (variant-key path) enforces exact raw length when known;
-            // fallback pass over all blobs for this song hash tolerates metadata drift.
-            if raw_sample_len > 0 && idx < strict_count && cache.raw_sample_len != raw_sample_len {
-                diag.strict_len_mismatches += 1;
-                continue;
+            // Strict pass (variant-key path) enforces exact raw length when known.
+            // When the writer stored the actual-decoded count and the reader only
+            // has the container's metadata n_frames, a slight mismatch is normal.
+            // Instead of hard-rejecting, check whether the cached timeline duration
+            // is close enough to the expected duration to trust the cache.
+            if raw_sample_len > 0 && cache.raw_sample_len != raw_sample_len {
+                let expected_dur = raw_sample_len as f64 / sample_rate as f64;
+                let cached_dur = cache.base_note_timeline.len() as f64
+                    * cache.base_note_timeline_step_sec as f64;
+                let drift = if expected_dur > 0.0 {
+                    (cached_dur - expected_dur).abs() / expected_dur
+                } else {
+                    1.0
+                };
+                // Within 2 % and 2 seconds → still a valid match (just metadata
+                // rounding). Anything beyond that is genuinely a different file.
+                if drift > 0.02 && (cached_dur - expected_dur).abs() > 2.0 {
+                    diag.strict_len_mismatches += 1;
+                    continue;
+                }
+                // Fall through — accept the cache even though raw_sample_len
+                // doesn't match exactly.
             }
 
             if !cache.base_note_timeline_step_sec.is_finite()
@@ -150,9 +167,12 @@ impl KeyScribeApp {
                 } else {
                     1.0
                 };
-                // > 5 % drift AND > 5 seconds absolute guarantees we only zap
-                // genuinely corrupt caches, not sub-second rounding artefacts.
-                if drift > 0.05 && (cached_dur - expected_dur).abs() > 5.0 {
+                // Only flag caches where the duration is off by more than 30 %
+                // or 60 seconds absolute. This is deliberately coarse — we only
+                // want to catch the "wrong audio track" scenario (e.g. 6 min vs
+                // 69 min).  Normal rounding / encoder-padding differences are
+                // well inside these bounds so valid caches are never zapped.
+                if drift > 0.30 && (cached_dur - expected_dur).abs() > 60.0 {
                     self.loading_cache_timeline_preloaded = false;
                     self.loading_cache_waveform_preloaded = false;
                     self.cache_status_message = Some(
@@ -194,11 +214,11 @@ impl KeyScribeApp {
                 )
             } else if precheck_diag.existing_files == 0 {
                 format!(
-                    "Analysis cache: no early hit (hash {hash_short}, no cache blobs found for this hash)."
+                    "Analysis cache: first-time transcription — no cached data yet (hash {hash_short})."
                 )
             } else {
                 format!(
-                    "Analysis cache: no early hit (hash {hash_short}, blobs {}, parsed {}, mismatches {}, failures {} [read {}, decompress {}, deserialize {}]).",
+                    "Analysis cache: cache miss — re-analysing (hash {hash_short}, blobs {}, parsed {}, mismatches {}, failures {} [read {}, decompress {}, deserialize {}]).",
                     precheck_diag.existing_files,
                     precheck_diag.parsed_blobs,
                     mismatch_total,
@@ -371,14 +391,27 @@ impl KeyScribeApp {
                 continue;
             }
 
-            let cache_matches = cache.cache_version == ANALYSIS_CACHE_VERSION
+            let mut cache_matches = cache.cache_version == ANALYSIS_CACHE_VERSION
                 && cache.sample_rate == sample_rate
-                && cache.raw_sample_len == raw_sample_len
                 && cache.audio_quality_mode_code == audio_quality_mode.cache_code()
                 && cache.speed_bits == expected_speed_bits
                 && cache.pitch_bits == expected_pitch_bits
                 && cache.use_cqt_analysis == use_cqt_analysis
                 && cache.preprocess_audio == preprocess_audio;
+
+            if cache_matches && raw_sample_len > 0 && cache.raw_sample_len != raw_sample_len {
+                let expected_dur = raw_sample_len as f64 / sample_rate as f64;
+                let cached_dur = cache.base_note_timeline.len() as f64
+                    * cache.base_note_timeline_step_sec as f64;
+                let drift = if expected_dur > 0.0 {
+                    (cached_dur - expected_dur).abs() / expected_dur
+                } else {
+                    1.0
+                };
+                if drift > 0.02 && (cached_dur - expected_dur).abs() > 2.0 {
+                    cache_matches = false;
+                }
+            }
 
             if !cache_matches {
                 continue;

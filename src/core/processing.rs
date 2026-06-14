@@ -20,13 +20,18 @@ pub fn build_waveform_for_processed(
             pt[0] *= speed_for_waveform;
         }
     }
-    // Normalize waveform for visualization: apply a soft compression curve so
-    // quiet sections are more visible and peaks are easier to spot. This only
-    // affects the display — playback audio is untouched.
-    const VIS_NORM_POWER: f64 = 0.55;
-    for pt in &mut waveform {
-        let amp = pt[1];
-        pt[1] = amp.signum() * amp.abs().powf(VIS_NORM_POWER);
+    // Peak-normalize the waveform for visualization: scale amplitudes so the
+    // loudest point reaches ±1.0 and fills the display height. Playback audio
+    // is untouched.
+    let max_amp = waveform
+        .iter()
+        .map(|pt| pt[1].abs())
+        .fold(0.0f64, f64::max);
+    if max_amp > f64::EPSILON {
+        let scale = 1.0 / max_amp;
+        for pt in &mut waveform {
+            pt[1] *= scale;
+        }
     }
     waveform
 }

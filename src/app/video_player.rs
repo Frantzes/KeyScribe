@@ -150,6 +150,7 @@ fn video_decoder_thread(
     let spawn_ffmpeg = |start_time: f32| -> Option<(std::process::Child, ChildStdout)> {
         let mut cmd = Command::new("ffmpeg");
         cmd.args([
+            "-ignore_editlist", "1",
             "-ss", &start_time.to_string(),
             "-i", &path,
             "-f", "image2pipe",

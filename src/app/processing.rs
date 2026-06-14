@@ -79,7 +79,7 @@ impl KeyScribeApp {
             self.estimate_processing_duration_sec(mode, raw_samples_mono.len(), raw_sample_rate);
 
         if mode == RebuildMode::Full {
-            self.cache_status_message = Some("Analysis cache: checking...".to_string());
+            self.cache_status_message = Some("Analysis running — first-time transcription in progress...".to_string());
             self.cache_status_message_at = Some(Instant::now());
         }
         self.restart_playback_after_processing |= restart_playback;
@@ -797,8 +797,11 @@ impl KeyScribeApp {
             last_file: self.loaded_path.clone(),
             recent_files: self.recent_file_paths.clone(),
             selected_time_sec: self.selected_time_sec,
-            speed: self.speed,
-            pitch_semitones: self.pitch_semitones,
+            // Persist identity speed/pitch when a file is loaded so the cache
+            // variant key stays deterministic across sessions. The user can
+            // re-apply preferred values after each load.
+            speed: if self.loaded_path.is_some() { 1.0 } else { self.speed },
+            pitch_semitones: if self.loaded_path.is_some() { 0.0 } else { self.pitch_semitones },
             key_color_sensitivity: self.key_color_sensitivity,
             key_highlight_max_sec: self.key_highlight_max_sec,
             visualization_timing_offset_ms: self.visualization_timing_offset_ms,

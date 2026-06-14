@@ -309,6 +309,7 @@ fn open_audio_with_fallback(path: &Path) -> Result<OpenedAudio> {
             let mut cmd = std::process::Command::new("ffmpeg");
             cmd.args([
                 "-y",
+                "-ignore_editlist", "1",
                 "-i",
                 &path.to_string_lossy(),
                 "-c:a",
