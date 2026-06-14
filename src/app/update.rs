@@ -115,7 +115,7 @@ impl eframe::App for KeyScribeApp {
                 )
                 .show_separator_line(false)
                 .resizable(false)
-                .min_height(120.0);
+                .min_height(40.0);
             let piano_panel = piano_panel_builder.show(ctx, |ui| {
                 let note_visuals_ready = self.note_visuals_ready();
                 if !note_visuals_ready {
@@ -132,16 +132,57 @@ impl eframe::App for KeyScribeApp {
                     keyboard_white_key_width(ui.available_width(), self.piano_zoom);
                 let max_allowed_key_h = (white_w_for_zoom * WHITE_KEY_LENGTH_TO_WIDTH)
                     .clamp(MIN_PIANO_KEY_HEIGHT, 220.0);
-                let key_h_for_frame = max_allowed_key_h;
+                let ideal_key_h = max_allowed_key_h;
                 let panel_visual_gap = UI_STACK_VSPACE;
                 let default_item_spacing_y = ui.spacing().item_spacing.y;
                 ui.spacing_mut().item_spacing.y = 0.0;
 
-                let prob_strip_height = if self.show_note_hist_window && note_visuals_ready {
-                    (key_h_for_frame * 0.9).clamp(MIN_PROBABILITY_STRIP_HEIGHT, 120.0)
+                let prob_strip_height_ideal = if self.show_note_hist_window && note_visuals_ready {
+                    (ideal_key_h * 0.9).clamp(MIN_PROBABILITY_STRIP_HEIGHT, 120.0)
                 } else {
                     0.0
                 };
+
+                let ideal_total_visual_h = prob_strip_height_ideal
+                    + if prob_strip_height_ideal > 0.0 { panel_visual_gap } else { 0.0 }
+                    + ideal_key_h;
+
+                // Scale keys and probability pane together via the user-controlled
+                // `piano_scale` factor (drag handle at top of panel).
+                let height_scale = self.piano_scale;
+                let key_h_for_frame = (ideal_key_h * height_scale).max(MIN_PIANO_KEY_HEIGHT);
+                let prob_strip_height = (prob_strip_height_ideal * height_scale)
+                    .max(if prob_strip_height_ideal > 0.0 { MIN_PROBABILITY_STRIP_HEIGHT } else { 0.0 });
+                self.piano_key_height = key_h_for_frame;
+                self.probability_panel_height = prob_strip_height;
+
+                // Drag handle: drag up to shrink keys+probabilities together.
+                let drag_h = 6.0;
+                let drag_w = ui.available_width();
+                let (drag_rect, drag_resp) =
+                    ui.allocate_exact_size(egui::vec2(drag_w, drag_h), egui::Sense::drag());
+                if drag_resp.hovered() || drag_resp.dragged() {
+                    ui.ctx().set_cursor_icon(egui::CursorIcon::ResizeVertical);
+                }
+                if drag_resp.dragged() {
+                    let delta_scale =
+                        (-drag_resp.drag_delta().y) / ideal_total_visual_h.max(40.0);
+                    self.piano_scale =
+                        (self.piano_scale + delta_scale).clamp(0.25, 1.0);
+                }
+                let drag_color = if drag_resp.hovered() || drag_resp.dragged() {
+                    self.highlight_color
+                } else {
+                    egui::Color32::from_gray(64)
+                };
+                ui.painter().rect_filled(
+                    egui::Rect::from_center_size(
+                        drag_rect.center(),
+                        egui::vec2(drag_rect.width() * 0.3, drag_h.max(2.0)),
+                    ),
+                    2.0,
+                    drag_color,
+                );
 
                 let mut max_scroll_px: f32 = 0.0;
                 if self.show_note_hist_window && note_visuals_ready {
@@ -455,15 +496,8 @@ impl eframe::App for KeyScribeApp {
                 ui.spacing_mut().item_spacing.y = default_item_spacing_y;
             });
             self.piano_panel_height = piano_panel.response.rect.height().max(80.0);
-
-            // Always use the tallest proportion-correct key height.
-            let white_w_for_zoom =
-                keyboard_white_key_width(piano_panel.response.rect.width(), self.piano_zoom);
-            self.piano_key_height =
-                (white_w_for_zoom * WHITE_KEY_LENGTH_TO_WIDTH).clamp(MIN_PIANO_KEY_HEIGHT, 220.0);
-
-            self.probability_panel_height = if self.show_note_hist_window {
-                (self.piano_key_height * 0.9).clamp(MIN_PROBABILITY_STRIP_HEIGHT, 120.0)
+            self.probability_panel_height = if self.show_note_hist_window && self.probability_panel_height > 0.0 {
+                self.probability_panel_height
             } else {
                 0.0
             };

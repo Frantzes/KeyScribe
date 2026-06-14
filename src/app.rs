@@ -165,6 +165,10 @@ fn default_playback_volume() -> f32 {
     0.8
 }
 
+fn default_piano_scale() -> f32 {
+    1.0
+}
+
 fn default_audio_quality_mode() -> AudioQualityMode {
     AudioQualityMode::Balanced
 }
@@ -273,6 +277,8 @@ struct PersistedState {
     visualization_timing_offset_ms: f32,
     piano_zoom: f32,
     piano_key_height: f32,
+    #[serde(default = "default_piano_scale")]
+    piano_scale: f32,
     waveform_panel_height: f32,
     probability_panel_height: f32,
     piano_panel_height: f32,
@@ -322,6 +328,7 @@ impl Default for PersistedState {
             visualization_timing_offset_ms: default_visualization_timing_offset_ms(),
             piano_zoom: 1.0,
             piano_key_height: 72.0,
+            piano_scale: 1.0,
             waveform_panel_height: 320.0,
             probability_panel_height: 130.0,
             piano_panel_height: 170.0,
@@ -887,6 +894,7 @@ pub struct KeyScribeApp {
     visualization_timing_offset_ms: f32,
     piano_zoom: f32,
     piano_key_height: f32,
+    piano_scale: f32,
     waveform_panel_height: f32,
     probability_panel_height: f32,
     piano_panel_height: f32,
@@ -1269,6 +1277,7 @@ impl KeyScribeApp {
             piano_key_height: persisted
                 .piano_key_height
                 .clamp(MIN_PIANO_KEY_HEIGHT, 220.0),
+            piano_scale: persisted.piano_scale.clamp(0.25, 1.0),
             waveform_panel_height: persisted.waveform_panel_height.clamp(120.0, 5000.0),
             probability_panel_height: persisted.probability_panel_height.clamp(0.0, 5000.0),
             piano_panel_height: persisted.piano_panel_height.clamp(80.0, 5000.0),

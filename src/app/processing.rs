@@ -804,6 +804,7 @@ impl KeyScribeApp {
             visualization_timing_offset_ms: self.visualization_timing_offset_ms,
             piano_zoom: self.piano_zoom,
             piano_key_height: self.piano_key_height,
+            piano_scale: self.piano_scale,
             waveform_panel_height: self.waveform_panel_height,
             probability_panel_height: self.probability_panel_height,
             piano_panel_height: self.piano_panel_height,
