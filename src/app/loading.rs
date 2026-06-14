@@ -143,6 +143,13 @@ impl KeyScribeApp {
         self.loading_cache_waveform_preloaded = false;
         self.loading_preview_cache.clear();
 
+        let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("").to_lowercase();
+        if matches!(ext.as_str(), "mp4" | "mkv" | "avi" | "mov" | "webm") {
+            self.video_player = Some(crate::app::video_player::VideoPlayer::new(path.to_string_lossy().to_string()));
+        } else {
+            self.video_player = None;
+        }
+
         if reset_state {
             // Reset loop state for new audio
             self.loop_selection = None;

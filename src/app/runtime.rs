@@ -523,8 +523,8 @@ impl KeyScribeApp {
             }
         };
 
-        if !is_supported_audio_extension(path.as_path()) {
-            return Err("Unsupported audio format. Use wav, mp3, flac, ogg, m4a, or aac.".into());
+        if !super::is_supported_media_extension(path.as_path()) {
+            return Err("Unsupported media format. Use wav, mp3, flac, ogg, m4a, aac, mp4, mkv, avi, mov, or webm.".into());
         }
         if !path.is_file() {
             return Err(format!("Audio file not found: {}", path.display()));
@@ -556,7 +556,7 @@ impl KeyScribeApp {
     #[cfg(feature = "desktop-ui")]
     pub(super) fn import_audio_with_ctx(&mut self, ctx: &egui::Context) {
         let picked = FileDialog::new()
-            .add_filter("Audio", &["wav", "mp3", "flac", "ogg", "m4a", "aac"])
+            .add_filter("Media", &["wav", "mp3", "flac", "ogg", "m4a", "aac", "mp4", "mkv", "avi", "mov", "webm"])
             .pick_file();
 
         if let Some(path) = picked {

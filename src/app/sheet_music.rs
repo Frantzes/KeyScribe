@@ -1575,7 +1575,14 @@ impl KeyScribeApp {
         }
 
         for cmd in &commands {
-            match Command::new(cmd).arg(temp_path.as_os_str()).spawn() {
+            let mut cmd_obj = Command::new(cmd);
+            cmd_obj.arg(temp_path.as_os_str());
+            #[cfg(windows)]
+            {
+                use std::os::windows::process::CommandExt;
+                cmd_obj.creation_flags(0x08000000);
+            }
+            match cmd_obj.spawn() {
                 Ok(_) => {
                     self.last_error = None;
                     return;
@@ -3571,7 +3578,14 @@ fn export_engraved_pdf_with_musescore(musicxml_path: &Path, pdf_path: &Path) -> 
         ];
 
         for args in attempts {
-            let status = Command::new(cmd.as_str()).args(args.as_slice()).status();
+            let mut cmd_obj = Command::new(cmd.as_str());
+            cmd_obj.args(args.as_slice());
+            #[cfg(windows)]
+            {
+                use std::os::windows::process::CommandExt;
+                cmd_obj.creation_flags(0x08000000);
+            }
+            let status = cmd_obj.status();
             match status {
                 Ok(s) if s.success() => return Ok(()),
                 Ok(s) => {

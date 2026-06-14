@@ -44,7 +44,7 @@ impl eframe::App for KeyScribeApp {
                 .hovered_files
                 .iter()
                 .filter_map(|file| file.path.as_ref())
-                .find(|path| is_supported_audio_extension(path.as_path()))
+                .find(|path| super::is_supported_media_extension(path.as_path()))
                 .cloned();
 
             let dropped_valid_drop = i
@@ -52,7 +52,7 @@ impl eframe::App for KeyScribeApp {
                 .dropped_files
                 .iter()
                 .filter_map(|file| file.path.as_ref())
-                .find(|path| is_supported_audio_extension(path.as_path()))
+                .find(|path| super::is_supported_media_extension(path.as_path()))
                 .cloned();
 
             (
@@ -559,6 +559,37 @@ impl eframe::App for KeyScribeApp {
                 // 1. Content Area (Strictly bounded)
                 ui.allocate_ui_at_rect(content_rect, |ui| {
                     ui.spacing_mut().item_spacing.y = 0.0;
+                    let mut remaining_h = content_h;
+                    if self.main_content_tab != MainContentTab::SheetMusic {
+                        if self.show_video_pane {
+                            let selected_time_sec = self.selected_time_sec;
+                            let is_playing = self.is_playing();
+                            if let Some(player) = &mut self.video_player {
+                                let available_width = ui.available_width();
+                                let video_h = self.video_panel_height.clamp(50.0, remaining_h - 100.0).max(50.0);
+                                
+                                let (rect, _) = ui.allocate_exact_size(egui::vec2(available_width, video_h), egui::Sense::hover());
+                                ui.allocate_ui_at_rect(rect, |ui| {
+                                    player.draw(ui, selected_time_sec, is_playing);
+                                });
+                                remaining_h -= video_h;
+                                
+                                let splitter_h = 8.0;
+                                let (_, resp) = ui.allocate_exact_size(egui::vec2(available_width, splitter_h), egui::Sense::drag());
+                                if resp.hovered() || resp.dragged() {
+                                    ui.ctx().set_cursor_icon(egui::CursorIcon::ResizeVertical);
+                                }
+                                if resp.dragged() {
+                                    self.video_panel_height += resp.drag_delta().y;
+                                }
+                                remaining_h -= splitter_h;
+
+                                ui.add_space(waveform_visual_gap);
+                                remaining_h -= waveform_visual_gap;
+                            }
+                        }
+                    }
+
                     if self.main_content_tab == MainContentTab::SheetMusic {
                         self.draw_sheet_music_view(
                             ui,
@@ -570,7 +601,7 @@ impl eframe::App for KeyScribeApp {
                         );
                     } else {
                         Plot::new("waveform_plot")
-                            .height(content_h)
+                            .height(remaining_h)
                             .allow_scroll(false)
                             .allow_zoom(false)
                             .allow_drag(false)

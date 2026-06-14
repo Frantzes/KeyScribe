@@ -50,6 +50,7 @@ mod runtime;
 mod sheet_music;
 mod top_controls;
 mod update;
+mod video_player;
 use media_controls::{draw_media_controls, media_controls_height_for_width, setting_toggle_row};
 
 const STATE_FILE_NAME: &str = ".keyscribe_state.json";
@@ -212,6 +213,10 @@ fn default_dark_mode() -> bool {
     true
 }
 
+fn default_video_panel_height() -> f32 {
+    300.0
+}
+
 fn default_use_cqt_analysis() -> bool {
     true
 }
@@ -269,7 +274,11 @@ struct PersistedState {
     waveform_panel_height: f32,
     probability_panel_height: f32,
     piano_panel_height: f32,
+    #[serde(default = "default_video_panel_height")]
+    video_panel_height: f32,
     show_note_hist_window: bool,
+    #[serde(default)]
+    show_video_pane: bool,
     #[serde(default = "default_use_cqt_analysis")]
     use_cqt_analysis: bool,
     #[serde(default = "default_preprocess_audio")]
@@ -314,7 +323,9 @@ impl Default for PersistedState {
             waveform_panel_height: 320.0,
             probability_panel_height: 130.0,
             piano_panel_height: 170.0,
+            video_panel_height: 300.0,
             show_note_hist_window: true,
+            show_video_pane: true,
             use_cqt_analysis: default_use_cqt_analysis(),
             preprocess_audio: true,
             playback_volume: 0.8,
@@ -425,14 +436,14 @@ fn ensure_parent_dir(path: &Path) -> bool {
         .unwrap_or(true)
 }
 
-fn is_supported_audio_extension(path: &Path) -> bool {
+fn is_supported_media_extension(path: &Path) -> bool {
     let Some(ext) = path.extension().and_then(|ext| ext.to_str()) else {
         return false;
     };
 
     matches!(
         ext.to_ascii_lowercase().as_str(),
-        "wav" | "mp3" | "flac" | "ogg" | "m4a" | "aac"
+        "wav" | "mp3" | "flac" | "ogg" | "m4a" | "aac" | "mp4" | "mkv" | "avi" | "mov" | "webm"
     )
 }
 
@@ -459,7 +470,7 @@ fn is_safe_startup_audio_path(path: &Path) -> bool {
     if !path.is_absolute() || is_windows_network_path(path) {
         return false;
     }
-    if !is_supported_audio_extension(path) || !path.is_file() {
+    if !is_supported_media_extension(path) || !path.is_file() {
         return false;
     }
 
@@ -522,7 +533,7 @@ fn unpack_waveform_points(points: &[[f32; 2]]) -> Vec<[f64; 2]> {
     points.iter().map(|&[x, y]| [x as f64, y as f64]).collect()
 }
 
-fn analysis_cache_dir() -> PathBuf {
+pub(crate) fn analysis_cache_dir() -> PathBuf {
     app_cache_base_dir().join(ANALYSIS_CACHE_DIR_NAME)
 }
 
@@ -845,6 +856,7 @@ pub struct KeyScribeApp {
     waveform_panel_height: f32,
     probability_panel_height: f32,
     piano_panel_height: f32,
+    video_panel_height: f32,
     piano_panel_height_needs_init: bool,
     piano_scroll_px: f32,
     piano_has_focus: bool,
@@ -872,6 +884,8 @@ pub struct KeyScribeApp {
     restart_playback_after_processing: bool,
     last_prob_update: Instant,
     show_note_hist_window: bool,
+    show_video_pane: bool,
+    video_player: Option<video_player::VideoPlayer>,
     playback_volume: f32,
     audio_quality_mode: AudioQualityMode,
     audio_output_device_id: Option<String>,
@@ -946,6 +960,7 @@ pub struct KeyScribeApp {
     sheet_preview_result_rx:
         Option<std::sync::mpsc::Receiver<(SheetPreviewCacheKey, Result<SheetPreviewData, String>)>>,
     stem_playback_cache: Option<StemPlaybackCache>,
+    cache_size_bytes: Option<Option<u64>>,
 }
 
 struct StemPlaybackCache {
@@ -1220,6 +1235,7 @@ impl KeyScribeApp {
             waveform_panel_height: persisted.waveform_panel_height.clamp(120.0, 5000.0),
             probability_panel_height: persisted.probability_panel_height.clamp(0.0, 5000.0),
             piano_panel_height: persisted.piano_panel_height.clamp(80.0, 5000.0),
+            video_panel_height: persisted.video_panel_height.clamp(100.0, 5000.0),
             piano_panel_height_needs_init: true,
             piano_scroll_px: 0.0,
             piano_has_focus: false,
@@ -1250,6 +1266,8 @@ impl KeyScribeApp {
             restart_playback_after_processing: false,
             last_prob_update: Instant::now(),
             show_note_hist_window: persisted.show_note_hist_window,
+            show_video_pane: persisted.show_video_pane,
+            video_player: None,
             playback_volume: persisted.playback_volume.clamp(0.0, 1.5),
             audio_quality_mode: persisted.audio_quality_mode,
             audio_output_device_id: persisted.audio_output_device_id.clone(),
@@ -1326,6 +1344,7 @@ impl KeyScribeApp {
             sheet_render_result_rx: None,
             sheet_preview_result_rx: None,
             stem_playback_cache: None,
+            cache_size_bytes: None,
         };
 
         app.refresh_audio_output_devices();

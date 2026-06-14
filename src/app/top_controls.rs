@@ -12,6 +12,38 @@ const CONTROLS_PANEL_VERTICAL_PADDING: f32 = UI_VSPACE_COMPACT;
 const SLIDER_PAIR_VERTICAL_SPACING: f32 = UI_VSPACE_TIGHT;
 const SHORTCUTS_MODAL_WIDTH: f32 = 470.0;
 
+fn get_dir_size(path: impl AsRef<std::path::Path>) -> std::io::Result<u64> {
+    let mut size = 0;
+    if path.as_ref().is_dir() {
+        for entry in std::fs::read_dir(path)? {
+            let entry = entry?;
+            let p = entry.path();
+            if p.is_dir() {
+                size += get_dir_size(&p).unwrap_or(0);
+            } else {
+                size += entry.metadata()?.len();
+            }
+        }
+    }
+    Ok(size)
+}
+
+fn format_size(size: u64) -> String {
+    let kb = size as f64 / 1024.0;
+    let mb = kb / 1024.0;
+    let gb = mb / 1024.0;
+
+    if gb >= 1.0 {
+        format!("{:.2} GB", gb)
+    } else if mb >= 1.0 {
+        format!("{:.2} MB", mb)
+    } else if kb >= 1.0 {
+        format!("{:.2} KB", kb)
+    } else {
+        format!("{} B", size)
+    }
+}
+
 #[derive(Clone)]
 struct SeparationModelOption {
     label: String,
@@ -374,6 +406,7 @@ impl KeyScribeApp {
     pub(super) fn draw_preferences_menu(&mut self, ui: &mut egui::Ui) {
         setting_toggle_row(ui, &mut self.dark_mode, "Dark Mode");
         let _ = setting_toggle_row(ui, &mut self.show_note_hist_window, "Show Probability Pane");
+        let _ = setting_toggle_row(ui, &mut self.show_video_pane, "Show Video Pane");
         let _ = setting_toggle_row(ui, &mut self.auto_separate, "Separate Instruments Automatically");
         Self::draw_toolbar_separator(ui);
 
@@ -494,6 +527,35 @@ impl KeyScribeApp {
                     }
                 }
             });
+        }
+
+        Self::draw_toolbar_separator(ui);
+
+        if self.cache_size_bytes.is_none() {
+            let cache_dir = crate::app::analysis_cache_dir();
+            let legacy_dir = crate::app::app_cache_base_dir().join(".transcriber_cache");
+            let stems_dir = crate::app::app_cache_base_dir().join("stems");
+            let size = get_dir_size(&cache_dir).unwrap_or(0) 
+                     + get_dir_size(&legacy_dir).unwrap_or(0)
+                     + get_dir_size(&stems_dir).unwrap_or(0);
+            self.cache_size_bytes = Some(Some(size));
+        }
+
+        let size_text = match self.cache_size_bytes {
+            Some(Some(size)) => format!(" ({})", format_size(size)),
+            _ => String::new(),
+        };
+
+        if ui.button(format!("Clean cache{}", size_text)).clicked() {
+            let cache_dir = crate::app::analysis_cache_dir();
+            let legacy_dir = crate::app::app_cache_base_dir().join(".transcriber_cache");
+            let stems_dir = crate::app::app_cache_base_dir().join("stems");
+            let _ = std::fs::remove_dir_all(&cache_dir);
+            let _ = std::fs::create_dir_all(&cache_dir);
+            let _ = std::fs::remove_dir_all(&legacy_dir);
+            let _ = std::fs::remove_dir_all(&stems_dir);
+            let _ = std::fs::create_dir_all(&stems_dir);
+            self.cache_size_bytes = Some(Some(0));
         }
     }
 

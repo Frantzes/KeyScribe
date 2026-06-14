@@ -172,15 +172,6 @@ struct OpenedAudio {
     decoder: Box<dyn symphonia::core::codecs::Decoder>,
     metadata: AudioMetadata,
     track_id: u32,
-    _temp_path: Option<std::path::PathBuf>,
-}
-
-impl Drop for OpenedAudio {
-    fn drop(&mut self) {
-        if let Some(path) = &self._temp_path {
-            let _ = std::fs::remove_file(path);
-        }
-    }
 }
 
 fn try_open_audio(path: &Path) -> Result<OpenedAudio> {
@@ -213,7 +204,6 @@ fn try_open_audio(path: &Path) -> Result<OpenedAudio> {
         decoder,
         metadata,
         track_id,
-        _temp_path: None,
     })
 }
 
@@ -222,28 +212,47 @@ fn open_audio_with_fallback(path: &Path) -> Result<OpenedAudio> {
         Ok(opened) => Ok(opened),
         Err(err) => {
             let temp_dir = std::env::temp_dir();
-            let nanos = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos();
-            let temp_file = temp_dir.join(format!("keyscribe_fallback_{}.flac", nanos));
+            
+            use std::collections::hash_map::DefaultHasher;
+            use std::hash::{Hash, Hasher};
+            let mut hasher = DefaultHasher::new();
+            path.hash(&mut hasher);
+            if let Ok(metadata) = std::fs::metadata(path) {
+                if let Ok(modified) = metadata.modified() {
+                    modified.hash(&mut hasher);
+                }
+            }
+            let hash = hasher.finish();
+            let temp_file = temp_dir.join(format!("keyscribe_fallback_{:016x}.flac", hash));
 
-            let output = std::process::Command::new("ffmpeg")
-                .args([
-                    "-y",
-                    "-i",
-                    &path.to_string_lossy(),
-                    "-c:a",
-                    "flac",
-                    &temp_file.to_string_lossy(),
-                ])
-                .output();
+            if temp_file.exists() {
+                if let Ok(opened) = try_open_audio(&temp_file) {
+                    return Ok(opened);
+                }
+            }
+
+            let mut cmd = std::process::Command::new("ffmpeg");
+            cmd.args([
+                "-y",
+                "-i",
+                &path.to_string_lossy(),
+                "-c:a",
+                "flac",
+                &temp_file.to_string_lossy(),
+            ]);
+
+            #[cfg(windows)]
+            {
+                use std::os::windows::process::CommandExt;
+                cmd.creation_flags(0x08000000);
+            }
+
+            let output = cmd.output();
 
             match output {
                 Ok(out) if out.status.success() => {
-                    let mut opened = try_open_audio(&temp_file)
+                    let opened = try_open_audio(&temp_file)
                         .context("FFmpeg fallback decoded file, but Symphonia still failed")?;
-                    opened._temp_path = Some(temp_file);
                     Ok(opened)
                 }
                 Ok(out) => {
