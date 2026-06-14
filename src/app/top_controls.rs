@@ -614,6 +614,27 @@ impl KeyScribeApp {
                 });
             });
 
+            ui.menu_button("Export", |ui| {
+                ui.set_min_width(Self::responsive_menu_min_width(ui));
+                
+                let has_stems = self.separated_stems.is_some();
+                if ui.add_enabled(has_stems, egui::Button::new("Export Stems...")).clicked() {
+                    self.export_stems_modal_open = true;
+                    if let Some(stems) = &self.separated_stems {
+                        self.export_selected_stems = stems.iter().map(|s| s.stem_type.clone()).collect();
+                    }
+                    ui.close_menu();
+                }
+                
+                if ui.add_enabled(has_stems, egui::Button::new("Export MIDI...")).clicked() {
+                    self.export_midi_modal_open = true;
+                    if let Some(stems) = &self.separated_stems {
+                        self.export_selected_stems = stems.iter().map(|s| s.stem_type.clone()).collect();
+                    }
+                    ui.close_menu();
+                }
+            });
+
             ui.menu_button("Settings", |ui| {
                 ui.set_min_width(Self::responsive_menu_min_width(ui));
                 self.draw_audio_settings_menu(ui);

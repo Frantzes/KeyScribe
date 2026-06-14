@@ -42,6 +42,7 @@ use crate::ui::utils::{accent_soft, color_to_hex, parse_hex_color, push_recent_c
 use crate::ui::widgets::icon_button;
 
 mod cache;
+mod export;
 mod loading;
 mod media_controls;
 mod playback;
@@ -222,7 +223,7 @@ fn default_use_cqt_analysis() -> bool {
 }
 
 fn default_auto_separate() -> bool {
-    true
+    false
 }
 
 fn assign_stem_colors(stems: &[crate::leadsheet::SeparatedStem]) -> Vec<egui::Color32> {
@@ -961,6 +962,11 @@ pub struct KeyScribeApp {
         Option<std::sync::mpsc::Receiver<(SheetPreviewCacheKey, Result<SheetPreviewData, String>)>>,
     stem_playback_cache: Option<StemPlaybackCache>,
     cache_size_bytes: Option<Option<u64>>,
+
+    // Export UI
+    export_stems_modal_open: bool,
+    export_midi_modal_open: bool,
+    export_selected_stems: std::collections::HashSet<crate::leadsheet::StemType>,
 }
 
 struct StemPlaybackCache {
@@ -1345,6 +1351,9 @@ impl KeyScribeApp {
             sheet_preview_result_rx: None,
             stem_playback_cache: None,
             cache_size_bytes: None,
+            export_stems_modal_open: false,
+            export_midi_modal_open: false,
+            export_selected_stems: std::collections::HashSet::new(),
         };
 
         app.refresh_audio_output_devices();

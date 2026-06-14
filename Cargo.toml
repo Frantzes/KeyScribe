@@ -51,6 +51,8 @@ thiserror = "1.0"
 verovioxide = "0.3.0"
 
 roxmltree = "0.20"
+midly = "0.5.3"
+hound = "3.5.1"
 
 [build-dependencies]
 winresource = "0.1"

@@ -478,8 +478,8 @@ impl eframe::App for KeyScribeApp {
                         import_surface_rect,
                         self.highlight_color,
                         168,
-                        "Click Or Drag Audio File",
-                        "To Start Transcribing (wav, mp3, flac, ogg, m4a, aac)",
+                        "Click Or Drag Media File",
+                        "To Start Transcribing (Audio: wav, mp3, flac, ogg, m4a, aac | Video: mp4, mkv, mov, avi, webm)",
                     );
 
                     #[cfg(feature = "desktop-ui")]
@@ -531,7 +531,7 @@ impl eframe::App for KeyScribeApp {
                         if self.separated_stems.is_some() {
                             ui.label(egui::RichText::new("Stem audio is loaded. Use the waveform tab controls to preview or enable instruments.").weak());
                         } else {
-                            ui.label(egui::RichText::new("Run separation to load instrument stems.").weak());
+                            ui.label(egui::RichText::new("Run separation to load instrument stems. You can enable automatic separation in Settings (Recommended unless you have a very very old computer).").weak());
                         }
                     });
                 }
@@ -953,6 +953,8 @@ impl eframe::App for KeyScribeApp {
         } else {
             IDLE_REPAINT_INTERVAL
         });
+
+        self.draw_export_modals(ctx);
 
         if self.last_state_save_at.elapsed() >= Duration::from_secs(2) {
             self.save_state_to_disk();

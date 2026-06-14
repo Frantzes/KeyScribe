@@ -693,7 +693,7 @@ impl KeyScribeApp {
             });
     }
 
-    fn sheet_preview_threshold(&self) -> f32 {
+    pub(crate) fn sheet_preview_threshold(&self) -> f32 {
         (NOTE_HIGHLIGHT_ACTIVATION_THRESHOLD / self.key_color_sensitivity.max(0.05)).clamp(0.05, 0.95)
     }
 
@@ -1311,7 +1311,7 @@ impl KeyScribeApp {
     }
 
     /// Static helper to extract note events from any timeline data.
-    fn extract_events_from_timeline_data(
+    pub(crate) fn extract_events_from_timeline_data(
         timeline: &[Vec<f32>],
         step_sec: f32,
         threshold: f32,
