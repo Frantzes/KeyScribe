@@ -1006,6 +1006,7 @@ pub struct KeyScribeApp {
     export_stems_modal_open: bool,
     export_midi_modal_open: bool,
     export_selected_stems: std::collections::HashSet<crate::leadsheet::StemType>,
+    export_full_mix_midi: bool,
 }
 
 struct StemPlaybackCache {
@@ -1392,6 +1393,7 @@ impl KeyScribeApp {
             export_stems_modal_open: false,
             export_midi_modal_open: false,
             export_selected_stems: std::collections::HashSet::new(),
+            export_full_mix_midi: false,
         };
 
         app.refresh_audio_output_devices();

@@ -138,26 +138,44 @@ impl KeyScribeApp {
         );
 
         if let Some((base_timeline, base_step_sec, cached_waveform)) = cached_timeline {
-            self.base_note_timeline = Arc::clone(&base_timeline);
-            self.base_note_timeline_step_sec = base_step_sec;
-            let (note_timeline, note_step_sec) = Self::transform_note_timeline(
-                base_timeline,
-                base_step_sec,
-                self.speed,
-                self.pitch_semitones,
-            );
-            self.note_timeline = note_timeline;
-            self.note_timeline_step_sec = note_step_sec;
-            self.loading_cache_timeline_preloaded = true;
-            if let Some(waveform) = cached_waveform {
-                self.set_waveform_data(waveform, true);
-                self.loading_cache_waveform_preloaded = true;
+            // If the cached timeline covers a drastically different duration than
+            // what the container metadata reports (e.g. a cache from a short
+            // alternate audio track vs the real full-length program track),
+            // discard the stale blob so a full re-render runs.
+            if raw_sample_len_opt.is_some() && self.loading_sample_rate > 0 {
+                let expected_dur = raw_sample_len as f32 / self.loading_sample_rate as f32;
+                let cached_dur = base_timeline.len() as f32 * base_step_sec;
+                let drift = if expected_dur > 0.0 {
+                    (cached_dur - expected_dur).abs() / expected_dur
+                } else {
+                    1.0
+                };
+                // > 5 % drift AND > 5 seconds absolute guarantees we only zap
+                // genuinely corrupt caches, not sub-second rounding artefacts.
+                if drift > 0.05 && (cached_dur - expected_dur).abs() > 5.0 {
+                    self.loading_cache_timeline_preloaded = false;
+                    self.loading_cache_waveform_preloaded = false;
+                    self.cache_status_message = Some(
+                        "Analysis cache: stale (duration mismatch), re-rendering."
+                            .to_string(),
+                    );
+                    self.cache_status_message_at = Some(Instant::now());
+                } else {
+                    // Valid cache — apply it.
+                    self.apply_prechecked_cache(
+                        base_timeline,
+                        base_step_sec,
+                        cached_waveform,
+                    );
+                }
             } else {
-                self.loading_cache_waveform_preloaded = false;
+                // No metadata frame count to validate against — trust the cache.
+                self.apply_prechecked_cache(
+                    base_timeline,
+                    base_step_sec,
+                    cached_waveform,
+                );
             }
-            self.update_note_probabilities(true);
-            self.cache_status_message =
-                Some("Analysis cache: transcription loaded during render.".to_string());
         } else {
             self.loading_cache_timeline_preloaded = false;
             self.loading_cache_waveform_preloaded = false;
@@ -192,6 +210,34 @@ impl KeyScribeApp {
             });
         }
         self.cache_status_message_at = Some(Instant::now());
+    }
+
+    fn apply_prechecked_cache(
+        &mut self,
+        base_timeline: Arc<Vec<Vec<f32>>>,
+        base_step_sec: f32,
+        cached_waveform: Option<Vec<[f64; 2]>>,
+    ) {
+        self.base_note_timeline = Arc::clone(&base_timeline);
+        self.base_note_timeline_step_sec = base_step_sec;
+        let (note_timeline, note_step_sec) = Self::transform_note_timeline(
+            base_timeline,
+            base_step_sec,
+            self.speed,
+            self.pitch_semitones,
+        );
+        self.note_timeline = note_timeline;
+        self.note_timeline_step_sec = note_step_sec;
+        self.loading_cache_timeline_preloaded = true;
+        if let Some(waveform) = cached_waveform {
+            self.set_waveform_data(waveform, true);
+            self.loading_cache_waveform_preloaded = true;
+        } else {
+            self.loading_cache_waveform_preloaded = false;
+        }
+        self.update_note_probabilities(true);
+        self.cache_status_message =
+            Some("Analysis cache: transcription loaded during render.".to_string());
     }
 
     #[allow(dead_code)]

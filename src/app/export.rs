@@ -29,11 +29,13 @@ impl KeyScribeApp {
         let mut midi_open = self.export_midi_modal_open;
         if midi_open {
             let mut close_modal = false;
-            egui::Window::new("Export Stems (MIDI)")
+            egui::Window::new("Export MIDI")
                 .collapsible(false)
                 .resizable(false)
                 .open(&mut midi_open)
                 .show(ctx, |ui| {
+                    // Original mix (full audio, no stem separation required).
+                    ui.checkbox(&mut self.export_full_mix_midi, "Full Mix");
                     self.draw_export_stem_selection(ui);
                     ui.add_space(8.0);
                     
@@ -107,10 +109,23 @@ impl KeyScribeApp {
     }
 
     fn execute_export_midi(&self, dest_folder: &Path) {
+        // Export the original/full mix when requested.
+        if self.export_full_mix_midi && !self.note_timeline.is_empty() && self.note_timeline_step_sec > 0.0 {
+            let mut next_id = 0;
+            let notes = Self::extract_events_from_timeline_data(
+                &self.note_timeline,
+                self.note_timeline_step_sec,
+                self.sheet_preview_threshold(),
+                &mut next_id,
+            );
+            let path = dest_folder.join("Original Mix.mid");
+            write_midi(&notes, &path);
+        }
+
+        // Export per-stem MIDI when stems are available and selected.
         if let Some(stems) = &self.separated_stems {
             for (stem_idx, stem) in stems.iter().enumerate() {
                 if self.export_selected_stems.contains(&stem.stem_type) {
-                    // Find the stem analysis
                     if let Some(analysis) = self.stem_analyses.iter().find(|a| a.stem_index == stem_idx) {
                         let mut next_id = 0;
                         let notes = Self::extract_events_from_timeline_data(
@@ -119,7 +134,7 @@ impl KeyScribeApp {
                             self.sheet_preview_threshold(),
                             &mut next_id,
                         );
-                        
+
                         let file_name = format!("{}.mid", stem.stem_type.display_name());
                         let path = dest_folder.join(file_name);
                         write_midi(&notes, &path);

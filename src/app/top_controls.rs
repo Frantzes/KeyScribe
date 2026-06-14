@@ -618,6 +618,7 @@ impl KeyScribeApp {
                 ui.set_min_width(Self::responsive_menu_min_width(ui));
                 
                 let has_stems = self.separated_stems.is_some();
+                let can_export_midi = has_stems || !self.note_timeline.is_empty();
                 if ui.add_enabled(has_stems, egui::Button::new("Export Stems...")).clicked() {
                     self.export_stems_modal_open = true;
                     if let Some(stems) = &self.separated_stems {
@@ -626,8 +627,9 @@ impl KeyScribeApp {
                     ui.close_menu();
                 }
                 
-                if ui.add_enabled(has_stems, egui::Button::new("Export MIDI...")).clicked() {
+                if ui.add_enabled(can_export_midi, egui::Button::new("Export MIDI...")).clicked() {
                     self.export_midi_modal_open = true;
+                    self.export_full_mix_midi = !self.note_timeline.is_empty();
                     if let Some(stems) = &self.separated_stems {
                         self.export_selected_stems = stems.iter().map(|s| s.stem_type.clone()).collect();
                     }

@@ -192,14 +192,27 @@ fn try_open_audio(path: &Path) -> Result<OpenedAudio> {
     let format = probed.format;
 
     // Collect every audio track (has a sample rate) and pick the longest one.
-    // The container's "default" track is often the first stream found, which
-    // for multi-track MP4 files can be a short commentary / intro track while
-    // the full program audio sits in a later stream.
     let audio_tracks: Vec<&symphonia::core::formats::Track> = format
         .tracks()
         .iter()
         .filter(|t| t.codec_params.sample_rate.is_some())
         .collect();
+
+    // Estimate the video track's duration (when available) so we can pick
+    // the audio track that best matches the program length. Some containers
+    // omit n_frames on the main audio track while a short alternate track
+    // (commentary, intro) reports it, causing a naive max-by-n_frames to
+    // select the wrong stream.
+    let video_duration_sec = format
+        .tracks()
+        .iter()
+        .filter(|t| t.codec_params.sample_rate.is_none())
+        .filter_map(|t| {
+            let tb = t.codec_params.time_base?;
+            let n_frames = t.codec_params.n_frames?;
+            Some(n_frames as f64 * tb.numer as f64 / tb.denom as f64)
+        })
+        .fold(0.0f64, f64::max);
 
     let track = if audio_tracks.len() <= 1 {
         audio_tracks
@@ -208,19 +221,52 @@ fn try_open_audio(path: &Path) -> Result<OpenedAudio> {
             .or_else(|| format.default_track())
             .context("No audio track found")?
     } else {
-        // n_frames is optional; treat None as 0 so the track with explicit
-        // metadata always wins. When every track reports None we fall back
-        // to the default track.
+        // Score each audio track: prefer the one whose duration is closest
+        // to the video track duration. When no video reference exists,
+        // prefer the track with the largest n_frames (treating None as 0).
         audio_tracks
             .iter()
-            .max_by_key(|t| {
-                t.codec_params
-                    .n_frames
-                    .unwrap_or(0)
+            .max_by(|a, b| {
+                let score = |t: &&symphonia::core::formats::Track| {
+                    let sr = t.codec_params.sample_rate.unwrap_or(1) as f64;
+                    let audio_dur = t
+                        .codec_params
+                        .n_frames
+                        .map(|nf| nf as f64 / sr)
+                        .unwrap_or(0.0);
+                    if video_duration_sec > 0.0 {
+                        // Prefer the track whose duration is closest to video.
+                        // Tracks without n_frames get a neutral middle score
+                        // so they're preferred when the n_frames track is way off.
+                        if t.codec_params.n_frames.is_some() {
+                            -(audio_dur - video_duration_sec).abs()
+                        } else {
+                            // Unknown duration — treat as matching video if the
+                            // explicit track is very far off (> 50 % drift).
+                            let best_explicit_dur = audio_tracks
+                                .iter()
+                                .filter_map(|at| {
+                                    let s = at.codec_params.sample_rate.unwrap_or(1) as f64;
+                                    at.codec_params.n_frames.map(|nf| nf as f64 / s)
+                                })
+                                .fold(0.0f64, f64::max);
+                            if best_explicit_dur > 0.0
+                                && (best_explicit_dur - video_duration_sec).abs()
+                                    > video_duration_sec * 0.5
+                            {
+                                0.0 // Prefer the unknown-duration track
+                            } else {
+                                f64::NEG_INFINITY // Stick with explicit
+                            }
+                        }
+                    } else {
+                        audio_dur
+                    }
+                };
+                score(a).total_cmp(&score(b))
             })
             .copied()
-            .filter(|t| t.codec_params.n_frames.unwrap_or(0) > 0)
-            .unwrap_or_else(|| audio_tracks[0])
+            .unwrap_or(audio_tracks[0])
     };
     let track_id = track.id;
 
