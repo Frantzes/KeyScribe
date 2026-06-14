@@ -20,6 +20,14 @@ pub fn build_waveform_for_processed(
             pt[0] *= speed_for_waveform;
         }
     }
+    // Normalize waveform for visualization: apply a soft compression curve so
+    // quiet sections are more visible and peaks are easier to spot. This only
+    // affects the display — playback audio is untouched.
+    const VIS_NORM_POWER: f64 = 0.55;
+    for pt in &mut waveform {
+        let amp = pt[1];
+        pt[1] = amp.signum() * amp.abs().powf(VIS_NORM_POWER);
+    }
     waveform
 }
 

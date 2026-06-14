@@ -190,9 +190,38 @@ fn try_open_audio(path: &Path) -> Result<OpenedAudio> {
     let metadata = extract_audio_metadata(&mut probed);
 
     let format = probed.format;
-    let track = format
-        .default_track()
-        .context("No default audio track found")?;
+
+    // Collect every audio track (has a sample rate) and pick the longest one.
+    // The container's "default" track is often the first stream found, which
+    // for multi-track MP4 files can be a short commentary / intro track while
+    // the full program audio sits in a later stream.
+    let audio_tracks: Vec<&symphonia::core::formats::Track> = format
+        .tracks()
+        .iter()
+        .filter(|t| t.codec_params.sample_rate.is_some())
+        .collect();
+
+    let track = if audio_tracks.len() <= 1 {
+        audio_tracks
+            .first()
+            .copied()
+            .or_else(|| format.default_track())
+            .context("No audio track found")?
+    } else {
+        // n_frames is optional; treat None as 0 so the track with explicit
+        // metadata always wins. When every track reports None we fall back
+        // to the default track.
+        audio_tracks
+            .iter()
+            .max_by_key(|t| {
+                t.codec_params
+                    .n_frames
+                    .unwrap_or(0)
+            })
+            .copied()
+            .filter(|t| t.codec_params.n_frames.unwrap_or(0) > 0)
+            .unwrap_or_else(|| audio_tracks[0])
+    };
     let track_id = track.id;
 
     let decoder = get_codecs()
@@ -304,6 +333,10 @@ pub fn load_audio_file(path: &Path) -> Result<AudioData> {
             }
             Err(err) => return Err(anyhow::anyhow!("Packet read error: {err}")),
         };
+
+        if packet.track_id() != opened.track_id {
+            continue;
+        }
 
         let decoded = match opened.decoder.decode(&packet) {
             Ok(decoded) => decoded,
@@ -419,6 +452,10 @@ pub fn load_audio_file_streaming(
             }
             Err(err) => return Err(anyhow::anyhow!("Packet read error: {err}")),
         };
+
+        if packet.track_id() != opened.track_id {
+            continue;
+        }
 
         let decoded = match opened.decoder.decode(&packet) {
             Ok(decoded) => decoded,

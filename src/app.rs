@@ -67,6 +67,7 @@ const FFT_TIMELINE_STEP_SEC: f32 = 0.05;
 const FFT_WINDOW_SIZE: usize = 4096;
 const LOOP_MIN_DURATION_SEC: f32 = 0.01;
 const SEEK_STEP_SEC: f32 = 5.0;
+pub(crate) const AUTO_SEPARATE_MAX_DURATION_SEC: f64 = 600.0; // 10 minutes
 const PARAM_UPDATE_PREVIEW_SEC: f32 = 8.0;
 const PARAM_UPDATE_LIVE_DEBOUNCE: Duration = Duration::from_millis(120);
 const ANALYSIS_CACHE_DIR_NAME: &str = ".keyscribe_cache";
@@ -82,9 +83,9 @@ const ANALYSIS_CACHE_MAX_WAVEFORM_POINTS: usize = 64_000;
 const STARTUP_MAX_AUDIO_FILE_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 const ALBUM_ART_MAX_BYTES: usize = 32 * 1024 * 1024;
 const ALBUM_ART_MAX_DIMENSION: usize = 4096;
-const AUDIO_STREAM_CHUNK_SAMPLES: usize = 44_100;
-const AUDIO_LOADING_MAX_EVENTS_PER_FRAME: usize = 2;
-const STREAMING_WAVEFORM_REBUILD_INTERVAL: Duration = Duration::from_millis(220);
+const AUDIO_STREAM_CHUNK_SAMPLES: usize = 441_000;
+const AUDIO_LOADING_MAX_EVENTS_PER_FRAME: usize = 8;
+const STREAMING_WAVEFORM_REBUILD_INTERVAL: Duration = Duration::from_millis(1000);
 const STREAMING_WAVEFORM_REBUILD_SAMPLE_DELTA: usize = AUDIO_STREAM_CHUNK_SAMPLES * 2;
 const LOADING_PREVIEW_CACHE_CHUNK_SEC: f32 = 16.0;
 const LOADING_PREVIEW_CACHE_STRIDE_SEC: f32 = 8.0;
@@ -339,7 +340,7 @@ impl Default for PersistedState {
             saved_visualize_stem_indices: None,
             saved_listen_stem_indices: None,
             sheet_use_musescore: false,
-            auto_separate: true,
+            auto_separate: default_auto_separate(),
         }
     }
 }
@@ -746,6 +747,38 @@ fn speed_pitch_is_identity(speed: f32, pitch_semitones: f32) -> bool {
     (speed.clamp(0.25, 4.0) - 1.0).abs() < 1.0e-4 && pitch_semitones.abs() < 1.0e-4
 }
 
+fn estimated_duration_sec(total_samples: Option<usize>, sample_rate: u32) -> f32 {
+    if sample_rate > 0 {
+        total_samples
+            .map(|ts| ts as f32 / sample_rate as f32)
+            .unwrap_or(0.0)
+    } else {
+        0.0
+    }
+}
+
+fn adaptive_waveform_budget(base_budget: usize, total_samples: Option<usize>, sample_rate: u32) -> usize {
+    let estimated_sec = estimated_duration_sec(total_samples, sample_rate);
+    if estimated_sec > 1800.0 {
+        base_budget.min(3000)
+    } else if estimated_sec > 300.0 {
+        base_budget / 2
+    } else {
+        base_budget
+    }
+}
+
+fn adaptive_rebuild_delta(base_delta: usize, total_samples: Option<usize>, sample_rate: u32) -> usize {
+    let estimated_sec = estimated_duration_sec(total_samples, sample_rate);
+    if estimated_sec > 1800.0 {
+        base_delta * 4
+    } else if estimated_sec > 300.0 {
+        base_delta * 2
+    } else {
+        base_delta
+    }
+}
+
 fn shuffle_f32_bytes(samples: &[f32]) -> Vec<u8> {
     let len = samples.len();
     let mut shuffled = vec![0u8; len * 4];
@@ -921,8 +954,6 @@ pub struct KeyScribeApp {
     loading_decoded_samples: usize,
     loading_last_waveform_rebuild_at: Option<Instant>,
     loading_last_waveform_rebuild_samples: usize,
-    loading_raw_samples: Vec<f32>,
-    loading_raw_samples_interleaved: Vec<f32>,
     loading_source_channels: u16,
     loading_provisional_timeline: Vec<Vec<f32>>,
     loading_next_transcribe_time_sec: f32,
@@ -1312,8 +1343,6 @@ impl KeyScribeApp {
             loading_decoded_samples: 0,
             loading_last_waveform_rebuild_at: None,
             loading_last_waveform_rebuild_samples: 0,
-            loading_raw_samples: Vec::new(),
-            loading_raw_samples_interleaved: Vec::new(),
             loading_source_channels: 1,
             loading_provisional_timeline: Vec::new(),
             loading_next_transcribe_time_sec: 0.0,

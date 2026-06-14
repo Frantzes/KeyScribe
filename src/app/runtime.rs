@@ -79,8 +79,14 @@ impl KeyScribeApp {
             return true;
         }
 
+        let delta = adaptive_rebuild_delta(
+            STREAMING_WAVEFORM_REBUILD_SAMPLE_DELTA,
+            self.loading_total_samples,
+            self.loading_sample_rate,
+        );
+
         if processed_sample_len.saturating_sub(self.loading_last_waveform_rebuild_samples)
-            >= STREAMING_WAVEFORM_REBUILD_SAMPLE_DELTA
+            >= delta
         {
             return true;
         }

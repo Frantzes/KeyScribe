@@ -74,15 +74,27 @@ impl eframe::App for KeyScribeApp {
             }
         } else if dropped_any_count > 0 {
             self.last_error =
-                Some("Drop a supported audio file (wav, mp3, flac, ogg, m4a, aac).".to_string());
+                Some("Drop a supported media file (Audio: wav, mp3, flac, ogg, m4a, aac | Video: mp4, mkv, avi, mov, webm).".to_string());
         }
 
         self.poll_audio_loading(ctx);
 
-        // Auto-run separation once audio is loaded (or hash is available) if not already done.
-        // We can do this in parallel with initial full-mix transcription.
-        if self.auto_separate && self.audio_raw.is_some() && self.loaded_audio_hash.is_some() && self.separated_stems.is_none() && !self.is_separating && !self.separation_attempted {
-            self.run_instrument_separation();
+        // Auto-run separation once audio is fully loaded (not during streaming).
+        if self.auto_separate
+            && !self.is_audio_loading
+            && self.audio_raw.is_some()
+            && self.loaded_audio_hash.is_some()
+            && self.separated_stems.is_none()
+            && !self.is_separating
+            && !self.separation_attempted
+        {
+            let duration = self.source_duration() as f64;
+            if duration > super::AUTO_SEPARATE_MAX_DURATION_SEC {
+                self.separation_attempted = true;
+                self.last_error = Some("Stem separation is manual for this source since it is longer than 10 minutes.".to_string());
+            } else {
+                self.run_instrument_separation();
+            }
         }
 
         self.poll_processing_result();
@@ -463,7 +475,7 @@ impl eframe::App for KeyScribeApp {
         let waveform_central = egui::CentralPanel::default()
             .frame(egui::Frame::none().inner_margin(egui::Margin::symmetric(UI_VSPACE_MEDIUM, 0.0)))
             .show(ctx, |ui| {
-                if self.audio_raw.is_none() {
+                if self.audio_raw.is_none() && !self.is_audio_loading {
                     let import_surface_rect = ui.max_rect();
                     let import_surface_id = ui.make_persistent_id("empty_audio_import_surface");
                     let import_surface =
@@ -504,9 +516,7 @@ impl eframe::App for KeyScribeApp {
                 let analysis_ready =
                     !self.is_blocking_processing() && !self.processed_samples.is_empty();
                 let interaction_ready = analysis_ready
-                    || (self.is_audio_loading
-                        && (self.loading_cache_waveform_preloaded
-                            || self.loading_cache_timeline_preloaded));
+                    || (self.is_audio_loading && self.loading_decoded_samples > 0);
                 let default_stack_spacing_y = ui.spacing().item_spacing.y;
                 ui.spacing_mut().item_spacing.y = 0.0;
 
@@ -516,7 +526,7 @@ impl eframe::App for KeyScribeApp {
                 });
 
                 ui.add_space(UI_VSPACE_TIGHT);
-                if !self.auto_separate {
+                if !self.auto_separate || (self.separation_attempted && self.separated_stems.is_none()) {
                     ui.horizontal_wrapped(|ui| {
                         if ui
                             .add_enabled(
@@ -566,7 +576,8 @@ impl eframe::App for KeyScribeApp {
                             let is_playing = self.is_playing();
                             if let Some(player) = &mut self.video_player {
                                 let available_width = ui.available_width();
-                                let video_h = self.video_panel_height.clamp(50.0, remaining_h - 100.0).max(50.0);
+                                let max_video_h = (remaining_h - 100.0).max(50.0);
+                                let video_h = self.video_panel_height.clamp(50.0, max_video_h);
                                 
                                 let (rect, _) = ui.allocate_exact_size(egui::vec2(available_width, video_h), egui::Sense::hover());
                                 ui.allocate_ui_at_rect(rect, |ui| {
@@ -936,8 +947,8 @@ impl eframe::App for KeyScribeApp {
                 screen_rect,
                 self.highlight_color,
                 228,
-                "Drop Audio File To Import",
-                "Supports wav, mp3, flac, ogg, m4a, aac",
+                "Drop Audio/Video File To Import",
+                "Audio: wav, mp3, flac, ogg, m4a, aac | Video: mp4, mkv, avi, mov, webm",
             );
         }
 
@@ -966,6 +977,17 @@ impl eframe::App for KeyScribeApp {
 impl Drop for KeyScribeApp {
     fn drop(&mut self) {
         self.save_state_to_disk();
+        self.cancel_audio_loading();
+        self.cancel_active_processing();
+        self.stop();
+
+        // Release large allocations eagerly so the OS can reclaim memory faster.
+        self.processed_samples = Vec::new();
+        self.processed_playback_samples = Vec::new();
+        self.waveform = Vec::new();
+        self.audio_raw = None;
+        self.video_player = None;
+        self.engine = None;
     }
 }
 
