@@ -62,7 +62,11 @@ fn draw_track_meta(
     compact: bool,
 ) {
     ui.vertical(|ui| {
-        let title_size = if compact { 15.0 } else { 17.0 };
+        let mut title_size = if compact { 15.0 } else { 17.0 };
+        if title.len() > 30 {
+            title_size = (title_size * (30.0 / title.len() as f32).max(0.6)).max(12.0);
+        }
+        
         let title_h = ui.fonts(|f| f.row_height(&egui::FontId::proportional(title_size)));
         let artist_h = ui.fonts(|f| f.row_height(&egui::FontId::proportional(14.0)));
         let format_h = ui.fonts(|f| f.row_height(&egui::FontId::proportional(12.0)));
@@ -73,7 +77,7 @@ fn draw_track_meta(
             ui.add_space(top_pad);
         }
 
-        ui.add(egui::Label::new(egui::RichText::new(title).size(title_size)).wrap(true));
+        ui.add(egui::Label::new(egui::RichText::new(title).size(title_size)).truncate(true));
         let secondary = if album.is_empty() {
             artist.to_string()
         } else {
@@ -83,7 +87,7 @@ fn draw_track_meta(
             egui::Label::new(
                 egui::RichText::new(secondary).color(egui::Color32::from_rgb(166, 182, 202)),
             )
-            .wrap(true),
+            .truncate(true),
         );
         ui.add(
             egui::Label::new(
@@ -91,7 +95,7 @@ fn draw_track_meta(
                     .size(12.0)
                     .color(egui::Color32::from_rgb(145, 160, 182)),
             )
-            .wrap(true),
+            .truncate(true),
         );
     });
 }
