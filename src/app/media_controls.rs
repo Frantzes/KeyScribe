@@ -1,6 +1,6 @@
 use eframe::egui;
 use egui_phosphor::regular::{
-    FAST_FORWARD, PAUSE, PLAY, REPEAT, REWIND, SPEAKER_HIGH, SPEAKER_NONE,
+    FAST_FORWARD, PAUSE, PLAY, REPEAT, REWIND, SPEAKER_HIGH, SPEAKER_NONE, MINUS, PLUS,
 };
 
 use super::{KeyScribeApp, SEEK_STEP_SEC, UI_VSPACE_COMPACT, UI_VSPACE_MEDIUM};
@@ -603,7 +603,7 @@ fn draw_loop_inputs(ui: &mut egui::Ui, app: &mut KeyScribeApp) {
 
     let duration = app.timeline_duration_sec();
 
-    if ui.push_id("start_minus", |ui| ui.button("-")).inner.on_hover_text("Subtract 1 second from loop start").clicked() {
+    if ui.push_id("start_minus", |ui| ui.add(egui::Button::new(egui::RichText::new(MINUS).font(icon_font_id(14.0))))).inner.on_hover_text("Subtract 1 second from loop start").clicked() {
         new_start = (start - 1.0).max(0.0);
         changed = true;
     }
@@ -613,14 +613,14 @@ fn draw_loop_inputs(ui: &mut egui::Ui, app: &mut KeyScribeApp) {
             .desired_width(50.0)
             .margin(egui::vec2(4.0, 2.0))
     );
-    if ui.push_id("start_plus", |ui| ui.button("+")).inner.on_hover_text("Add 1 second to loop start").clicked() {
+    if ui.push_id("start_plus", |ui| ui.add(egui::Button::new(egui::RichText::new(PLUS).font(icon_font_id(14.0))))).inner.on_hover_text("Add 1 second to loop start").clicked() {
         new_start = (start + 1.0).min(end - 0.1);
         changed = true;
     }
 
     ui.label("\u{2014}");
 
-    if ui.push_id("end_minus", |ui| ui.button("-")).inner.on_hover_text("Subtract 1 second from loop end").clicked() {
+    if ui.push_id("end_minus", |ui| ui.add(egui::Button::new(egui::RichText::new(MINUS).font(icon_font_id(14.0))))).inner.on_hover_text("Subtract 1 second from loop end").clicked() {
         new_end = (end - 1.0).max(start + 0.1);
         changed = true;
     }
@@ -630,7 +630,7 @@ fn draw_loop_inputs(ui: &mut egui::Ui, app: &mut KeyScribeApp) {
             .desired_width(50.0)
             .margin(egui::vec2(4.0, 2.0))
     );
-    if ui.push_id("end_plus", |ui| ui.button("+")).inner.on_hover_text("Add 1 second to loop end").clicked() {
+    if ui.push_id("end_plus", |ui| ui.add(egui::Button::new(egui::RichText::new(PLUS).font(icon_font_id(14.0))))).inner.on_hover_text("Add 1 second to loop end").clicked() {
         new_end = (end + 1.0).min(duration);
         changed = true;
     }
