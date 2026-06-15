@@ -745,6 +745,9 @@ impl KeyScribeApp {
                     });
 
                 ui.add_space(UI_VSPACE_COMPACT);
+                ui.label(egui::RichText::new("Run separation to load instrument stems. You can enable automatic separation in Settings (Recommended unless you have a very very old computer).").weak());
+                
+                ui.add_space(UI_VSPACE_COMPACT);
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     if ui.button("Close").clicked() {
                         close_requested = true;
@@ -1171,6 +1174,9 @@ impl KeyScribeApp {
                                 "Analyzing track in background... waveform and playback stay available."
                             }
                             RebuildMode::ParametersPreview => "Buffering speed/pitch preview...",
+                            _ if (self.speed - 1.0).abs() < 1e-6 && self.pitch_semitones.abs() < 1e-6 => {
+                                "Building playback buffer..."
+                            }
                             _ => "Rendering full speed/pitch update...",
                         };
                         let processing_color = egui::Color32::from_rgb(

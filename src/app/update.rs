@@ -6,15 +6,20 @@ impl eframe::App for KeyScribeApp {
         self.lock_startup_min_window_size_once(ctx);
         self.apply_mobile_ui_tweaks_once(ctx);
 
+        let wants_keyboard = ctx.wants_keyboard_input();
         let (space_pressed, k_pressed, left_pressed, right_pressed, m_pressed, ctrl_held) = ctx.input(|i| {
-            (
-                i.key_pressed(egui::Key::Space),
-                i.key_pressed(egui::Key::K),
-                i.key_pressed(egui::Key::ArrowLeft),
-                i.key_pressed(egui::Key::ArrowRight),
-                i.key_pressed(egui::Key::M),
-                i.modifiers.ctrl,
-            )
+            if wants_keyboard {
+                (false, false, false, false, false, i.modifiers.ctrl)
+            } else {
+                (
+                    i.key_pressed(egui::Key::Space),
+                    i.key_pressed(egui::Key::K),
+                    i.key_pressed(egui::Key::ArrowLeft),
+                    i.key_pressed(egui::Key::ArrowRight),
+                    i.key_pressed(egui::Key::M),
+                    i.modifiers.ctrl,
+                )
+            }
         });
 
         if space_pressed {
@@ -26,8 +31,8 @@ impl eframe::App for KeyScribeApp {
         if m_pressed {
             if let Some(hash) = &self.loaded_audio_hash {
                 let markers = self.file_markers.entry(hash.clone()).or_default();
-                markers.push(self.selected_time_sec);
-                markers.sort_by(|a, b| a.partial_cmp(b).unwrap());
+                markers.push(crate::app::MarkerData::Detailed { time: self.selected_time_sec, desc: String::new() });
+                markers.sort_by(|a, b| a.time().partial_cmp(&b.time()).unwrap());
             }
         }
         if left_pressed {
@@ -99,7 +104,8 @@ impl eframe::App for KeyScribeApp {
             let duration = self.source_duration() as f64;
             if duration > super::AUTO_SEPARATE_MAX_DURATION_SEC {
                 self.separation_attempted = true;
-                self.last_error = Some("Stem separation is manual for this source since it is longer than 10 minutes.".to_string());
+                self.cache_status_message = Some("Stem separation is manual for this source since it is longer than 10 minutes.".to_string());
+                self.cache_status_message_at = Some(std::time::Instant::now());
             } else {
                 self.run_instrument_separation();
             }
@@ -582,8 +588,6 @@ impl eframe::App for KeyScribeApp {
 
                         if self.separated_stems.is_some() {
                             ui.label(egui::RichText::new("Stem audio is loaded. Use the waveform tab controls to preview or enable instruments.").weak());
-                        } else {
-                            ui.label(egui::RichText::new("Run separation to load instrument stems. You can enable automatic separation in Settings (Recommended unless you have a very very old computer).").weak());
                         }
                     });
                 }
@@ -748,7 +752,8 @@ impl eframe::App for KeyScribeApp {
                                 let mut hovered_marker_idx = None;
                                 if let Some(hash) = &self.loaded_audio_hash {
                                     if let Some(markers) = self.file_markers.get(hash) {
-                                        for (i, &mark_sec) in markers.iter().enumerate() {
+                                        for (i, mark_data) in markers.iter().enumerate() {
+                                            let mark_sec = mark_data.time();
                                             let label = (b'A' + (i % 26) as u8) as char;
                                             let marker_color = if self.dark_mode { egui::Color32::WHITE } else { egui::Color32::BLACK };
                                             let bg_color = if self.dark_mode { egui::Color32::from_black_alpha(200) } else { egui::Color32::from_white_alpha(200) };
@@ -773,8 +778,8 @@ impl eframe::App for KeyScribeApp {
                                             if p.y > 0.4 {
                                                 let x_span = plot_ui.plot_bounds().width();
                                                 let mut min_dist = x_span * 0.02;
-                                                for (i, &mark_sec) in markers.iter().enumerate() {
-                                                    let dist = (p.x - mark_sec as f64).abs();
+                                                for (i, mark) in markers.iter().enumerate() {
+                                                    let dist = (p.x - mark.time() as f64).abs();
                                                     if dist < min_dist {
                                                         min_dist = dist;
                                                         hovered_marker_idx = Some(i);
@@ -987,7 +992,7 @@ impl eframe::App for KeyScribeApp {
                                     if let Some(idx) = hovered_marker_idx {
                                         if let Some(hash) = &self.loaded_audio_hash {
                                             if let Some(markers) = self.file_markers.get(hash) {
-                                                self.selected_time_sec = markers[idx].clamp(0.0, interaction_duration);
+                                                self.selected_time_sec = markers[idx].time().clamp(0.0, interaction_duration);
                                             }
                                         }
                                     } else if let Some(pointer) = pointer {
@@ -1025,36 +1030,42 @@ impl eframe::App for KeyScribeApp {
                                     let label = (b'A' + (idx % 26) as u8) as char;
                                     ui.label(format!("Marker {label}"));
                                     ui.separator();
-                                    if ui.button("Delete Mark").clicked() {
-                                        delete_mark_idx = Some(idx);
-                                        ui.close_menu();
-                                    }
-                                    
                                     ui.horizontal(|ui| {
                                         ui.label("Edit Time:");
                                         if self.marker_edit_index != Some(idx) {
                                             self.marker_edit_index = Some(idx);
                                             if let Some(markers) = self.file_markers.get(hash) {
                                                 if idx < markers.len() {
-                                                    let total_ms = (markers[idx] * 1000.0).round() as u32;
+                                                    let total_ms = (markers[idx].time() * 1000.0).round() as u32;
                                                     let ms = total_ms % 1000;
                                                     let s = (total_ms / 1000) % 60;
                                                     let m = (total_ms / 60000) % 60;
                                                     let h = total_ms / 3600000;
-                                                    self.marker_edit_str = format!("{:02}:{:02}:{:02}:{:03}", h, m, s, ms);
+                                                    self.marker_edit_str = if h == 0 {
+                                                        format!("{:02}:{:02}:{:03}", m, s, ms)
+                                                    } else {
+                                                        format!("{:02}:{:02}:{:02}:{:03}", h, m, s, ms)
+                                                    };
                                                 }
                                             }
                                         }
                                         
                                         if ui.add(egui::TextEdit::singleline(&mut self.marker_edit_str).desired_width(100.0)).changed() {
                                             let parts: Vec<&str> = self.marker_edit_str.split(':').collect();
-                                            if parts.len() == 4 {
+                                            let parsed_val = if parts.len() == 4 {
                                                 if let (Ok(h), Ok(m), Ok(s), Ok(ms)) = (parts[0].parse::<f32>(), parts[1].parse::<f32>(), parts[2].parse::<f32>(), parts[3].parse::<f32>()) {
-                                                    let val = h * 3600.0 + m * 60.0 + s + ms / 1000.0;
-                                                    if let Some(markers) = self.file_markers.get_mut(hash) {
-                                                        if idx < markers.len() {
-                                                            markers[idx] = val.clamp(0.0, interaction_duration);
-                                                        }
+                                                    Some(h * 3600.0 + m * 60.0 + s + ms / 1000.0)
+                                                } else { None }
+                                            } else if parts.len() == 3 {
+                                                if let (Ok(m), Ok(s), Ok(ms)) = (parts[0].parse::<f32>(), parts[1].parse::<f32>(), parts[2].parse::<f32>()) {
+                                                    Some(m * 60.0 + s + ms / 1000.0)
+                                                } else { None }
+                                            } else { None };
+
+                                            if let Some(val) = parsed_val {
+                                                if let Some(markers) = self.file_markers.get_mut(hash) {
+                                                    if idx < markers.len() {
+                                                        markers[idx].set_time(val.clamp(0.0, interaction_duration));
                                                     }
                                                 }
                                             }
@@ -1062,28 +1073,51 @@ impl eframe::App for KeyScribeApp {
                                     });
 
                                     ui.separator();
-                                    if ui.button("Loop From Here").clicked() {
+                                    
+                                    if ui.add(egui::Button::new("Loop From Here").frame(false)).clicked() {
                                         if let Some(markers) = self.file_markers.get(hash) {
                                             if idx < markers.len() {
                                                 let end = self.loop_selection.map(|(_, e)| e).unwrap_or(interaction_duration);
-                                                self.loop_selection = Some((markers[idx], end));
+                                                self.loop_selection = Some((markers[idx].time(), end));
                                                 self.loop_enabled = true;
                                                 self.loop_playback_enabled = true;
                                                 ui.close_menu();
                                             }
                                         }
                                     }
-                                    if ui.button("Loop To Here").clicked() {
+                                    if ui.add(egui::Button::new("Loop To Here").frame(false)).clicked() {
                                         if let Some(markers) = self.file_markers.get(hash) {
                                             if idx < markers.len() {
                                                 let start = self.loop_selection.map(|(s, _)| s).unwrap_or(0.0);
-                                                self.loop_selection = Some((start, markers[idx]));
+                                                self.loop_selection = Some((start, markers[idx].time()));
                                                 self.loop_enabled = true;
                                                 self.loop_playback_enabled = true;
                                                 ui.close_menu();
                                             }
                                         }
                                     }
+                                    if ui.add(egui::Button::new(egui::RichText::new("Delete Mark").color(crate::theme::ERROR_RED)).frame(false)).clicked() {
+                                        delete_mark_idx = Some(idx);
+                                        ui.close_menu();
+                                    }
+
+                                    ui.separator();
+                                    ui.label("Description:");
+                                    let mut desc = String::new();
+                                    if let Some(markers) = self.file_markers.get(hash) {
+                                        if idx < markers.len() {
+                                            desc = markers[idx].desc().to_string();
+                                        }
+                                    }
+                                    egui::ScrollArea::vertical().max_height(150.0).show(ui, |ui| {
+                                        if ui.add(egui::TextEdit::multiline(&mut desc).desired_width(200.0).desired_rows(5)).changed() {
+                                            if let Some(markers) = self.file_markers.get_mut(hash) {
+                                                if idx < markers.len() {
+                                                    markers[idx].set_desc(desc);
+                                                }
+                                            }
+                                        }
+                                    });
                                 } else {
                                     if ui.button("Add Marker Here").clicked() {
                                         if let Some(x) = self.context_menu_plot_x {
@@ -1103,7 +1137,7 @@ impl eframe::App for KeyScribeApp {
                                     if let Some(p) = plot_resp.response.interact_pointer_pos() {
                                         let plot_p = plot_resp.transform.value_from_position(p);
                                         if let Some(markers) = self.file_markers.get_mut(hash) {
-                                            markers[idx] = (plot_p.x as f32).clamp(0.0, interaction_duration);
+                                            markers[idx].set_time((plot_p.x as f32).clamp(0.0, interaction_duration));
                                         }
                                     }
                                 }
@@ -1112,7 +1146,7 @@ impl eframe::App for KeyScribeApp {
                             if plot_resp.response.drag_stopped_by(egui::PointerButton::Secondary) {
                                 self.dragging_marker = None;
                                 if let Some(markers) = self.file_markers.get_mut(hash) {
-                                    markers.sort_by(|a, b| a.partial_cmp(b).unwrap());
+                                    markers.sort_by(|a, b| a.time().partial_cmp(&b.time()).unwrap());
                                 }
                             }
 
@@ -1124,8 +1158,8 @@ impl eframe::App for KeyScribeApp {
 
                             if let Some(sec) = add_mark_sec {
                                 let markers = self.file_markers.entry(hash.clone()).or_default();
-                                markers.push(sec);
-                                markers.sort_by(|a, b| a.partial_cmp(b).unwrap());
+                                markers.push(crate::app::MarkerData::Detailed { time: sec, desc: String::new() });
+                                markers.sort_by(|a, b| a.time().partial_cmp(&b.time()).unwrap());
                             }
                         }
                     }

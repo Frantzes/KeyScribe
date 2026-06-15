@@ -454,12 +454,16 @@ impl KeyScribeApp {
             return;
         }
 
-        // Non-stem path: reference existing data to avoid 100MB+ clone
         let sr = raw.sample_rate;
-        let ch = self.processed_playback_channels;
+        let (play_samples, ch) = if self.processed_playback_samples.is_empty() {
+            (Arc::clone(&raw.samples_interleaved), raw.channels)
+        } else {
+            (Arc::clone(&self.processed_playback_samples), self.processed_playback_channels)
+        };
+        
         if let Some(engine) = &mut self.engine {
             if let Err(err) = engine.play_arc_range(
-                Arc::clone(&self.processed_playback_samples),
+                play_samples,
                 ch,
                 sr,
                 start_sec,

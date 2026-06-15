@@ -261,7 +261,36 @@ fn push_recent_file_path(recent_paths: &mut Vec<PathBuf>, path: &Path) {
     recent_paths.truncate(MAX_RECENT_FILES);
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(serde::Deserialize, serde::Serialize, Clone)]
+#[serde(untagged)]
+pub enum MarkerData {
+    Legacy(f32),
+    Detailed { time: f32, desc: String },
+}
+
+impl MarkerData {
+    pub fn time(&self) -> f32 {
+        match self {
+            Self::Legacy(t) => *t,
+            Self::Detailed { time, .. } => *time,
+        }
+    }
+    pub fn desc(&self) -> &str {
+        match self {
+            Self::Legacy(_) => "",
+            Self::Detailed { desc, .. } => desc,
+        }
+    }
+    pub fn set_time(&mut self, new_time: f32) {
+        *self = Self::Detailed { time: new_time, desc: self.desc().to_string() };
+    }
+    pub fn set_desc(&mut self, new_desc: String) {
+        *self = Self::Detailed { time: self.time(), desc: new_desc };
+    }
+}
+
+#[derive(serde::Deserialize, serde::Serialize)]
+#[serde(default)]
 struct PersistedState {
     last_file: Option<PathBuf>,
     #[serde(default)]
@@ -314,7 +343,7 @@ struct PersistedState {
     #[serde(default)]
     auto_separate: bool,
     #[serde(default)]
-    file_markers: std::collections::HashMap<String, Vec<f32>>,
+    file_markers: std::collections::HashMap<String, Vec<MarkerData>>,
 }
 
 impl Default for PersistedState {
@@ -1012,7 +1041,7 @@ pub struct KeyScribeApp {
     export_midi_modal_open: bool,
     export_selected_stems: std::collections::HashSet<crate::leadsheet::StemType>,
     export_full_mix_midi: bool,
-    file_markers: std::collections::HashMap<String, Vec<f32>>,
+    file_markers: std::collections::HashMap<String, Vec<MarkerData>>,
     dragging_marker: Option<usize>,
     context_menu_marker_idx: Option<usize>,
     context_menu_plot_x: Option<f32>,

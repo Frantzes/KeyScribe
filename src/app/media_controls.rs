@@ -364,7 +364,7 @@ pub(super) fn draw_media_controls(
                                     if is_playing {
                                         app.stop();
                                     } else if app.audio_raw.is_some() {
-                                        if app.processed_playback_samples.is_empty() && app.separated_stems.is_none() {
+                                        if app.processed_playback_samples.is_empty() && app.separated_stems.is_none() && !app.is_processing {
                                             app.request_rebuild(false, super::RebuildMode::Full);
                                         }
 
@@ -644,7 +644,7 @@ fn draw_loop_inputs(ui: &mut egui::Ui, app: &mut KeyScribeApp) {
                 if let Some(hash) = &app.loaded_audio_hash {
                     if let Some(markers) = app.file_markers.get(hash) {
                         if idx < markers.len() {
-                            return Some(markers[idx]);
+                            return Some(markers[idx].time());
                         }
                     }
                 }
