@@ -598,7 +598,7 @@ impl KeyScribeApp {
             self.processed_playback_channels = raw.channels.max(1);
             if speed_pitch_is_identity(self.speed, self.pitch_semitones) {
                 self.processed_samples = raw.samples_mono.as_ref().to_vec();
-                self.processed_playback_samples = raw.samples_interleaved.as_ref().to_vec();
+                self.processed_playback_samples = Arc::clone(&raw.samples_interleaved);
                 let waveform = build_waveform_for_processed(
                     self.processed_samples.as_slice(),
                     raw.sample_rate,
@@ -608,7 +608,7 @@ impl KeyScribeApp {
                 self.set_waveform_data(waveform, false);
             } else {
                 self.processed_samples.clear();
-                self.processed_playback_samples.clear();
+                self.processed_playback_samples = Arc::new(Vec::new());
                 self.clear_waveform_data();
             }
         }

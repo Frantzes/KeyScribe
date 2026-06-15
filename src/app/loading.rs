@@ -113,7 +113,7 @@ impl KeyScribeApp {
         self.selected_time_sec = 0.0;
         self.audio_raw = None;
         self.processed_samples.clear();
-        self.processed_playback_samples.clear();
+        self.processed_playback_samples = Arc::new(Vec::new());
         self.processed_playback_channels = 1;
         self.clear_waveform_data();
         self.note_timeline = Arc::new(Vec::new());
@@ -262,7 +262,7 @@ impl KeyScribeApp {
                 // and memcpy cascades during streaming for long files.
                 if let Some(total) = total_samples {
                     self.processed_samples.reserve(total);
-                    self.processed_playback_samples
+                    Arc::make_mut(&mut self.processed_playback_samples)
                         .reserve(total * self.loading_source_channels as usize);
                 }
 
@@ -287,7 +287,7 @@ impl KeyScribeApp {
 
                 let was_empty = self.processed_samples.is_empty();
                 self.processed_samples.extend_from_slice(&samples_mono);
-                self.processed_playback_samples
+                Arc::make_mut(&mut self.processed_playback_samples)
                     .extend_from_slice(&samples_interleaved);
                 self.processed_playback_channels = playback_channels;
                 let processed_len = self.processed_samples.len();
@@ -325,16 +325,16 @@ impl KeyScribeApp {
                 // Build AudioData from the accumulated processed samples.
                 // Since speed/pitch is identity during loading, processed == raw.
                 let mono = std::mem::take(&mut self.processed_samples);
-                let interleaved = std::mem::take(&mut self.processed_playback_samples);
+                let interleaved = Arc::clone(&self.processed_playback_samples);
                 self.audio_raw = Some(AudioData {
                     sample_rate,
                     channels: self.loading_source_channels,
                     samples_mono: Arc::new(mono.clone()),
-                    samples_interleaved: Arc::new(interleaved.clone()),
+                    samples_interleaved: interleaved,
                     metadata,
                 });
                 self.processed_samples = mono;
-                self.processed_playback_samples = interleaved;
+                // self.processed_playback_samples is already the interleaved data
                 self.processed_playback_channels = self.loading_source_channels;
                 self.album_art_texture = self.create_album_art_texture(ctx);
 

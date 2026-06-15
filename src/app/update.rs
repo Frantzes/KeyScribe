@@ -1017,7 +1017,7 @@ impl Drop for KeyScribeApp {
 
         // Release large allocations eagerly so the OS can reclaim memory faster.
         self.processed_samples = Vec::new();
-        self.processed_playback_samples = Vec::new();
+        self.processed_playback_samples = Arc::new(Vec::new());
         self.waveform = Vec::new();
         self.audio_raw = None;
         self.video_player = None;

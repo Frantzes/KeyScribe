@@ -34,7 +34,31 @@ pub fn accent_soft(color: egui::Color32) -> egui::Color32 {
 
 pub fn format_time(sec: f32) -> String {
     let total = sec.max(0.0).floor() as u64;
-    let m = total / 60;
+    let h = total / 3600;
+    let m = (total % 3600) / 60;
     let s = total % 60;
-    format!("{m:02}:{s:02}")
+    if h > 0 {
+        format!("{h}:{m:02}:{s:02}")
+    } else {
+        format!("{m:02}:{s:02}")
+    }
+}
+
+pub fn parse_time(s: &str) -> Option<f32> {
+    let parts: Vec<&str> = s.split(':').collect();
+    match parts.len() {
+        1 => parts[0].trim().parse::<f32>().ok(),
+        2 => {
+            let m = parts[0].trim().parse::<f32>().ok()?;
+            let s = parts[1].trim().parse::<f32>().ok()?;
+            Some(m * 60.0 + s)
+        }
+        3 => {
+            let h = parts[0].trim().parse::<f32>().ok()?;
+            let m = parts[1].trim().parse::<f32>().ok()?;
+            let s = parts[2].trim().parse::<f32>().ok()?;
+            Some(h * 3600.0 + m * 60.0 + s)
+        }
+        _ => None,
+    }
 }

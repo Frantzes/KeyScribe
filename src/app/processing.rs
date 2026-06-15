@@ -221,7 +221,7 @@ impl KeyScribeApp {
                     cache_lookup_hit: None,
                     source_hash: None,
                     processed_samples: Vec::new(),
-                    processed_playback_samples: Vec::new(),
+                    processed_playback_samples: Arc::new(Vec::new()),
                     processed_playback_channels: playback_channels,
                     waveform: Vec::new(),
                     note_timeline: Arc::new(Vec::new()),
@@ -293,7 +293,7 @@ impl KeyScribeApp {
                             pitch_semitones,
                         );
 
-                        let mut processed_playback_samples = Vec::new();
+                        let mut processed_playback_samples = Arc::new(Vec::new());
                         let mut waveform = Vec::new();
                         let mut processed_samples_out = Vec::new();
 
@@ -310,15 +310,15 @@ impl KeyScribeApp {
 
                             processed_playback_samples =
                                 if speed_pitch_is_identity(speed, pitch_semitones) {
-                                    raw_playback_samples.as_ref().to_vec()
+                                    Arc::clone(&raw_playback_samples)
                                 } else {
-                                    apply_speed_and_pitch_interleaved(
+                                    Arc::new(apply_speed_and_pitch_interleaved(
                                         raw_playback_samples.as_slice(),
                                         raw_playback_channels,
                                         sample_rate,
                                         speed,
                                         pitch_semitones,
-                                    )
+                                    ))
                                 };
                             processed_samples_out = cached_processed_samples;
 
@@ -401,18 +401,18 @@ impl KeyScribeApp {
             };
 
             let processed_playback_samples = if mode == RebuildMode::VisualizationOnly {
-                Vec::new()
+                Arc::new(Vec::new())
             } else {
                 if speed_pitch_is_identity(speed, pitch_semitones) {
-                    raw_playback_samples.as_ref().to_vec()
+                    Arc::clone(&raw_playback_samples)
                 } else {
-                    apply_speed_and_pitch_interleaved(
+                    Arc::new(apply_speed_and_pitch_interleaved(
                         raw_playback_samples.as_slice(),
                         raw_playback_channels,
                         sample_rate,
                         speed,
                         pitch_semitones,
-                    )
+                    ))
                 }
             };
 

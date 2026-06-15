@@ -323,9 +323,14 @@ impl KeyScribeApp {
         let sr = raw.sample_rate;
         let ch = self.processed_playback_channels;
         if let Some(engine) = &mut self.engine {
-            if let Err(err) =
-                engine.play_from(&self.processed_playback_samples, ch, sr, pos, playback_rate)
-            {
+            if let Err(err) = engine.play_arc_range(
+                Arc::clone(&self.processed_playback_samples),
+                ch,
+                sr,
+                pos,
+                None,
+                playback_rate,
+            ) {
                 self.last_error = Some(format!("Playback error: {err}"));
                 self.playing_preview_buffer = false;
                 self.live_stream_playback = false;
@@ -453,8 +458,8 @@ impl KeyScribeApp {
         let sr = raw.sample_rate;
         let ch = self.processed_playback_channels;
         if let Some(engine) = &mut self.engine {
-            if let Err(err) = engine.play_range(
-                &self.processed_playback_samples,
+            if let Err(err) = engine.play_arc_range(
+                Arc::clone(&self.processed_playback_samples),
                 ch,
                 sr,
                 start_sec,

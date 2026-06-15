@@ -120,28 +120,24 @@ fn draw_volume_time_row(
 
     ui.allocate_ui_with_layout(
         egui::vec2(ui.available_width(), row_h),
-        egui::Layout::left_to_right(egui::Align::Center),
+        egui::Layout::right_to_left(egui::Align::Center),
         |ui| {
             ui.spacing_mut().item_spacing.x = 10.0;
             let spacing_x = ui.spacing().item_spacing.x;
-            let icon_slot_w = (icon_size + 8.0).max(18.0);
 
-            let vol_icon = if app.playback_volume <= 0.01 {
-                SPEAKER_NONE
-            } else {
-                SPEAKER_HIGH
-            };
-            let (icon_rect, _) =
-                ui.allocate_exact_size(egui::vec2(icon_slot_w, row_h), egui::Sense::hover());
+            let (time_rect, _) =
+                ui.allocate_exact_size(egui::vec2(time_width, row_h), egui::Sense::hover());
             ui.painter().text(
-                icon_rect.center(),
+                time_rect.center(),
                 egui::Align2::CENTER_CENTER,
-                vol_icon,
-                icon_font_id(icon_size),
-                ui.visuals().text_color(),
+                time_label,
+                time_font,
+                time_color,
             );
 
-            let max_slider_width = (ui.available_width() - (time_width + spacing_x))
+            let icon_slot_w = (icon_size + 8.0).max(18.0);
+
+            let max_slider_width = (ui.available_width() - (icon_slot_w + spacing_x))
                 .max(0.0)
                 .min(VOLUME_SLIDER_MAX_WIDTH);
             let volume_width = if max_slider_width >= min_slider_width {
@@ -188,14 +184,19 @@ fn draw_volume_time_row(
                 }
             }
 
-            let (time_rect, _) =
-                ui.allocate_exact_size(egui::vec2(time_width, row_h), egui::Sense::hover());
+            let vol_icon = if app.playback_volume <= 0.01 {
+                SPEAKER_NONE
+            } else {
+                SPEAKER_HIGH
+            };
+            let (icon_rect, _) =
+                ui.allocate_exact_size(egui::vec2(icon_slot_w, row_h), egui::Sense::hover());
             ui.painter().text(
-                time_rect.center(),
+                icon_rect.center(),
                 egui::Align2::CENTER_CENTER,
-                time_label,
-                time_font,
-                time_color,
+                vol_icon,
+                icon_font_id(icon_size),
+                ui.visuals().text_color(),
             );
         },
     );
@@ -363,7 +364,7 @@ pub(super) fn draw_media_controls(
                                     if is_playing {
                                         app.stop();
                                     } else if app.audio_raw.is_some() {
-                                        if app.processed_playback_samples.is_empty() {
+                                        if app.processed_playback_samples.is_empty() && app.separated_stems.is_none() {
                                             app.request_rebuild(false, super::RebuildMode::Full);
                                         }
 
@@ -400,6 +401,8 @@ pub(super) fn draw_media_controls(
                                         }
                                     }
                                 }
+
+                                draw_loop_inputs(ui, app);
                             });
 
                             ui.add_space(UI_VSPACE_COMPACT);
@@ -448,11 +451,16 @@ pub(super) fn draw_media_controls(
                                     let play_w = button_size;
                                     let side_w = ((ui.available_width() - play_w).max(0.0)) * 0.5;
 
+                                    let play_row_height = button_size;
+                                    let total_needed_h = play_row_height;
+                                    
+                                    ui.add_space((content_h - total_needed_h).max(0.0) / 2.0);
+
                                     ui.horizontal(|ui| {
                                         ui.spacing_mut().item_spacing.x = 10.0;
 
                                         ui.allocate_ui_with_layout(
-                                            egui::vec2(side_w, content_h),
+                                            egui::vec2(side_w, play_row_height),
                                             egui::Layout::right_to_left(egui::Align::Center),
                                             |ui| {
                                                 if icon_button(
@@ -483,7 +491,7 @@ pub(super) fn draw_media_controls(
                                             if is_playing {
                                                 app.stop();
                                             } else if app.audio_raw.is_some() {
-                                                if app.processed_playback_samples.is_empty() {
+                                                if app.processed_playback_samples.is_empty() && app.separated_stems.is_none() {
                                                     app.request_rebuild(
                                                         false,
                                                         super::RebuildMode::Full,
@@ -501,7 +509,7 @@ pub(super) fn draw_media_controls(
                                         }
 
                                         ui.allocate_ui_with_layout(
-                                            egui::vec2(side_w, content_h),
+                                            egui::vec2(side_w + 150.0, play_row_height),
                                             egui::Layout::left_to_right(egui::Align::Center),
                                             |ui| {
                                                 if icon_button(
@@ -536,6 +544,11 @@ pub(super) fn draw_media_controls(
                                                         }
                                                     }
                                                 }
+
+                                                if app.loop_enabled {
+                                                    ui.add_space(8.0);
+                                                    draw_loop_inputs(ui, app);
+                                                }
                                             },
                                         );
                                     });
@@ -563,4 +576,82 @@ pub(super) fn draw_media_controls(
                 });
         },
     );
+}
+
+fn draw_loop_inputs(ui: &mut egui::Ui, app: &mut KeyScribeApp) {
+    if !app.loop_enabled {
+        return;
+    }
+    if let Some((start, end)) = app.loop_selection {
+        let start_id = ui.make_persistent_id("loop_start_input");
+        let end_id = ui.make_persistent_id("loop_end_input");
+
+        if !ui.memory(|mem| mem.has_focus(start_id)) {
+            app.loop_start_input_str = format_time(start);
+        }
+        if !ui.memory(|mem| mem.has_focus(end_id)) {
+            app.loop_end_input_str = format_time(end);
+        }
+
+        ui.spacing_mut().item_spacing.x = 4.0;
+        
+        let mut new_start = start;
+        let mut new_end = end;
+        let mut changed = false;
+
+        let duration = app.timeline_duration_sec();
+
+        if ui.push_id("start_minus", |ui| ui.button("-")).inner.on_hover_text("Subtract 1 second from loop start").clicked() {
+            new_start = (start - 1.0).max(0.0);
+            changed = true;
+        }
+        let start_resp = ui.add(
+            egui::TextEdit::singleline(&mut app.loop_start_input_str)
+                .id(start_id)
+                .desired_width(50.0)
+                .margin(egui::vec2(4.0, 2.0))
+        );
+        if ui.push_id("start_plus", |ui| ui.button("+")).inner.on_hover_text("Add 1 second to loop start").clicked() {
+            new_start = (start + 1.0).min(end - 0.1);
+            changed = true;
+        }
+
+        ui.label("\u{2014}");
+
+        if ui.push_id("end_minus", |ui| ui.button("-")).inner.on_hover_text("Subtract 1 second from loop end").clicked() {
+            new_end = (end - 1.0).max(start + 0.1);
+            changed = true;
+        }
+        let end_resp = ui.add(
+            egui::TextEdit::singleline(&mut app.loop_end_input_str)
+                .id(end_id)
+                .desired_width(50.0)
+                .margin(egui::vec2(4.0, 2.0))
+        );
+        if ui.push_id("end_plus", |ui| ui.button("+")).inner.on_hover_text("Add 1 second to loop end").clicked() {
+            new_end = (end + 1.0).min(duration);
+            changed = true;
+        }
+
+        if start_resp.lost_focus() {
+            if let Some(parsed) = crate::ui::utils::parse_time(&app.loop_start_input_str) {
+                new_start = parsed.max(0.0).min(end - 0.1);
+                changed = true;
+            }
+        }
+        if end_resp.lost_focus() {
+            if let Some(parsed) = crate::ui::utils::parse_time(&app.loop_end_input_str) {
+                new_end = parsed.min(duration).max(start + 0.1);
+                changed = true;
+            }
+        }
+
+        if changed {
+            app.loop_selection = Some((new_start, new_end));
+            app.loop_playback_enabled = true;
+            if app.is_playing() {
+                app.play_from_selected();
+            }
+        }
+    }
 }

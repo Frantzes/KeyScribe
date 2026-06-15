@@ -32,7 +32,7 @@ impl KeyScribeApp {
         let expected_pitch_bits = pitch_semitones.to_bits();
 
         let strict_paths = analysis_cache_candidate_file_paths(song_hash, &variant_key);
-        let strict_count = strict_paths.len();
+        let _strict_count = strict_paths.len();
         let mut candidate_paths = strict_paths;
         for path in analysis_cache_song_file_paths(song_hash) {
             if !candidate_paths.iter().any(|existing| existing == &path) {
@@ -41,7 +41,7 @@ impl KeyScribeApp {
         }
         diag.total_candidates = candidate_paths.len();
 
-        for (idx, cache_path) in candidate_paths.into_iter().enumerate() {
+        for (_idx, cache_path) in candidate_paths.into_iter().enumerate() {
             if !cache_path.is_file() {
                 continue;
             }
@@ -323,15 +323,15 @@ impl KeyScribeApp {
         self.processed_playback_channels = raw_playback_channels;
         self.processed_playback_samples = if speed_pitch_is_identity(self.speed, self.pitch_semitones)
         {
-            raw_playback_samples.as_ref().to_vec()
+            Arc::clone(&raw_playback_samples)
         } else {
-            apply_speed_and_pitch_interleaved(
+            Arc::new(apply_speed_and_pitch_interleaved(
                 raw_playback_samples.as_slice(),
                 raw_playback_channels,
                 sample_rate,
                 self.speed,
                 self.pitch_semitones,
-            )
+            ))
         };
         let waveform = cached_waveform.unwrap_or_else(|| {
             build_waveform_for_processed(
