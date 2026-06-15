@@ -835,6 +835,7 @@ impl KeyScribeApp {
             },
             sheet_use_musescore: self.sheet_use_musescore,
             auto_separate: self.auto_separate,
+            file_markers: self.file_markers.clone(),
         };
 
         if let Ok(raw) = serde_json::to_string_pretty(&state) {

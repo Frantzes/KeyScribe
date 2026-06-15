@@ -703,7 +703,44 @@ impl KeyScribeApp {
                         ui.end_row();
 
                         ui.monospace("Ctrl + Left/Right Arrow");
-                        ui.label("Shift loop range by 5 seconds (when loop is active)");
+                        ui.label("Shift loop range by 1 second (when loop is active)");
+                        ui.end_row();
+                    });
+
+                ui.add_space(UI_VSPACE_COMPACT);
+                ui.label("Markers & Looping");
+                egui::Grid::new("markers_help_grid")
+                    .num_columns(2)
+                    .min_col_width(140.0)
+                    .spacing([14.0, 8.0])
+                    .striped(true)
+                    .show(ui, |ui| {
+                        ui.monospace("M");
+                        ui.label("Add a marker at the current playhead");
+                        ui.end_row();
+
+                        ui.monospace("Right Click on Waveform");
+                        ui.label("Add a marker at your cursor");
+                        ui.end_row();
+
+                        ui.monospace("Left Click Marker Letter");
+                        ui.label("Jump directly to the marker's time");
+                        ui.end_row();
+
+                        ui.monospace("Right Click Marker Letter");
+                        ui.label("Open menu to loop, edit precise time, or delete");
+                        ui.end_row();
+
+                        ui.monospace("Right Click Drag Marker");
+                        ui.label("Move marker smoothly");
+                        ui.end_row();
+
+                        ui.monospace("Left Click Drag Waveform");
+                        ui.label("Create a loop selection");
+                        ui.end_row();
+
+                        ui.monospace("Type Letter in Loop Box");
+                        ui.label("Snap the loop point to that marker's time");
                         ui.end_row();
                     });
 

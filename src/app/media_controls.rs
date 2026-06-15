@@ -582,76 +582,99 @@ fn draw_loop_inputs(ui: &mut egui::Ui, app: &mut KeyScribeApp) {
     if !app.loop_enabled {
         return;
     }
-    if let Some((start, end)) = app.loop_selection {
-        let start_id = ui.make_persistent_id("loop_start_input");
-        let end_id = ui.make_persistent_id("loop_end_input");
+    
+    let (start, end) = app.loop_selection.unwrap_or((0.0, 0.0));
+    
+    let start_id = ui.make_persistent_id("loop_start_input");
+    let end_id = ui.make_persistent_id("loop_end_input");
 
-        if !ui.memory(|mem| mem.has_focus(start_id)) {
-            app.loop_start_input_str = format_time(start);
-        }
-        if !ui.memory(|mem| mem.has_focus(end_id)) {
-            app.loop_end_input_str = format_time(end);
-        }
+    if !ui.memory(|mem| mem.has_focus(start_id)) {
+        app.loop_start_input_str = format_time(start);
+    }
+    if !ui.memory(|mem| mem.has_focus(end_id)) {
+        app.loop_end_input_str = format_time(end);
+    }
 
-        ui.spacing_mut().item_spacing.x = 4.0;
-        
-        let mut new_start = start;
-        let mut new_end = end;
-        let mut changed = false;
+    ui.spacing_mut().item_spacing.x = 4.0;
+    
+    let mut new_start = start;
+    let mut new_end = end;
+    let mut changed = false;
 
-        let duration = app.timeline_duration_sec();
+    let duration = app.timeline_duration_sec();
 
-        if ui.push_id("start_minus", |ui| ui.button("-")).inner.on_hover_text("Subtract 1 second from loop start").clicked() {
-            new_start = (start - 1.0).max(0.0);
-            changed = true;
-        }
-        let start_resp = ui.add(
-            egui::TextEdit::singleline(&mut app.loop_start_input_str)
-                .id(start_id)
-                .desired_width(50.0)
-                .margin(egui::vec2(4.0, 2.0))
-        );
-        if ui.push_id("start_plus", |ui| ui.button("+")).inner.on_hover_text("Add 1 second to loop start").clicked() {
-            new_start = (start + 1.0).min(end - 0.1);
-            changed = true;
-        }
+    if ui.push_id("start_minus", |ui| ui.button("-")).inner.on_hover_text("Subtract 1 second from loop start").clicked() {
+        new_start = (start - 1.0).max(0.0);
+        changed = true;
+    }
+    let start_resp = ui.add(
+        egui::TextEdit::singleline(&mut app.loop_start_input_str)
+            .id(start_id)
+            .desired_width(50.0)
+            .margin(egui::vec2(4.0, 2.0))
+    );
+    if ui.push_id("start_plus", |ui| ui.button("+")).inner.on_hover_text("Add 1 second to loop start").clicked() {
+        new_start = (start + 1.0).min(end - 0.1);
+        changed = true;
+    }
 
-        ui.label("\u{2014}");
+    ui.label("\u{2014}");
 
-        if ui.push_id("end_minus", |ui| ui.button("-")).inner.on_hover_text("Subtract 1 second from loop end").clicked() {
-            new_end = (end - 1.0).max(start + 0.1);
-            changed = true;
-        }
-        let end_resp = ui.add(
-            egui::TextEdit::singleline(&mut app.loop_end_input_str)
-                .id(end_id)
-                .desired_width(50.0)
-                .margin(egui::vec2(4.0, 2.0))
-        );
-        if ui.push_id("end_plus", |ui| ui.button("+")).inner.on_hover_text("Add 1 second to loop end").clicked() {
-            new_end = (end + 1.0).min(duration);
-            changed = true;
-        }
+    if ui.push_id("end_minus", |ui| ui.button("-")).inner.on_hover_text("Subtract 1 second from loop end").clicked() {
+        new_end = (end - 1.0).max(start + 0.1);
+        changed = true;
+    }
+    let end_resp = ui.add(
+        egui::TextEdit::singleline(&mut app.loop_end_input_str)
+            .id(end_id)
+            .desired_width(50.0)
+            .margin(egui::vec2(4.0, 2.0))
+    );
+    if ui.push_id("end_plus", |ui| ui.button("+")).inner.on_hover_text("Add 1 second to loop end").clicked() {
+        new_end = (end + 1.0).min(duration);
+        changed = true;
+    }
 
-        if start_resp.lost_focus() {
-            if let Some(parsed) = crate::ui::utils::parse_time(&app.loop_start_input_str) {
-                new_start = parsed.max(0.0).min(end - 0.1);
-                changed = true;
+    let mut marker_time = |input: &str| -> Option<f32> {
+        let s = input.trim();
+        if s.len() == 1 {
+            let c = s.chars().next().unwrap().to_ascii_uppercase();
+            if c >= 'A' && c <= 'Z' {
+                let idx = (c as u8 - b'A') as usize;
+                if let Some(hash) = &app.loaded_audio_hash {
+                    if let Some(markers) = app.file_markers.get(hash) {
+                        if idx < markers.len() {
+                            return Some(markers[idx]);
+                        }
+                    }
+                }
             }
         }
-        if end_resp.lost_focus() {
-            if let Some(parsed) = crate::ui::utils::parse_time(&app.loop_end_input_str) {
-                new_end = parsed.min(duration).max(start + 0.1);
-                changed = true;
-            }
-        }
+        None
+    };
 
-        if changed {
-            app.loop_selection = Some((new_start, new_end));
-            app.loop_playback_enabled = true;
-            if app.is_playing() {
-                app.play_from_selected();
-            }
+    if start_resp.lost_focus() {
+        let parsed = marker_time(&app.loop_start_input_str)
+            .or_else(|| crate::ui::utils::parse_time(&app.loop_start_input_str));
+        if let Some(parsed) = parsed {
+            new_start = parsed.max(0.0).min(end - 0.1);
+            changed = true;
+        }
+    }
+    if end_resp.lost_focus() {
+        let parsed = marker_time(&app.loop_end_input_str)
+            .or_else(|| crate::ui::utils::parse_time(&app.loop_end_input_str));
+        if let Some(parsed) = parsed {
+            new_end = parsed.min(duration).max(start + 0.1);
+            changed = true;
+        }
+    }
+
+    if changed {
+        app.loop_selection = Some((new_start, new_end));
+        app.loop_playback_enabled = true;
+        if app.is_playing() {
+            app.play_from_selected();
         }
     }
 }

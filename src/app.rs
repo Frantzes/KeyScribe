@@ -311,8 +311,10 @@ struct PersistedState {
     saved_listen_stem_indices: Option<Vec<usize>>,
     #[serde(default)]
     sheet_use_musescore: bool,
-    #[serde(default = "default_auto_separate")]
+    #[serde(default)]
     auto_separate: bool,
+    #[serde(default)]
+    file_markers: std::collections::HashMap<String, Vec<f32>>,
 }
 
 impl Default for PersistedState {
@@ -348,6 +350,7 @@ impl Default for PersistedState {
             saved_listen_stem_indices: None,
             sheet_use_musescore: false,
             auto_separate: default_auto_separate(),
+            file_markers: std::collections::HashMap::new(),
         }
     }
 }
@@ -1009,6 +1012,12 @@ pub struct KeyScribeApp {
     export_midi_modal_open: bool,
     export_selected_stems: std::collections::HashSet<crate::leadsheet::StemType>,
     export_full_mix_midi: bool,
+    file_markers: std::collections::HashMap<String, Vec<f32>>,
+    dragging_marker: Option<usize>,
+    context_menu_marker_idx: Option<usize>,
+    context_menu_plot_x: Option<f32>,
+    marker_edit_index: Option<usize>,
+    marker_edit_str: String,
 }
 
 struct StemPlaybackCache {
@@ -1398,6 +1407,12 @@ impl KeyScribeApp {
             export_midi_modal_open: false,
             export_selected_stems: std::collections::HashSet::new(),
             export_full_mix_midi: false,
+            file_markers: persisted.file_markers,
+            dragging_marker: None,
+            context_menu_marker_idx: None,
+            context_menu_plot_x: None,
+            marker_edit_index: None,
+            marker_edit_str: String::new(),
         };
 
         app.refresh_audio_output_devices();

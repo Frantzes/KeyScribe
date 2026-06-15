@@ -6,12 +6,13 @@ impl eframe::App for KeyScribeApp {
         self.lock_startup_min_window_size_once(ctx);
         self.apply_mobile_ui_tweaks_once(ctx);
 
-        let (space_pressed, k_pressed, left_pressed, right_pressed, ctrl_held) = ctx.input(|i| {
+        let (space_pressed, k_pressed, left_pressed, right_pressed, m_pressed, ctrl_held) = ctx.input(|i| {
             (
                 i.key_pressed(egui::Key::Space),
                 i.key_pressed(egui::Key::K),
                 i.key_pressed(egui::Key::ArrowLeft),
                 i.key_pressed(egui::Key::ArrowRight),
+                i.key_pressed(egui::Key::M),
                 i.modifiers.ctrl,
             )
         });
@@ -22,15 +23,22 @@ impl eframe::App for KeyScribeApp {
         if k_pressed {
             self.handle_toggle_play_pause();
         }
+        if m_pressed {
+            if let Some(hash) = &self.loaded_audio_hash {
+                let markers = self.file_markers.entry(hash.clone()).or_default();
+                markers.push(self.selected_time_sec);
+                markers.sort_by(|a, b| a.partial_cmp(b).unwrap());
+            }
+        }
         if left_pressed {
-            if ctrl_held && self.shift_loop_by_seconds(-SEEK_STEP_SEC) {
+            if ctrl_held && self.shift_loop_by_seconds(-1.0) {
                 // Ctrl+Arrow shifts loop range when looping is active.
             } else {
                 self.skip_by_seconds(-SEEK_STEP_SEC);
             }
         }
         if right_pressed {
-            if ctrl_held && self.shift_loop_by_seconds(SEEK_STEP_SEC) {
+            if ctrl_held && self.shift_loop_by_seconds(1.0) {
                 // Ctrl+Arrow shifts loop range when looping is active.
             } else {
                 self.skip_by_seconds(SEEK_STEP_SEC);
@@ -645,7 +653,7 @@ impl eframe::App for KeyScribeApp {
                             content_h,
                         );
                     } else {
-                        Plot::new("waveform_plot")
+                        let plot_resp = Plot::new("waveform_plot")
                             .height(remaining_h)
                             .allow_scroll(false)
                             .allow_zoom(false)
@@ -737,6 +745,46 @@ impl eframe::App for KeyScribeApp {
                                         .color(accent_soft(self.highlight_color)),
                                 );
 
+                                let mut hovered_marker_idx = None;
+                                if let Some(hash) = &self.loaded_audio_hash {
+                                    if let Some(markers) = self.file_markers.get(hash) {
+                                        for (i, &mark_sec) in markers.iter().enumerate() {
+                                            let label = (b'A' + (i % 26) as u8) as char;
+                                            let marker_color = if self.dark_mode { egui::Color32::WHITE } else { egui::Color32::BLACK };
+                                            let bg_color = if self.dark_mode { egui::Color32::from_black_alpha(200) } else { egui::Color32::from_white_alpha(200) };
+                                            plot_ui.vline(
+                                                VLine::new(mark_sec as f64)
+                                                    .color(marker_color)
+                                            );
+                                            plot_ui.text(
+                                                egui_plot::Text::new(
+                                                    egui_plot::PlotPoint::new(mark_sec as f64, 1.0),
+                                                    egui::RichText::new(format!(" {label} "))
+                                                        .size(16.0)
+                                                        .color(marker_color)
+                                                        .background_color(bg_color)
+                                                )
+                                                .anchor(egui::Align2::CENTER_TOP)
+                                            );
+                                        }
+
+                                        let pointer = plot_ui.pointer_coordinate();
+                                        if let Some(p) = pointer {
+                                            if p.y > 0.4 {
+                                                let x_span = plot_ui.plot_bounds().width();
+                                                let mut min_dist = x_span * 0.02;
+                                                for (i, &mark_sec) in markers.iter().enumerate() {
+                                                    let dist = (p.x - mark_sec as f64).abs();
+                                                    if dist < min_dist {
+                                                        min_dist = dist;
+                                                        hovered_marker_idx = Some(i);
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+
                                 if let Some((a, b)) = self.loop_selection {
                                     let start = a.min(b);
                                     let end = a.max(b);
@@ -757,9 +805,9 @@ impl eframe::App for KeyScribeApp {
 
                                 let pointer = plot_ui.pointer_coordinate();
                                 let hovered = plot_ui.response().hovered();
-                                let drag_started = plot_ui.response().drag_started();
-                                let dragged = plot_ui.response().dragged();
-                                let drag_stopped = plot_ui.response().drag_stopped();
+                                let drag_started = plot_ui.response().drag_started_by(egui::PointerButton::Primary);
+                                let dragged = plot_ui.response().dragged_by(egui::PointerButton::Primary);
+                                let drag_stopped = plot_ui.response().drag_stopped_by(egui::PointerButton::Primary);
                                 let clicked = plot_ui.response().clicked();
                                 let (
                                     raw_scroll,
@@ -936,19 +984,150 @@ impl eframe::App for KeyScribeApp {
                                 }
 
                                 if interaction_ready && clicked {
-                                    if let Some(pointer) = pointer {
+                                    if let Some(idx) = hovered_marker_idx {
+                                        if let Some(hash) = &self.loaded_audio_hash {
+                                            if let Some(markers) = self.file_markers.get(hash) {
+                                                self.selected_time_sec = markers[idx].clamp(0.0, interaction_duration);
+                                            }
+                                        }
+                                    } else if let Some(pointer) = pointer {
                                         self.selected_time_sec = pointer
                                             .x
                                             .clamp(0.0, interaction_duration as f64)
                                             as f32;
-                                        self.loop_selection = None;
-                                        self.loop_playback_enabled = false;
-                                        if self.is_playing() {
-                                            self.play_from_selected();
+                                    }
+                                    self.loop_selection = None;
+                                    self.loop_playback_enabled = false;
+                                    if self.is_playing() {
+                                        self.play_from_selected();
+                                    }
+                                }
+
+                                hovered_marker_idx
+                            });
+
+                        let hovered_marker_idx = plot_resp.inner;
+                        let mut delete_mark_idx = None;
+                        let mut add_mark_sec = None;
+
+                        if plot_resp.response.secondary_clicked() {
+                            self.context_menu_marker_idx = hovered_marker_idx;
+                            if let Some(pos) = plot_resp.response.interact_pointer_pos() {
+                                self.context_menu_plot_x = Some(plot_resp.transform.value_from_position(pos).x as f32);
+                            } else {
+                                self.context_menu_plot_x = None;
+                            }
+                        }
+
+                        if let Some(hash) = &self.loaded_audio_hash {
+                            plot_resp.response.context_menu(|ui| {
+                                if let Some(idx) = self.context_menu_marker_idx {
+                                    let label = (b'A' + (idx % 26) as u8) as char;
+                                    ui.label(format!("Marker {label}"));
+                                    ui.separator();
+                                    if ui.button("Delete Mark").clicked() {
+                                        delete_mark_idx = Some(idx);
+                                        ui.close_menu();
+                                    }
+                                    
+                                    ui.horizontal(|ui| {
+                                        ui.label("Edit Time:");
+                                        if self.marker_edit_index != Some(idx) {
+                                            self.marker_edit_index = Some(idx);
+                                            if let Some(markers) = self.file_markers.get(hash) {
+                                                if idx < markers.len() {
+                                                    let total_ms = (markers[idx] * 1000.0).round() as u32;
+                                                    let ms = total_ms % 1000;
+                                                    let s = (total_ms / 1000) % 60;
+                                                    let m = (total_ms / 60000) % 60;
+                                                    let h = total_ms / 3600000;
+                                                    self.marker_edit_str = format!("{:02}:{:02}:{:02}:{:03}", h, m, s, ms);
+                                                }
+                                            }
                                         }
+                                        
+                                        if ui.add(egui::TextEdit::singleline(&mut self.marker_edit_str).desired_width(100.0)).changed() {
+                                            let parts: Vec<&str> = self.marker_edit_str.split(':').collect();
+                                            if parts.len() == 4 {
+                                                if let (Ok(h), Ok(m), Ok(s), Ok(ms)) = (parts[0].parse::<f32>(), parts[1].parse::<f32>(), parts[2].parse::<f32>(), parts[3].parse::<f32>()) {
+                                                    let val = h * 3600.0 + m * 60.0 + s + ms / 1000.0;
+                                                    if let Some(markers) = self.file_markers.get_mut(hash) {
+                                                        if idx < markers.len() {
+                                                            markers[idx] = val.clamp(0.0, interaction_duration);
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    });
+
+                                    ui.separator();
+                                    if ui.button("Loop From Here").clicked() {
+                                        if let Some(markers) = self.file_markers.get(hash) {
+                                            if idx < markers.len() {
+                                                let end = self.loop_selection.map(|(_, e)| e).unwrap_or(interaction_duration);
+                                                self.loop_selection = Some((markers[idx], end));
+                                                self.loop_enabled = true;
+                                                self.loop_playback_enabled = true;
+                                                ui.close_menu();
+                                            }
+                                        }
+                                    }
+                                    if ui.button("Loop To Here").clicked() {
+                                        if let Some(markers) = self.file_markers.get(hash) {
+                                            if idx < markers.len() {
+                                                let start = self.loop_selection.map(|(s, _)| s).unwrap_or(0.0);
+                                                self.loop_selection = Some((start, markers[idx]));
+                                                self.loop_enabled = true;
+                                                self.loop_playback_enabled = true;
+                                                ui.close_menu();
+                                            }
+                                        }
+                                    }
+                                } else {
+                                    if ui.button("Add Marker Here").clicked() {
+                                        if let Some(x) = self.context_menu_plot_x {
+                                            add_mark_sec = Some(x);
+                                        }
+                                        ui.close_menu();
                                     }
                                 }
                             });
+
+                            if plot_resp.response.drag_started_by(egui::PointerButton::Secondary) {
+                                self.dragging_marker = hovered_marker_idx;
+                            }
+                            
+                            if plot_resp.response.dragged_by(egui::PointerButton::Secondary) {
+                                if let Some(idx) = self.dragging_marker {
+                                    if let Some(p) = plot_resp.response.interact_pointer_pos() {
+                                        let plot_p = plot_resp.transform.value_from_position(p);
+                                        if let Some(markers) = self.file_markers.get_mut(hash) {
+                                            markers[idx] = (plot_p.x as f32).clamp(0.0, interaction_duration);
+                                        }
+                                    }
+                                }
+                            }
+                            
+                            if plot_resp.response.drag_stopped_by(egui::PointerButton::Secondary) {
+                                self.dragging_marker = None;
+                                if let Some(markers) = self.file_markers.get_mut(hash) {
+                                    markers.sort_by(|a, b| a.partial_cmp(b).unwrap());
+                                }
+                            }
+
+                            if let Some(idx) = delete_mark_idx {
+                                if let Some(markers) = self.file_markers.get_mut(hash) {
+                                    markers.remove(idx);
+                                }
+                            }
+
+                            if let Some(sec) = add_mark_sec {
+                                let markers = self.file_markers.entry(hash.clone()).or_default();
+                                markers.push(sec);
+                                markers.sort_by(|a, b| a.partial_cmp(b).unwrap());
+                            }
+                        }
                     }
                 });
 
