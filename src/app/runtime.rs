@@ -1,4 +1,5 @@
 use super::*;
+use crate::core::processing::build_waveform_for_processed;
 
 impl KeyScribeApp {
     pub(super) fn lock_startup_min_window_size_once(&mut self, _ctx: &egui::Context) {
@@ -158,6 +159,9 @@ impl KeyScribeApp {
         let cancel_epoch = self.next_job_id;
         self.next_job_id = self.next_job_id.saturating_add(1);
         self.processing_epoch.store(cancel_epoch, Ordering::Release);
+        if let Some(flag) = &self.processing_cancel_flag {
+            flag.store(true, Ordering::Release);
+        }
         self.clear_processing_job();
         self.pending_param_change = false;
         self.last_param_change_at = None;
@@ -225,6 +229,40 @@ impl KeyScribeApp {
             return;
         }
 
+        // When speed/pitch are back to identity, skip the costly processing
+        // pipeline and directly use the raw samples. This prevents unnecessary
+        // buffer clones, waveform rebuilds, and thread spawns that cause lag
+        // while seeking during a parameter update.
+        if speed_pitch_is_identity(self.speed, self.pitch_semitones) {
+            // Cancel any in-flight param render so is_processing resets.
+            self.cancel_active_processing();
+
+            if let Some(raw) = &self.audio_raw {
+                self.processed_samples = raw.samples_mono.to_vec();
+                self.processed_playback_samples = Arc::clone(&raw.samples_interleaved);
+                self.processed_playback_channels = raw.channels;
+
+                let waveform = build_waveform_for_processed(
+                    &self.processed_samples,
+                    raw.sample_rate,
+                    self.audio_quality_mode.waveform_points(),
+                    self.speed,
+                );
+                self.set_waveform_data(waveform, false);
+            }
+
+            self.note_timeline = Arc::clone(&self.base_note_timeline);
+            self.note_timeline_step_sec = self.base_note_timeline_step_sec;
+            self.selected_time_sec = self.selected_time_sec.min(self.source_duration());
+            self.playing_preview_buffer = false;
+
+            if self.restart_playback_after_processing {
+                self.restart_playback_after_processing = false;
+                self.play_from_selected();
+            }
+            return;
+        }
+
         let was_playing = self.stop_if_playing();
         if was_playing {
             self.request_rebuild(true, RebuildMode::ParametersPreview);
@@ -265,6 +303,7 @@ impl KeyScribeApp {
         self.processing_started_at = None;
         self.processing_estimated_total_sec = 0.0;
         self.processing_audio_duration_sec = 0.0;
+        self.processing_cancel_flag = None;
     }
 
     pub(super) fn apply_processing_result(&mut self, result: ProcessingResult) {

@@ -28,7 +28,7 @@ use crate::audio_io::{
     StreamingAudioEvent,
 };
 use crate::core::processing::build_waveform_for_processed;
-use crate::dsp::{apply_speed_and_pitch, apply_speed_and_pitch_interleaved};
+use crate::dsp::{apply_speed_and_pitch_interleaved, apply_speed_and_pitch_interleaved_with_cancel, apply_speed_and_pitch_with_cancel};
 use crate::leadsheet::StemType;
 use crate::leadsheet::{BeatTrackResult, LeadSheetFoundation};
 use crate::playback::{available_output_devices, AudioEngine, AudioOutputDeviceOption};
@@ -939,6 +939,7 @@ pub struct KeyScribeApp {
     engine: Option<AudioEngine>,
     processing_rx: Option<Receiver<ProcessingResult>>,
     processing_epoch: Arc<AtomicU64>,
+    processing_cancel_flag: Option<Arc<AtomicBool>>,
     active_rebuild_mode: RebuildMode,
     active_job_id: Option<u64>,
     next_job_id: u64,
@@ -1334,6 +1335,7 @@ impl KeyScribeApp {
             .ok(),
             processing_rx: None,
             processing_epoch: Arc::new(AtomicU64::new(0)),
+            processing_cancel_flag: None,
             active_rebuild_mode: RebuildMode::Full,
             active_job_id: None,
             next_job_id: 1,

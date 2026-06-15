@@ -1,3 +1,5 @@
+use std::sync::atomic::{AtomicBool, Ordering};
+
 use signalsmith_stretch::Stretch;
 
 pub fn apply_speed_and_pitch(
@@ -9,14 +11,25 @@ pub fn apply_speed_and_pitch(
     apply_speed_and_pitch_interleaved(samples, 1, sample_rate, speed, pitch_semitones)
 }
 
-fn apply_speed_and_pitch_mono(
+pub(crate) fn apply_speed_and_pitch_with_cancel(
     samples: &[f32],
     sample_rate: u32,
     speed: f32,
     pitch_semitones: f32,
-) -> Vec<f32> {
+    cancel: &AtomicBool,
+) -> Option<Vec<f32>> {
+    apply_speed_and_pitch_interleaved_with_cancel(samples, 1, sample_rate, speed, pitch_semitones, cancel)
+}
+
+fn apply_speed_and_pitch_mono_with_cancel(
+    samples: &[f32],
+    sample_rate: u32,
+    speed: f32,
+    pitch_semitones: f32,
+    cancel: &AtomicBool,
+) -> Option<Vec<f32>> {
     if samples.is_empty() {
-        return Vec::new();
+        return Some(Vec::new());
     }
 
     let clamped_speed = speed.clamp(0.25, 4.0);
@@ -24,11 +37,11 @@ fn apply_speed_and_pitch_mono(
     let pitch_is_zero = pitch_semitones.abs() < 1.0e-4;
 
     if speed_is_unity && pitch_is_zero {
-        return samples.to_vec();
+        return Some(samples.to_vec());
     }
 
     if sample_rate == 0 {
-        return samples.to_vec();
+        return Some(samples.to_vec());
     }
 
     let mut stretch = Stretch::preset_default(1, sample_rate);
@@ -73,6 +86,10 @@ fn apply_speed_and_pitch_mono(
     }
 
     while rendered < target_frames {
+        if cancel.load(Ordering::Relaxed) {
+            return None;
+        }
+
         let out_len = (target_frames - rendered).min(BLOCK_OUT);
         let in_len = ((out_len as f32) * clamped_speed).ceil().max(1.0) as usize;
 
@@ -109,6 +126,9 @@ fn apply_speed_and_pitch_mono(
     if output_latency > 0 {
         let mut flushed = 0usize;
         while flushed < output_latency {
+            if cancel.load(Ordering::Relaxed) {
+                return None;
+            }
             let len = (output_latency - flushed).min(output_chunk.len());
             stretch.flush(&mut output_chunk[..len]);
             push_chunk_with_skip(&mut output, &output_chunk[..len], &mut skip_front);
@@ -122,7 +142,7 @@ fn apply_speed_and_pitch_mono(
         output.truncate(target_frames);
     }
 
-    output
+    Some(output)
 }
 
 pub fn apply_speed_and_pitch_interleaved(
@@ -132,18 +152,30 @@ pub fn apply_speed_and_pitch_interleaved(
     speed: f32,
     pitch_semitones: f32,
 ) -> Vec<f32> {
+    apply_speed_and_pitch_interleaved_with_cancel(samples, channels, sample_rate, speed, pitch_semitones, &AtomicBool::new(false))
+        .unwrap()
+}
+
+pub(crate) fn apply_speed_and_pitch_interleaved_with_cancel(
+    samples: &[f32],
+    channels: u16,
+    sample_rate: u32,
+    speed: f32,
+    pitch_semitones: f32,
+    cancel: &AtomicBool,
+) -> Option<Vec<f32>> {
     let channels = channels.max(1) as usize;
     if channels == 1 {
-        return apply_speed_and_pitch_mono(samples, sample_rate, speed, pitch_semitones);
+        return apply_speed_and_pitch_mono_with_cancel(samples, sample_rate, speed, pitch_semitones, cancel);
     }
 
     if samples.is_empty() {
-        return Vec::new();
+        return Some(Vec::new());
     }
 
     let frame_count = samples.len() / channels;
     if frame_count == 0 {
-        return Vec::new();
+        return Some(Vec::new());
     }
 
     let trimmed_len = frame_count * channels;
@@ -156,31 +188,36 @@ pub fn apply_speed_and_pitch_interleaved(
     }
 
     use rayon::prelude::*;
-    let processed_channels: Vec<Vec<f32>> = separated
+    let processed_channels: Vec<Option<Vec<f32>>> = separated
         .into_par_iter()
         .map(|channel| {
-            apply_speed_and_pitch_mono(
+            apply_speed_and_pitch_mono_with_cancel(
                 &channel,
                 sample_rate,
                 speed,
                 pitch_semitones,
+                cancel,
             )
         })
         .collect();
 
-    let out_frames = processed_channels.iter().map(Vec::len).min().unwrap_or(0);
+    if processed_channels.iter().any(Option::is_none) {
+        return None;
+    }
+
+    let out_frames = processed_channels.iter().filter_map(|c| c.as_ref().map(Vec::len)).min().unwrap_or(0);
     if out_frames == 0 {
-        return Vec::new();
+        return Some(Vec::new());
     }
 
     let mut out = Vec::with_capacity(out_frames * channels);
     for frame_idx in 0..out_frames {
         for ch in 0..channels {
-            out.push(processed_channels[ch][frame_idx]);
+            out.push(processed_channels[ch].as_ref().unwrap()[frame_idx]);
         }
     }
 
     // Keep output aligned to whole frames, even if input had a partial tail.
     let _ = trimmed_len;
-    out
+    Some(out)
 }

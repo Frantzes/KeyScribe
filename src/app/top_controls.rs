@@ -1174,7 +1174,7 @@ impl KeyScribeApp {
                                 "Analyzing track in background... waveform and playback stay available."
                             }
                             RebuildMode::ParametersPreview => "Buffering speed/pitch preview...",
-                            _ if (self.speed - 1.0).abs() < 1e-6 && self.pitch_semitones.abs() < 1e-6 => {
+                            _ if speed_pitch_is_identity(self.speed, self.pitch_semitones) => {
                                 "Building playback buffer..."
                             }
                             _ => "Rendering full speed/pitch update...",

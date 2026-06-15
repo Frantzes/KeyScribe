@@ -52,6 +52,8 @@ impl KeyScribeApp {
             self.loaded_path.clone()
         };
         let processing_epoch = Arc::clone(&self.processing_epoch);
+        let cancel_flag = Arc::new(AtomicBool::new(false));
+        self.processing_cancel_flag = Some(Arc::clone(&cancel_flag));
 
         let stem_sample_rate = self
             .separated_stems
@@ -200,13 +202,17 @@ impl KeyScribeApp {
                 let preview_samples = if preview_start_frame < preview_end_frame {
                     let preview_start_idx = preview_start_frame * playback_channels_usize;
                     let preview_end_idx = preview_end_frame * playback_channels_usize;
-                    apply_speed_and_pitch_interleaved(
+                    match apply_speed_and_pitch_interleaved_with_cancel(
                         &raw_playback_samples[preview_start_idx..preview_end_idx],
                         playback_channels,
                         sample_rate,
                         speed,
                         pitch_semitones,
-                    )
+                        &cancel_flag,
+                    ) {
+                        Some(samples) => samples,
+                        None => return,
+                    }
                 } else {
                     Vec::new()
                 };
@@ -312,13 +318,17 @@ impl KeyScribeApp {
                                 if speed_pitch_is_identity(speed, pitch_semitones) {
                                     Arc::clone(&raw_playback_samples)
                                 } else {
-                                    Arc::new(apply_speed_and_pitch_interleaved(
+                                    match apply_speed_and_pitch_interleaved_with_cancel(
                                         raw_playback_samples.as_slice(),
                                         raw_playback_channels,
                                         sample_rate,
                                         speed,
                                         pitch_semitones,
-                                    ))
+                                        &cancel_flag,
+                                    ) {
+                                        Some(samples) => Arc::new(samples),
+                                        None => return,
+                                    }
                                 };
                             processed_samples_out = cached_processed_samples;
 
@@ -385,20 +395,28 @@ impl KeyScribeApp {
                 }
             }
 
-            let processed_samples = if mode == RebuildMode::VisualizationOnly {
+            let processed_samples: Option<Vec<f32>> = if mode == RebuildMode::VisualizationOnly {
                 None
             } else {
                 if processing_epoch.load(Ordering::Acquire) != job_id {
                     None
                 } else {
-                    Some(apply_speed_and_pitch(
+                    match apply_speed_and_pitch_with_cancel(
                         raw_render_samples.as_slice(),
                         sample_rate,
                         speed,
                         pitch_semitones,
-                    ))
+                        &cancel_flag,
+                    ) {
+                        Some(samples) => Some(samples),
+                        None => return,
+                    }
                 }
             };
+
+            if processing_epoch.load(Ordering::Acquire) != job_id {
+                return;
+            }
 
             let processed_playback_samples = if mode == RebuildMode::VisualizationOnly {
                 Arc::new(Vec::new())
@@ -406,13 +424,17 @@ impl KeyScribeApp {
                 if speed_pitch_is_identity(speed, pitch_semitones) {
                     Arc::clone(&raw_playback_samples)
                 } else {
-                    Arc::new(apply_speed_and_pitch_interleaved(
+                    match apply_speed_and_pitch_interleaved_with_cancel(
                         raw_playback_samples.as_slice(),
                         raw_playback_channels,
                         sample_rate,
                         speed,
                         pitch_semitones,
-                    ))
+                        &cancel_flag,
+                    ) {
+                        Some(samples) => Arc::new(samples),
+                        None => return,
+                    }
                 }
             };
 
