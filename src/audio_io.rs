@@ -306,7 +306,7 @@ fn open_audio_with_fallback(path: &Path) -> Result<OpenedAudio> {
                 }
             }
 
-            let mut cmd = std::process::Command::new("ffmpeg");
+            let mut cmd = crate::dsp::get_ffmpeg_command();
             cmd.args([
                 "-y",
                 "-ignore_editlist", "1",
@@ -350,7 +350,6 @@ fn open_audio_with_fallback(path: &Path) -> Result<OpenedAudio> {
     }
 }
 
-#[allow(dead_code)]
 pub fn load_audio_file(path: &Path) -> Result<AudioData> {
     let mut opened = open_audio_with_fallback(path)?;
 

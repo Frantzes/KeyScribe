@@ -597,9 +597,16 @@ impl KeyScribeApp {
         let param_render_in_progress = self.is_param_render_in_progress();
         if let Some(engine) = &mut self.engine {
             engine.sync_finished();
+
+            // Capture the master audio clock once per frame. This snapshot is
+            // the single source of truth distributed to all visual consumers
+            // (video, keyboard, waveform playhead) so they can never drift.
+            let clock = engine.clock_snapshot();
+            self.master_clock = Some(clock);
+
             if engine.is_playing() {
                 self.selected_time_sec =
-                    engine.current_position().min(self.timeline_duration_sec());
+                    clock.position_sec.min(self.timeline_duration_sec());
                 self.update_note_probabilities(false);
             } else if self.loop_enabled && self.loop_playback_enabled {
                 if let Some((a, b)) = self.loop_selection {
@@ -621,6 +628,8 @@ impl KeyScribeApp {
                     self.live_stream_playback = false;
                 }
             }
+        } else {
+            self.master_clock = None;
         }
     }
 }

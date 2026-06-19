@@ -1,3 +1,4 @@
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -6,6 +7,41 @@ use rodio::buffer::SamplesBuffer;
 use rodio::cpal::traits::{DeviceTrait, HostTrait};
 use rodio::cpal::Device;
 use rodio::{OutputStream, OutputStreamHandle, Sink, Source};
+
+/// A point-in-time snapshot of the master audio clock.
+///
+/// This is the single source of truth for playback position. All consumers
+/// (video, keyboard transcription, waveform playhead) must read from this
+/// snapshot rather than independently estimating time, so they can never
+/// drift apart — the same approach VLC uses with its audio-master clock.
+#[derive(Debug, Clone, Copy)]
+pub struct ClockSnapshot {
+    /// Position in timeline seconds, already compensated for output latency
+    /// so it reflects the sample currently *audible* through the speakers,
+    /// not the sample merely queued into the device buffer.
+    pub position_sec: f32,
+    /// Configured playback rate (speed factor applied to the timeline).
+    pub timeline_rate: f32,
+    /// Whether the engine is actively producing sound.
+    pub is_playing: bool,
+    /// Wall-clock instant at which this snapshot was captured.
+    pub captured_at: Instant,
+    /// Estimated output device latency (seconds) baked into `position_sec`.
+    pub latency_sec: f32,
+}
+
+impl ClockSnapshot {
+    /// A neutral snapshot representing a stopped clock at the given position.
+    pub fn stopped(position_sec: f32) -> Self {
+        Self {
+            position_sec,
+            timeline_rate: 1.0,
+            is_playing: false,
+            captured_at: Instant::now(),
+            latency_sec: 0.0,
+        }
+    }
+}
 
 // Stream samples from a shared buffer without copying.
 struct ArcSamplesSource {
@@ -16,6 +52,7 @@ struct ArcSamplesSource {
     channels: u16,
     sample_rate: u32,
     fade_frames: usize,
+    consumed: Arc<AtomicUsize>,
 }
 
 impl ArcSamplesSource {
@@ -25,6 +62,7 @@ impl ArcSamplesSource {
         end_idx: usize,
         channels: u16,
         sample_rate: u32,
+        consumed: Arc<AtomicUsize>,
     ) -> Self {
         let fade_frames = (sample_rate as f32 * 0.005) as usize; // 5ms fade
         Self {
@@ -35,6 +73,7 @@ impl ArcSamplesSource {
             channels,
             sample_rate,
             fade_frames,
+            consumed,
         }
     }
 }
@@ -46,6 +85,8 @@ impl Iterator for ArcSamplesSource {
         if self.idx >= self.end {
             return None;
         }
+
+        self.consumed.fetch_add(1, Ordering::Relaxed);
 
         let mut value = self.samples[self.idx];
         
@@ -92,6 +133,12 @@ impl Source for ArcSamplesSource {
         Some(Duration::from_secs_f32(frames as f32 / denom))
     }
 }
+
+/// Default estimated output latency used when no device-specific value is
+/// available. cpal/rodio typically buffer ~1-3 periods of ~10-30 ms each, so
+/// 30 ms is a conservative middle ground. This keeps the master clock
+/// tracking the audible signal rather than the queued one.
+const DEFAULT_OUTPUT_LATENCY_SEC: f32 = 0.030;
 
 #[derive(Debug, Clone)]
 pub struct AudioOutputDeviceOption {
@@ -159,6 +206,16 @@ pub struct AudioEngine {
     duration_sec: f32,
     timeline_rate: f32,
     volume: f32,
+    consumed_samples: Option<Arc<AtomicUsize>>,
+    playback_channels: u16,
+    playback_sample_rate: u32,
+    /// Estimated output device latency in seconds. The master clock subtracts
+    /// this from the raw consumed-sample position so that `position_sec`
+    /// tracks the sample currently *audible*, not the sample merely pulled
+    /// into the device buffer. This is the single biggest source of audio/
+    /// video and audio/keyboard drift, and compensating for it mirrors how
+    /// VLC aligns its clock to the audible audio endpoint.
+    output_latency_sec: f32,
 }
 
 impl AudioEngine {
@@ -178,6 +235,10 @@ impl AudioEngine {
             duration_sec: 0.0,
             timeline_rate: 1.0,
             volume: 0.8,
+            consumed_samples: None,
+            playback_channels: 1,
+            playback_sample_rate: 44100,
+            output_latency_sec: DEFAULT_OUTPUT_LATENCY_SEC,
         })
     }
 
@@ -305,7 +366,15 @@ impl AudioEngine {
 
         let sink = Sink::try_new(&self.stream_handle).context("Failed to create playback sink")?;
         sink.set_volume(self.volume.clamp(0.0, 1.5));
-        let source = ArcSamplesSource::new(samples, start_idx, end_idx, channels, sample_rate);
+        let consumed = Arc::new(AtomicUsize::new(0));
+        let source = ArcSamplesSource::new(
+            samples,
+            start_idx,
+            end_idx,
+            channels,
+            sample_rate,
+            Arc::clone(&consumed),
+        );
 
         sink.append(source);
         sink.play();
@@ -321,6 +390,9 @@ impl AudioEngine {
         self.started_at = Some(Instant::now());
         self.is_playing = true;
         self.sink = Some(sink);
+        self.consumed_samples = Some(consumed);
+        self.playback_channels = channels;
+        self.playback_sample_rate = sample_rate;
 
         Ok(())
     }
@@ -349,8 +421,17 @@ impl AudioEngine {
         let timeline_rate = timeline_rate.clamp(0.25, 4.0);
         let sink = Sink::try_new(&self.stream_handle).context("Failed to create playback sink")?;
         sink.set_volume(self.volume.clamp(0.0, 1.5));
-        let data = samples[..frame_count * channels_usize].to_vec();
-        let source = SamplesBuffer::new(channels, sample_rate, data);
+        let consumed = Arc::new(AtomicUsize::new(0));
+        let data = Arc::new(samples[..frame_count * channels_usize].to_vec());
+        let total = data.len();
+        let source = ArcSamplesSource::new(
+            data,
+            0,
+            total,
+            channels,
+            sample_rate,
+            Arc::clone(&consumed),
+        );
 
         sink.append(source);
         sink.play();
@@ -362,6 +443,9 @@ impl AudioEngine {
         self.started_at = Some(Instant::now());
         self.is_playing = true;
         self.sink = Some(sink);
+        self.consumed_samples = Some(consumed);
+        self.playback_channels = channels;
+        self.playback_sample_rate = sample_rate;
 
         Ok(())
     }
@@ -393,13 +477,26 @@ impl AudioEngine {
         };
 
         let timeline_rate = timeline_rate.clamp(0.25, 4.0);
-        sink.append(SamplesBuffer::new(
+        let data = Arc::new(samples[..frame_count * channels_usize].to_vec());
+        let total = data.len();
+        let shared_consumed = self
+            .consumed_samples
+            .clone()
+            .unwrap_or_else(|| Arc::new(AtomicUsize::new(0)));
+        let source = ArcSamplesSource::new(
+            data,
+            0,
+            total,
             channels,
             sample_rate,
-            samples[..frame_count * channels_usize].to_vec(),
-        ));
+            Arc::clone(&shared_consumed),
+        );
+        sink.append(source);
         self.duration_sec += (frame_count as f32 / sample_rate as f32) * timeline_rate;
         self.timeline_rate = timeline_rate;
+        self.consumed_samples = Some(shared_consumed);
+        self.playback_channels = channels;
+        self.playback_sample_rate = sample_rate;
 
         // If playback reached queue end and new audio arrives, resume timeline tracking.
         if !self.is_playing && !sink.is_paused() {
@@ -418,6 +515,7 @@ impl AudioEngine {
         self.started_at = None;
         self.start_pos_sec = 0.0;
         self.timeline_rate = 1.0;
+        self.consumed_samples = None;
     }
 
     pub fn pause(&mut self) {
@@ -427,7 +525,19 @@ impl AudioEngine {
         if let Some(s) = &self.sink {
             s.pause();
         }
-        self.start_pos_sec = self.current_position();
+        // When using the consumed-samples clock (hardware sample clock), do
+        // NOT touch consumed_samples or start_pos_sec — the consumed counter
+        // simply stops incrementing while the sink is paused and resumes when
+        // playback continues, so the clock stays locked to the hardware with
+        // zero drift.
+        //
+        // Only the wall-time fallback path needs to freeze start_pos_sec.
+        // We use raw_position() (not current_position()) because start_pos_sec
+        // stores the uncompensated value; using the compensated one would
+        // double-subtract latency on resume.
+        if self.consumed_samples.is_none() {
+            self.start_pos_sec = self.raw_position();
+        }
         self.started_at = None;
         self.is_playing = false;
     }
@@ -447,7 +557,20 @@ impl AudioEngine {
         self.is_playing
     }
 
-    pub fn current_position(&self) -> f32 {
+    /// Raw position (timeline seconds) of the playback cursor **without**
+    /// latency compensation. This counts samples that have been pulled into
+    /// the audio device buffer, which is ahead of the audible signal by the
+    /// output latency. Use `current_position()` or `clock_snapshot()` for
+    /// latency-compensated positions that consumers should display.
+    fn raw_position(&self) -> f32 {
+        if let Some(ref consumed) = self.consumed_samples {
+            let count = consumed.load(Ordering::Relaxed) as f32;
+            let channels = self.playback_channels.max(1) as f32;
+            let sr = self.playback_sample_rate.max(1) as f32;
+            let elapsed = count / channels / sr;
+            let pos = self.start_pos_sec + elapsed * self.timeline_rate;
+            return pos.min(self.duration_sec.max(self.start_pos_sec));
+        }
         if self.is_playing {
             if let Some(t0) = self.started_at {
                 let pos = self.start_pos_sec + t0.elapsed().as_secs_f32() * self.timeline_rate;
@@ -457,6 +580,50 @@ impl AudioEngine {
         self.start_pos_sec
     }
 
+    /// Latency-compensated master clock position in timeline seconds.
+    ///
+    /// The output latency is subtracted so this reflects the sample
+    /// currently **audible** through the speakers. This is the canonical
+    /// position that all visual consumers (video, keyboard, waveform
+    /// playhead) must use to stay in sync with what the user hears.
+    pub fn current_position(&self) -> f32 {
+        let raw = self.raw_position();
+        let compensated = raw - self.output_latency_sec * self.timeline_rate;
+        // Clamp to the valid timeline range [0, duration]. The raw
+        // start_pos_sec is *not* used as the lower bound because it is an
+        // uncompensated value — using it here would re-add the latency we
+        // just subtracted and defeat the compensation.
+        compensated.clamp(0.0, self.duration_sec.max(0.0))
+    }
+
+    /// Capture a point-in-time snapshot of the master audio clock.
+    ///
+    /// This is the single source of truth for all playback-synchronized
+    /// consumers. Capturing once per UI frame and distributing the snapshot
+    /// guarantees that video, keyboard transcription, and the waveform
+    /// playhead can never drift relative to each other — they all read the
+    /// same compensated audio time.
+    pub fn clock_snapshot(&self) -> ClockSnapshot {
+        ClockSnapshot {
+            position_sec: self.current_position(),
+            timeline_rate: self.timeline_rate,
+            is_playing: self.is_playing,
+            captured_at: Instant::now(),
+            latency_sec: self.output_latency_sec,
+        }
+    }
+
+    /// Estimated output device latency (seconds) applied to the master clock.
+    pub fn output_latency_sec(&self) -> f32 {
+        self.output_latency_sec
+    }
+
+    /// Override the estimated output latency. Useful for calibration or when
+    /// a device reports its own latency. Values are clamped to a sane range.
+    pub fn set_output_latency(&mut self, latency_sec: f32) {
+        self.output_latency_sec = latency_sec.clamp(0.0, 0.5);
+    }
+
     pub fn sync_finished(&mut self) {
         let is_empty = self.sink.as_ref().map(|s| s.empty()).unwrap_or(false);
         if is_empty {
@@ -464,6 +631,7 @@ impl AudioEngine {
             self.is_playing = false;
             self.started_at = None;
             self.start_pos_sec = self.duration_sec;
+            self.consumed_samples = None;
         }
     }
 

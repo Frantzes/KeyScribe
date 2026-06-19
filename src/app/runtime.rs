@@ -1,5 +1,4 @@
 use super::*;
-use crate::core::processing::build_waveform_for_processed;
 
 impl KeyScribeApp {
     pub(super) fn lock_startup_min_window_size_once(&mut self, _ctx: &egui::Context) {
@@ -614,48 +613,6 @@ impl KeyScribeApp {
     #[cfg(not(feature = "desktop-ui"))]
     pub(super) fn import_audio_with_ctx(&mut self, ctx: &egui::Context) {
         self.import_audio_from_manual_path(ctx);
-    }
-
-    #[allow(dead_code)]
-    pub(super) fn apply_loaded_audio(
-        &mut self,
-        path: PathBuf,
-        audio: AudioData,
-        ctx: &egui::Context,
-    ) {
-        self.cancel_active_processing();
-        self.loaded_audio_hash = None;
-        self.loaded_path = Some(path);
-        self.loading_preview_cache.clear();
-        self.selected_time_sec = 0.0;
-        self.audio_raw = Some(audio);
-        self.note_timeline = Arc::new(Vec::new());
-        self.note_timeline_step_sec = 0.0;
-        self.base_note_timeline = Arc::new(Vec::new());
-        self.base_note_timeline_step_sec = 0.0;
-        if let Some(raw) = &self.audio_raw {
-            self.processed_playback_channels = raw.channels.max(1);
-            if speed_pitch_is_identity(self.speed, self.pitch_semitones) {
-                self.processed_samples = raw.samples_mono.as_ref().to_vec();
-                self.processed_playback_samples = Arc::clone(&raw.samples_interleaved);
-                let waveform = build_waveform_for_processed(
-                    self.processed_samples.as_slice(),
-                    raw.sample_rate,
-                    self.audio_quality_mode.waveform_points(),
-                    1.0,
-                );
-                self.set_waveform_data(waveform, false);
-            } else {
-                self.processed_samples.clear();
-                self.processed_playback_samples = Arc::new(Vec::new());
-                self.clear_waveform_data();
-            }
-        }
-        self.waveform_reset_view = true;
-        self.playing_preview_buffer = false;
-        self.live_stream_playback = false;
-        self.album_art_texture = self.create_album_art_texture(ctx);
-        self.update_note_probabilities(true);
     }
 
     pub(super) fn create_album_art_texture(

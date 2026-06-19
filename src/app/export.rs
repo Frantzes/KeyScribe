@@ -1,6 +1,6 @@
 use crate::app::KeyScribeApp;
 use eframe::egui;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use crate::leadsheet::NoteEvent;
 
 impl KeyScribeApp {

@@ -407,6 +407,7 @@ impl KeyScribeApp {
         setting_toggle_row(ui, &mut self.dark_mode, "Dark Mode");
         let _ = setting_toggle_row(ui, &mut self.show_note_hist_window, "Show Probability Pane");
         let _ = setting_toggle_row(ui, &mut self.show_video_pane, "Show Video Pane");
+        let _ = setting_toggle_row(ui, &mut self.show_chord_suggestions, "Show Chord Suggestions");
         let _ = setting_toggle_row(ui, &mut self.auto_separate, "Separate Instruments Automatically");
         Self::draw_toolbar_separator(ui);
 
@@ -704,6 +705,31 @@ impl KeyScribeApp {
 
                         ui.monospace("Ctrl + Left/Right Arrow");
                         ui.label("Shift loop range by 1 second (when loop is active)");
+                        ui.end_row();
+                    });
+
+                ui.add_space(UI_VSPACE_COMPACT);
+                ui.label("Waveform Navigation");
+                egui::Grid::new("waveform_nav_help_grid")
+                    .num_columns(2)
+                    .min_col_width(140.0)
+                    .spacing([14.0, 8.0])
+                    .striped(true)
+                    .show(ui, |ui| {
+                        ui.monospace("Ctrl + Scroll Wheel Up");
+                        ui.label("Zoom in on the waveform");
+                        ui.end_row();
+
+                        ui.monospace("Ctrl + Scroll Wheel Down");
+                        ui.label("Zoom out on the waveform");
+                        ui.end_row();
+
+                        ui.monospace("Shift + Scroll Wheel Up");
+                        ui.label("Navigate forward in time");
+                        ui.end_row();
+
+                        ui.monospace("Shift + Scroll Wheel Down");
+                        ui.label("Navigate backward in time");
                         ui.end_row();
                     });
 

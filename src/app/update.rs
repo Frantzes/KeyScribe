@@ -211,26 +211,28 @@ impl eframe::App for KeyScribeApp {
                         self.highlight_color,
                     );
                     max_scroll_px = max_scroll_px.max(prob_draw.max_scroll_px);
-                    if let Some(chord) = &self.current_chord {
-                        let pane = prob_draw.rect;
-                        let overlay_w = pane.width().min(280.0);
-                        let overlay_rect = egui::Rect::from_min_size(
-                            egui::pos2(pane.left() + 6.0, pane.top() + 6.0),
-                            egui::vec2(overlay_w, pane.height() - 12.0),
-                        );
-                        let painter = ui.painter();
-                        painter.rect_filled(
-                            overlay_rect,
-                            8.0,
-                            egui::Color32::from_rgba_unmultiplied(0, 0, 0, 153),
-                        );
-                        painter.text(
-                            egui::pos2(overlay_rect.left() + 10.0, overlay_rect.center().y),
-                            egui::Align2::LEFT_CENTER,
-                            chord,
-                            egui::FontId::proportional(26.0),
-                            egui::Color32::WHITE,
-                        );
+                    if self.show_chord_suggestions {
+                        if let Some(chord) = &self.current_chord {
+                            let pane = prob_draw.rect;
+                            let overlay_w = pane.width().min(280.0);
+                            let overlay_rect = egui::Rect::from_min_size(
+                                egui::pos2(pane.left() + 6.0, pane.top() + 6.0),
+                                egui::vec2(overlay_w, pane.height() - 12.0),
+                            );
+                            let painter = ui.painter();
+                            painter.rect_filled(
+                                overlay_rect,
+                                8.0,
+                                egui::Color32::from_rgba_unmultiplied(0, 0, 0, 153),
+                            );
+                            painter.text(
+                                egui::pos2(overlay_rect.left() + 10.0, overlay_rect.center().y),
+                                egui::Align2::LEFT_CENTER,
+                                chord,
+                                egui::FontId::proportional(26.0),
+                                egui::Color32::WHITE,
+                            );
+                        }
                     }
                     if prob_draw.clicked {
                         self.piano_has_focus = true;
@@ -618,7 +620,14 @@ impl eframe::App for KeyScribeApp {
                     let mut remaining_h = content_h;
                     if self.main_content_tab != MainContentTab::SheetMusic {
                         if self.show_video_pane {
-                            let selected_time_sec = self.selected_time_sec;
+                            // The video follows the master audio clock (not
+                            // selected_time_sec) so it stays locked to the
+                            // audible audio, exactly like VLC's audio-master
+                            // synchronization.
+                            let audio_clock_sec = self
+                                .master_clock
+                                .map(|c| c.position_sec)
+                                .unwrap_or(self.selected_time_sec);
                             let is_playing = self.is_playing();
                             if let Some(player) = &mut self.video_player {
                                 let available_width = ui.available_width();
@@ -627,7 +636,7 @@ impl eframe::App for KeyScribeApp {
                                 
                                 let (rect, _) = ui.allocate_exact_size(egui::vec2(available_width, video_h), egui::Sense::hover());
                                 ui.allocate_ui_at_rect(rect, |ui| {
-                                    player.draw(ui, selected_time_sec, is_playing);
+                                    player.draw(ui, audio_clock_sec, is_playing);
                                 });
                                 remaining_h -= video_h;
                                 

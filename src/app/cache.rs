@@ -1,5 +1,4 @@
 use super::*;
-use crate::core::processing::build_waveform_for_processed;
 
 impl KeyScribeApp {
     #[allow(clippy::too_many_arguments)]
@@ -258,99 +257,6 @@ impl KeyScribeApp {
         self.update_note_probabilities(true);
         self.cache_status_message =
             Some("Analysis cache: transcription loaded during render.".to_string());
-    }
-
-    #[allow(dead_code)]
-    pub(super) fn try_restore_analysis_cache(&mut self, source_path: &Path) -> bool {
-        let Some(audio) = &self.audio_raw else {
-            return false;
-        };
-        let sample_rate = audio.sample_rate;
-        let raw_sample_len = audio.samples_mono.len();
-        let raw_samples = Arc::clone(&audio.samples_mono);
-        let raw_playback_samples = Arc::clone(&audio.samples_interleaved);
-        let raw_playback_channels = audio.channels.max(1);
-
-        let song_hash = if let Some(hash) = self.loaded_audio_hash.clone() {
-            hash
-        } else {
-            let Some(hash) = compute_file_hash(source_path) else {
-                return false;
-            };
-            self.loaded_audio_hash = Some(hash.clone());
-            hash
-        };
-
-        let Some((
-            processed_samples,
-            base_note_timeline,
-            base_note_timeline_step_sec,
-            cached_waveform,
-        )) =
-            Self::load_analysis_cache_for_variant(
-                song_hash.as_str(),
-                sample_rate,
-                raw_sample_len,
-                raw_samples.as_slice(),
-                self.audio_quality_mode,
-                self.speed,
-                self.pitch_semitones,
-                self.use_cqt_analysis,
-                self.preprocess_audio,
-            )
-        else {
-            return false;
-        };
-
-        if self.preprocess_audio
-            && (base_note_timeline.is_empty() || base_note_timeline_step_sec <= 0.0)
-        {
-            return false;
-        }
-
-        let (note_timeline, note_timeline_step_sec) = if self.preprocess_audio {
-            Self::transform_note_timeline(
-                Arc::clone(&base_note_timeline),
-                base_note_timeline_step_sec,
-                self.speed,
-                self.pitch_semitones,
-            )
-        } else {
-            (Arc::new(Vec::new()), 0.0)
-        };
-
-        self.processed_samples = processed_samples;
-        self.processed_playback_channels = raw_playback_channels;
-        self.processed_playback_samples = if speed_pitch_is_identity(self.speed, self.pitch_semitones)
-        {
-            Arc::clone(&raw_playback_samples)
-        } else {
-            Arc::new(apply_speed_and_pitch_interleaved(
-                raw_playback_samples.as_slice(),
-                raw_playback_channels,
-                sample_rate,
-                self.speed,
-                self.pitch_semitones,
-            ))
-        };
-        let waveform = cached_waveform.unwrap_or_else(|| {
-            build_waveform_for_processed(
-                self.processed_samples.as_slice(),
-                sample_rate,
-                self.audio_quality_mode.waveform_points(),
-                self.speed,
-            )
-        });
-        self.set_waveform_data(waveform, true);
-        self.note_timeline = note_timeline;
-        self.note_timeline_step_sec = note_timeline_step_sec;
-        self.base_note_timeline = base_note_timeline;
-        self.base_note_timeline_step_sec = base_note_timeline_step_sec;
-        self.selected_time_sec = self.selected_time_sec.min(self.source_duration());
-        self.playing_preview_buffer = false;
-        self.update_note_probabilities(true);
-
-        true
     }
 
     #[allow(clippy::too_many_arguments)]

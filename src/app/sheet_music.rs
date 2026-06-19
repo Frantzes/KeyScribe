@@ -17,9 +17,6 @@ use crate::leadsheet::{
 #[cfg(test)]
 use crate::leadsheet::TempoSegment;
 
-const SHEET_NOTE_TABLE_LIMIT: usize = 96;
-#[allow(dead_code)]
-const BEATS_PER_MEASURE: f32 = 4.0;
 const MUSICXML_DIVISIONS: i32 = 480;
 const GRAND_STAFF_SPLIT_MIDI: u8 = 60;
 const MIN_SHEET_NOTE_FRAMES: usize = 2;
@@ -439,7 +436,11 @@ impl KeyScribeApp {
 
                 // Score Area - Fills all remaining space
                 if let Some(data) = preview.as_ref() {
-                    let playback_time = (self.selected_time_sec
+                    let clock_pos = self
+                        .master_clock
+                        .map(|c| c.position_sec)
+                        .unwrap_or(self.selected_time_sec);
+                    let playback_time = (clock_pos
                         + self.visualization_timing_offset_ms / 1000.0)
                         .max(0.0);
                     let active_note_id =
@@ -697,14 +698,6 @@ impl KeyScribeApp {
         (NOTE_HIGHLIGHT_ACTIVATION_THRESHOLD / self.key_color_sensitivity.max(0.05)).clamp(0.05, 0.95)
     }
 
-    fn stem_label(&self, idx: usize) -> String {
-        self.separated_stems
-            .as_ref()
-            .and_then(|stems| stems.get(idx))
-            .map(|s| s.stem_type.display_name().to_string())
-            .unwrap_or_else(|| format!("Stem {}", idx))
-    }
-
     fn current_sheet_preview_key(&self) -> Option<SheetPreviewCacheKey> {
         // Per-stem analyses take priority; fall back to blended note_timeline
         let has_timeline = !self.stem_analyses.is_empty()
@@ -873,7 +866,7 @@ impl KeyScribeApp {
     }
 
     fn run_preview_background(job: SheetPreviewJob) -> (SheetPreviewCacheKey, Result<SheetPreviewData, String>) {
-        let threshold = job.threshold;
+        let _threshold = job.threshold;
         let melody_events = job.melody_events;
 
         // Reduce melody based on selected mode
@@ -1020,21 +1013,17 @@ impl KeyScribeApp {
             }
         }
 
-        let bpm_source = if job.manual_bpm.is_some() {
+        let _bpm_source = if job.manual_bpm.is_some() {
             "Manual".to_string()
         } else {
             bpm_source
         };
 
         let cursor_offset_sec = Self::estimate_sheet_cursor_offset_sec(&note_events, &foundation);
-        let note_count = note_events.len();
         let melody_events = note_events;
 
         (job.key, Ok(SheetPreviewData {
             foundation,
-            note_count,
-            threshold,
-            bpm_source,
             cursor_offset_sec,
             melody_events,
         }))
@@ -1090,7 +1079,7 @@ impl KeyScribeApp {
 
         let file_stem = self.export_file_stem();
         let engraving_config = SheetEngravingConfig {
-            allow_triplets: !SHEET_SWING_BIAS,
+            _allow_triplets: !SHEET_SWING_BIAS,
             is_lead_sheet: self.sheet_music_mode.is_lead_sheet(),
             single_staff: self.sheet_music_mode == SheetMusicMode::SingleStaff,
         };
@@ -1158,8 +1147,6 @@ impl KeyScribeApp {
                             width_px: raw.width_px,
                             height_px: raw.height_px,
                             note_positions: raw.note_positions.clone(),
-                            beat_start: 0.0,
-                            beat_end: 0.0,
                         });
                     }
                     self.sheet_engraving_cache_key = Some(result.key);
@@ -1467,7 +1454,7 @@ impl KeyScribeApp {
 
         let file_stem = self.export_file_stem();
         let engraving_config = SheetEngravingConfig {
-            allow_triplets: !SHEET_SWING_BIAS,
+            _allow_triplets: !SHEET_SWING_BIAS,
             is_lead_sheet: self.sheet_music_mode.is_lead_sheet(),
             single_staff: self.sheet_music_mode == SheetMusicMode::SingleStaff,
         };
@@ -1495,7 +1482,7 @@ impl KeyScribeApp {
 
         let file_stem = self.export_file_stem();
         let engraving_config = SheetEngravingConfig {
-            allow_triplets: !SHEET_SWING_BIAS,
+            _allow_triplets: !SHEET_SWING_BIAS,
             is_lead_sheet: self.sheet_music_mode.is_lead_sheet(),
             single_staff: self.sheet_music_mode == SheetMusicMode::SingleStaff,
         };
@@ -1537,7 +1524,7 @@ impl KeyScribeApp {
 
         let file_stem = self.export_file_stem();
         let engraving_config = SheetEngravingConfig {
-            allow_triplets: !SHEET_SWING_BIAS,
+            _allow_triplets: !SHEET_SWING_BIAS,
             is_lead_sheet: self.sheet_music_mode.is_lead_sheet(),
             single_staff: self.sheet_music_mode == SheetMusicMode::SingleStaff,
         };
@@ -1722,7 +1709,7 @@ fn parse_svg_note_positions(svg_str: &str) -> Vec<NotePosition> {
             _ => continue,
         };
         let parts: Vec<&str> = id[1..].split('_').collect();
-        let (note_id, pitch, tick, duration_ticks) = if parts.len() >= 4 {
+        let (note_id, _pitch, tick, duration_ticks) = if parts.len() >= 4 {
             let note_id = match parts[0].parse::<u32>().ok() {
                 Some(id) => id,
                 None => continue,
@@ -1756,7 +1743,6 @@ fn parse_svg_note_positions(svg_str: &str) -> Vec<NotePosition> {
                     y: (parts[1] + margin_oy) / svg_h,
                     w: parts[2] / svg_w,
                     h: parts[3] / svg_h,
-                    pitch,
                     tick,
                     duration_ticks,
                 });
@@ -1778,7 +1764,6 @@ fn parse_svg_note_positions(svg_str: &str) -> Vec<NotePosition> {
                         y: (ry + margin_oy) / svg_h,
                         w: rw / svg_w,
                         h: rh / svg_h,
-                        pitch,
                         tick,
                         duration_ticks,
                     });
@@ -1836,7 +1821,6 @@ fn parse_svg_note_positions(svg_str: &str) -> Vec<NotePosition> {
                         y: (ncy + margin_oy - 7.0) / svg_h,
                         w: note_w,
                         h: note_h,
-                        pitch,
                         tick,
                         duration_ticks,
                     });
@@ -2095,7 +2079,7 @@ struct DurationToken {
 
 #[derive(Clone, Copy)]
 struct SheetEngravingConfig {
-    allow_triplets: bool,
+    _allow_triplets: bool,
     is_lead_sheet: bool,
     single_staff: bool,
 }
@@ -2103,7 +2087,7 @@ struct SheetEngravingConfig {
 impl Default for SheetEngravingConfig {
     fn default() -> Self {
         Self {
-            allow_triplets: !SHEET_SWING_BIAS,
+            _allow_triplets: !SHEET_SWING_BIAS,
             is_lead_sheet: true,
             single_staff: false,
         }
@@ -3194,37 +3178,6 @@ fn write_note_element(
     let _ = write!(xml, "      </note>\n");
 }
 
-fn note_type_for_ticks(ticks: i32, divisions: i32) -> (&'static str, i32, i32) {
-    let d = divisions.max(1);
-    // DEBUG: whole, half, quarter, 8th only (no 16th/32nd)
-    let types = [
-        ("whole", d * 4, 0),
-        ("half", d * 2, 0),
-        ("quarter", d, 0),
-        ("eighth", d / 2, 0),
-    ];
-    let mut best = ("quarter", d, 0i32);
-    for &(name, expected, dots) in &types {
-        if expected <= 0 {
-            continue;
-        }
-        if (ticks - expected).abs() <= (ticks - best.1).abs() {
-            best = (name, expected, dots);
-        }
-    }
-    // Check dotted: 1.5x
-    for &(name, base, _) in &types {
-        if base <= 0 {
-            continue;
-        }
-        let dotted = base + base / 2;
-        if (ticks - dotted).abs() < (ticks - best.1).abs() {
-            best = (name, dotted, 1);
-        }
-    }
-    best
-}
-
 fn duration_tokens_for_ticks(
     duration_ticks: i32,
     divisions: i32,
@@ -3471,49 +3424,6 @@ fn midi_to_pitch_parts(midi: u8) -> (&'static str, i8, i32) {
         10 => ("A", 1, octave),
         _ => ("B", 0, octave),
     }
-}
-
-fn midi_note_name(midi: u8) -> String {
-    let names = ["C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B"];
-    let octave = (midi as i32 / 12) - 1;
-    format!("{}{}", names[(midi % 12) as usize], octave)
-}
-
-fn midi_note_name_opt(midi: u8) -> Option<String> {
-    if midi >= 21 && midi <= 108 {
-        Some(midi_note_name(midi))
-    } else {
-        None
-    }
-}
-
-fn parse_note_input(input: &str) -> Option<u8> {
-    let input = input.trim();
-    if input.is_empty() {
-        return None;
-    }
-    // Try as MIDI number first
-    if let Ok(num) = input.parse::<u8>() {
-        return Some(num.clamp(21, 108));
-    }
-    // Try as note name (e.g. C4, C#4, Db5, B-1)
-    let names = [
-        ("C", 0), ("C#", 1), ("Db", 1), ("D", 2), ("D#", 3), ("Eb", 3),
-        ("E", 4), ("F", 5), ("F#", 6), ("Gb", 6), ("G", 7), ("G#", 8),
-        ("Ab", 8), ("A", 9), ("A#", 10), ("Bb", 10), ("B", 11),
-    ];
-    let upper = input.to_uppercase();
-    for (name, semitone) in &names {
-        if let Some(rest) = upper.strip_prefix(name) {
-            if let Ok(octave) = rest.trim().parse::<i32>() {
-                let midi = (octave + 1) * 12 + semitone;
-                if midi >= 21 && midi <= 108 {
-                    return Some(midi as u8);
-                }
-            }
-        }
-    }
-    None
 }
 
 fn sanitize_filename_component(input: &str) -> String {

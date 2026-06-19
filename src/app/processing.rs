@@ -923,7 +923,17 @@ impl KeyScribeApp {
         }
 
         let timing_offset_sec = self.visualization_timing_offset_ms / 1000.0;
-        let current_time = (self.selected_time_sec + timing_offset_sec).max(0.0);
+        // Use the master audio clock (latency-compensated) as the source of
+        // truth for keyboard transcription. This locks the piano-roll
+        // visualization to the sample currently *audible* through the
+        // speakers, eliminating the drift that occurred when reading
+        // selected_time_sec (which trailed the audio device buffer).
+        // The user's visualization offset is applied as an additional trim.
+        let clock_pos = self
+            .master_clock
+            .map(|c| c.position_sec)
+            .unwrap_or(self.selected_time_sec);
+        let current_time = (clock_pos + timing_offset_sec).max(0.0);
 
         let note_count = (PIANO_HIGH_MIDI - PIANO_LOW_MIDI + 1) as usize;
 
@@ -940,8 +950,7 @@ impl KeyScribeApp {
                 if analysis.timeline.is_empty() || analysis.step_sec <= 0.0 {
                     continue;
                 }
-                let idx = (current_time / analysis.step_sec) as usize;
-                let idx = idx.min(analysis.timeline.len().saturating_sub(1));
+                let idx = nearest_timeline_frame(current_time, analysis.step_sec, analysis.timeline.len());
                 let frame = &analysis.timeline[idx];
 
                 let frame = if pitch.abs() < 1.0e-6 {
@@ -991,14 +1000,12 @@ impl KeyScribeApp {
         }
         // 2. Pre-computed blended timeline (original audio or blended stems when per-stem not ready)
         else if self.enabled_stem_indices.is_empty() && !self.base_note_timeline.is_empty() && self.base_note_timeline_step_sec > 0.0 {
-            let idx = (current_time.max(0.0) / self.base_note_timeline_step_sec) as usize;
-            let idx = idx.min(self.base_note_timeline.len().saturating_sub(1));
+            let idx = nearest_timeline_frame(current_time, self.base_note_timeline_step_sec, self.base_note_timeline.len());
             self.note_probs = self.base_note_timeline[idx].clone();
             self.note_stem_colors = vec![self.highlight_color; note_count];
         }
         else if !self.note_timeline.is_empty() && self.note_timeline_step_sec > 0.0 {
-            let idx = (current_time.max(0.0) / self.note_timeline_step_sec) as usize;
-            let idx = idx.min(self.note_timeline.len().saturating_sub(1));
+            let idx = nearest_timeline_frame(current_time, self.note_timeline_step_sec, self.note_timeline.len());
             self.note_probs = self.note_timeline[idx].clone();
             self.note_stem_colors = vec![self.highlight_color; note_count];
         }
@@ -1087,47 +1094,6 @@ impl KeyScribeApp {
         } else {
             self.update_note_probabilities(true);
         }
-    }
-
-    pub(super) fn compute_fft_timeline(
-        samples: &[f32],
-        sample_rate: u32,
-        step_sec: f32,
-        fft_window_size: usize,
-    ) -> Vec<Vec<f32>> {
-        if samples.is_empty() || sample_rate == 0 || step_sec <= 0.0 || fft_window_size < 64 {
-            return Vec::new();
-        }
-
-        let total_sec = samples.len() as f32 / sample_rate as f32;
-        let frame_count = ((total_sec / step_sec).floor() as usize).saturating_add(1);
-
-        let timeline: Vec<Vec<f32>> = if frame_count >= 256 {
-            (0..frame_count)
-                .into_par_iter()
-                .map(|idx| {
-                    let t = idx as f32 * step_sec;
-                    let center =
-                        ((t * sample_rate as f32) as usize).min(samples.len().saturating_sub(1));
-                    detect_note_probabilities(samples, sample_rate, center, fft_window_size)
-                })
-                .collect()
-        } else {
-            (0..frame_count)
-                .map(|idx| {
-                    let t = idx as f32 * step_sec;
-                    let center =
-                        ((t * sample_rate as f32) as usize).min(samples.len().saturating_sub(1));
-                    detect_note_probabilities(samples, sample_rate, center, fft_window_size)
-                })
-                .collect()
-        };
-
-        if timeline.is_empty() {
-            return vec![vec![0.0; (PIANO_HIGH_MIDI - PIANO_LOW_MIDI + 1) as usize]];
-        }
-
-        timeline
     }
 
     pub(super) fn build_note_timeline(
@@ -1219,4 +1185,21 @@ impl KeyScribeApp {
         let step_sec = base_step_sec;
         (transformed, step_sec)
     }
+}
+
+/// Resolve a timeline time to the nearest frame index using round-to-nearest
+/// instead of truncation.
+///
+/// The previous code used `idx = (time / step_sec) as usize`, which truncates
+/// and introduces up to one full `step_sec` of systematic error — the
+/// keyboard always lagged behind the audio by up to one frame. Rounding to
+/// the nearest frame halves the maximum error to `step_sec / 2` and removes
+/// the systematic bias, keeping the keyboard tightly synced to the audio
+/// clock.
+fn nearest_timeline_frame(time_sec: f32, step_sec: f32, timeline_len: usize) -> usize {
+    if timeline_len == 0 || step_sec <= 0.0 {
+        return 0;
+    }
+    let idx = ((time_sec.max(0.0) / step_sec) + 0.5) as usize;
+    idx.min(timeline_len.saturating_sub(1))
 }

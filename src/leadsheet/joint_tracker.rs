@@ -42,11 +42,10 @@ impl Default for JointRhythmConfig {
     }
 }
 
-#[allow(dead_code)]
 pub struct JointRhythmTracker {
-    config: JointRhythmConfig,
+    _config: JointRhythmConfig,
     states: Vec<RhythmState>,
-    state_index: Vec<std::collections::HashMap<RhythmState, usize>>,
+    _state_index: Vec<std::collections::HashMap<RhythmState, usize>>,
     transition_costs: Vec<Vec<f32>>,
 }
 
@@ -57,9 +56,9 @@ impl JointRhythmTracker {
         let transition_costs = Self::build_transition_costs(&states, &config);
 
         Self {
-            config,
+            _config: config,
             states,
-            state_index,
+            _state_index: state_index,
             transition_costs,
         }
     }

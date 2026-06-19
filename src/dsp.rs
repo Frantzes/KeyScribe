@@ -216,8 +216,139 @@ pub(crate) fn apply_speed_and_pitch_interleaved_with_cancel(
             out.push(processed_channels[ch].as_ref().unwrap()[frame_idx]);
         }
     }
-
     // Keep output aligned to whole frames, even if input had a partial tail.
     let _ = trimmed_len;
     Some(out)
+}
+
+pub fn get_ffmpeg_command() -> std::process::Command {
+    let ffmpeg_exe = if cfg!(windows) {
+        "ffmpeg.exe"
+    } else {
+        "ffmpeg"
+    };
+
+    // 1. Try next to the executable
+    if let Ok(exe_path) = std::env::current_exe() {
+        if let Some(parent) = exe_path.parent() {
+            let local_ffmpeg = parent.join(ffmpeg_exe);
+            if local_ffmpeg.exists() {
+                return std::process::Command::new(local_ffmpeg);
+            }
+        }
+    }
+
+    // 2. Try current working directory
+    let local_ffmpeg = std::path::PathBuf::from(ffmpeg_exe);
+    if local_ffmpeg.exists() {
+        return std::process::Command::new(local_ffmpeg);
+    }
+
+    // 3. Fallback to system PATH
+    std::process::Command::new(ffmpeg_exe)
+}
+
+/// Locate the `ffprobe` executable using the same resolution order as
+/// `get_ffmpeg_command` (next to exe → cwd → PATH).
+pub fn get_ffprobe_command() -> std::process::Command {
+    let ffprobe_exe = if cfg!(windows) {
+        "ffprobe.exe"
+    } else {
+        "ffprobe"
+    };
+
+    if let Ok(exe_path) = std::env::current_exe() {
+        if let Some(parent) = exe_path.parent() {
+            let local = parent.join(ffprobe_exe);
+            if local.exists() {
+                return std::process::Command::new(local);
+            }
+        }
+    }
+
+    let local = std::path::PathBuf::from(ffprobe_exe);
+    if local.exists() {
+        return std::process::Command::new(local);
+    }
+
+    std::process::Command::new(ffprobe_exe)
+}
+
+/// Probed video stream properties needed for accurate audio/video sync.
+#[derive(Debug, Clone)]
+pub struct VideoStreamInfo {
+    /// Average frames per second as a floating-point value. For fractional
+    /// rates (e.g. 30000/1001 ≈ 29.97) the exact quotient is returned.
+    pub fps: f64,
+    /// Total duration in seconds, if known.
+    pub duration_sec: Option<f64>,
+}
+
+/// Probe a video file for its frame rate and duration using `ffprobe`.
+///
+/// Returns `None` if ffprobe is unavailable or the file cannot be parsed.
+/// The caller should fall back to a sane default (30 fps) in that case.
+pub fn probe_video_stream(path: &std::path::Path) -> Option<VideoStreamInfo> {
+    let mut cmd = get_ffprobe_command();
+    cmd.args([
+        "-v", "error",
+        "-select_streams", "v:0",
+        "-show_entries", "stream=avg_frame_rate,r_frame_rate,duration:format=duration",
+        "-of", "default=noprint_wrappers=1:nokey=1",
+        &path.to_string_lossy(),
+    ])
+    .stdout(std::process::Stdio::piped())
+    .stderr(std::process::Stdio::piped());
+
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        cmd.creation_flags(0x08000000);
+    }
+
+    let output = cmd.output().ok()?;
+    if !output.status.success() {
+        return None;
+    }
+
+    let text = String::from_utf8_lossy(&output.stdout);
+    let mut lines = text.lines();
+
+    // ffprobe outputs values in declaration order: avg_frame_rate,
+    // r_frame_rate, stream duration, format duration.
+    let avg_fps = parse_fps_line(lines.next());
+    let r_fps = parse_fps_line(lines.next());
+    let stream_dur = lines.next().and_then(parse_duration_line);
+    let format_dur = lines.next().and_then(parse_duration_line);
+
+    // Prefer r_frame_rate (the actual base frame rate) for PTS math; fall
+    // back to avg_frame_rate if it is missing or zero.
+    let fps = r_fps.or(avg_fps).filter(|f| *f > 0.0).unwrap_or(30.0);
+    let duration_sec = stream_dur.or(format_dur);
+
+    Some(VideoStreamInfo { fps, duration_sec })
+}
+
+fn parse_fps_line(line: Option<&str>) -> Option<f64> {
+    let line = line?.trim();
+    if line.is_empty() || line == "N/A" {
+        return None;
+    }
+    if let Some((num, den)) = line.split_once('/') {
+        let n: f64 = num.trim().parse().ok()?;
+        let d: f64 = den.trim().parse().ok()?;
+        if d == 0.0 {
+            return None;
+        }
+        return Some(n / d);
+    }
+    line.parse::<f64>().ok()
+}
+
+fn parse_duration_line(line: &str) -> Option<f64> {
+    let line = line.trim();
+    if line.is_empty() || line == "N/A" {
+        return None;
+    }
+    line.parse::<f64>().ok()
 }

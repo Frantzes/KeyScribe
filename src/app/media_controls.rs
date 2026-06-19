@@ -107,10 +107,19 @@ fn draw_volume_time_row(
     slider_height: f32,
     icon_size: f32,
     min_slider_width: f32,
+    _duration: f32,
 ) {
     let time_color = egui::Color32::from_rgb(176, 188, 203);
     let time_font = egui::TextStyle::Body.resolve(ui.style());
-    let (time_width, time_height) = ui.fonts(|f| {
+
+    // Fixed allocation uses the widest possible time-string format so the
+    // volume slider never shifts regardless of duration growth or digit widths.
+    let time_fixed_width = ui.fonts(|f| {
+        f.layout_no_wrap("0:00:00 / 0:00:00".to_owned(), time_font.clone(), time_color)
+            .size()
+            .x
+    });
+    let (_actual_width, time_height) = ui.fonts(|f| {
         let size = f
             .layout_no_wrap(time_label.to_owned(), time_font.clone(), time_color)
             .size();
@@ -126,7 +135,7 @@ fn draw_volume_time_row(
             let spacing_x = ui.spacing().item_spacing.x;
 
             let (time_rect, _) =
-                ui.allocate_exact_size(egui::vec2(time_width, row_h), egui::Sense::hover());
+                ui.allocate_exact_size(egui::vec2(time_fixed_width, row_h), egui::Sense::hover());
             ui.painter().text(
                 time_rect.center(),
                 egui::Align2::CENTER_CENTER,
@@ -413,6 +422,7 @@ pub(super) fn draw_media_controls(
                                 (button_size * 0.62).clamp(18.0, 24.0),
                                 16.0,
                                 96.0,
+                                duration,
                             );
                         });
                     } else {
@@ -568,6 +578,7 @@ pub(super) fn draw_media_controls(
                                         slider_height,
                                         17.0,
                                         120.0,
+                                        duration,
                                     );
                                 },
                             );
@@ -635,7 +646,7 @@ fn draw_loop_inputs(ui: &mut egui::Ui, app: &mut KeyScribeApp) {
         changed = true;
     }
 
-    let mut marker_time = |input: &str| -> Option<f32> {
+    let marker_time = |input: &str| -> Option<f32> {
         let s = input.trim();
         if s.len() == 1 {
             let c = s.chars().next().unwrap().to_ascii_uppercase();

@@ -137,14 +137,52 @@ for MODEL_PATH in "${MODEL_FILES[@]}"; do
     cp "$MODEL_PATH" "$MODELS_DIR/$(basename "$MODEL_PATH")"
 done
 
+# --- FFmpeg Bundling ---
+FFMPEG_VENDOR_DIR="$REPO_ROOT/vendor/ffmpeg"
+FFMPEG_BIN_PATH="$FFMPEG_VENDOR_DIR/ffmpeg"
+
+if [[ ! -f "$FFMPEG_BIN_PATH" ]]; then
+    echo "FFmpeg not found in vendor/ffmpeg. Downloading static build..."
+    mkdir -p "$FFMPEG_VENDOR_DIR"
+    
+    FFMPEG_TAR="$FFMPEG_VENDOR_DIR/ffmpeg.tar.xz"
+    # Using the BtbN GPL static build for Linux x64
+    FFMPEG_URL="https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-master-latest-linux64-gpl.tar.xz"
+    
+    if command -v curl >/dev/null 2>&1; then
+        curl -L -o "$FFMPEG_TAR" "$FFMPEG_URL"
+    elif command -v wget >/dev/null 2>&1; then
+        wget -O "$FFMPEG_TAR" "$FFMPEG_URL"
+    else
+        echo "Error: curl or wget is required to download FFmpeg." >&2
+        exit 1
+    fi
+    
+    echo "Extracting FFmpeg..."
+    # Extract just the ffmpeg binary from the tarball
+    # The tarball has a top-level directory like ffmpeg-7.1-amd64-static/
+    tar -xJf "$FFMPEG_TAR" -C "$FFMPEG_VENDOR_DIR" --strip-components=1 --wildcards "*/ffmpeg"
+    
+    rm -f "$FFMPEG_TAR"
+fi
+
+if [[ -f "$FFMPEG_BIN_PATH" ]]; then
+    cp "$FFMPEG_BIN_PATH" "$BUNDLE_DIR/ffmpeg"
+    chmod +x "$BUNDLE_DIR/ffmpeg"
+    echo "Included ffmpeg from: $FFMPEG_BIN_PATH"
+else
+    echo "Warning: Failed to prepare ffmpeg. Video features may not work." >&2
+fi
+
 cat > "$BUNDLE_DIR/README-portable.txt" <<'EOF'
 KeyScribe portable Linux bundle
 
 Contents:
 - keyscribe
+- ffmpeg
 - models/*.onnx
 
-Run ./keyscribe from this folder so relative model path works.
+Run ./keyscribe from this folder so relative model and ffmpeg paths work.
 EOF
 
 mkdir -p "$REPO_ROOT/$OUTPUT_ROOT"

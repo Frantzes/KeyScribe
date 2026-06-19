@@ -30,8 +30,8 @@ use crate::audio_io::{
 use crate::core::processing::build_waveform_for_processed;
 use crate::dsp::{apply_speed_and_pitch_interleaved, apply_speed_and_pitch_interleaved_with_cancel, apply_speed_and_pitch_with_cancel};
 use crate::leadsheet::StemType;
-use crate::leadsheet::{BeatTrackResult, LeadSheetFoundation};
-use crate::playback::{available_output_devices, AudioEngine, AudioOutputDeviceOption};
+use crate::leadsheet::LeadSheetFoundation;
+use crate::playback::{available_output_devices, AudioEngine, AudioOutputDeviceOption, ClockSnapshot};
 use crate::theme::{apply_brand_theme, ACCENT_PURPLE, ERROR_RED};
 use crate::ui::keyboard::{
     draw_piano_view, draw_probability_pane, keyboard_white_key_width, MIN_PIANO_KEY_HEIGHT,
@@ -63,7 +63,6 @@ const KEY_HIGHLIGHT_MAX_SEC_MAX: f32 = 1.0;
 const VISUALIZATION_TIMING_OFFSET_MS_MIN: f32 = -500.0;
 const VISUALIZATION_TIMING_OFFSET_MS_MAX: f32 = 500.0;
 const NOTE_HIGHLIGHT_ACTIVATION_THRESHOLD: f32 = 0.12;
-const FFT_TIMELINE_STEP_SEC: f32 = 0.05;
 const FFT_WINDOW_SIZE: usize = 4096;
 const LOOP_MIN_DURATION_SEC: f32 = 0.01;
 const SEEK_STEP_SEC: f32 = 5.0;
@@ -911,8 +910,6 @@ pub struct KeyScribeApp {
     sheet_preview_cache_key: Option<SheetPreviewCacheKey>,
     sheet_preview_cache: Option<SheetPreviewData>,
     sheet_preview_error: Option<String>,
-    beat_track_cache_path: Option<PathBuf>,
-    beat_track_cache: Option<BeatTrackResult>,
     selected_time_sec: f32,
     sheet_engraving_cache_key: Option<SheetPreviewCacheKey>,
     sheet_engraving_pages: Vec<EngravedSheetPage>,
@@ -937,6 +934,11 @@ pub struct KeyScribeApp {
     piano_drag_last_x: Option<f32>,
     last_error: Option<String>,
     engine: Option<AudioEngine>,
+    /// Master audio clock snapshot captured once per UI frame. This is the
+    /// single source of truth that the video player and keyboard transcription
+    /// follow, guaranteeing they can never drift relative to each other or to
+    /// the audible audio (VLC audio-master synchronization model).
+    master_clock: Option<ClockSnapshot>,
     processing_rx: Option<Receiver<ProcessingResult>>,
     processing_epoch: Arc<AtomicU64>,
     processing_cancel_flag: Option<Arc<AtomicBool>>,
@@ -1018,6 +1020,7 @@ pub struct KeyScribeApp {
     chord_stem_selector_open: bool,
     chord_skip: bool,
     current_chord: Option<String>,
+    show_chord_suggestions: bool,
     stem_analyses: Vec<StemAnalysis>,
     stem_colors: Vec<egui::Color32>,
     note_stem_colors: Vec<egui::Color32>,
@@ -1029,8 +1032,6 @@ pub struct KeyScribeApp {
     bpm_input_str: String,
     melody_min_note: Option<u8>,
     melody_max_note: Option<u8>,
-    melody_min_input_str: String,
-    melody_max_input_str: String,
     sheet_render_result_rx: Option<std::sync::mpsc::Receiver<SheetRenderResult>>,
     sheet_preview_result_rx:
         Option<std::sync::mpsc::Receiver<(SheetPreviewCacheKey, Result<SheetPreviewData, String>)>>,
@@ -1163,9 +1164,6 @@ struct SheetPreviewCacheKey {
 #[derive(Clone)]
 struct SheetPreviewData {
     foundation: LeadSheetFoundation,
-    note_count: usize,
-    threshold: f32,
-    bpm_source: String,
     cursor_offset_sec: f32,
     melody_events: Vec<crate::leadsheet::NoteEvent>,
 }
@@ -1177,7 +1175,6 @@ struct NotePosition {
     y: f32,
     w: f32,
     h: f32,
-    pitch: u8,
     tick: i32,
     duration_ticks: i32,
 }
@@ -1223,8 +1220,6 @@ struct EngravedSheetPage {
     width_px: usize,
     height_px: usize,
     note_positions: Vec<NotePosition>,
-    beat_start: f32,
-    beat_end: f32,
 }
 
 #[derive(Default)]
@@ -1297,8 +1292,6 @@ impl KeyScribeApp {
             sheet_preview_cache_key: None,
             sheet_preview_cache: None,
             sheet_preview_error: None,
-            beat_track_cache_path: None,
-            beat_track_cache: None,
             sheet_engraving_cache_key: None,
             sheet_engraving_pages: Vec::new(),
             sheet_engraving_error: None,
@@ -1333,6 +1326,7 @@ impl KeyScribeApp {
                 persisted.audio_output_device_id.as_deref(),
             )
             .ok(),
+            master_clock: None,
             processing_rx: None,
             processing_epoch: Arc::new(AtomicU64::new(0)),
             processing_cancel_flag: None,
@@ -1417,6 +1411,7 @@ impl KeyScribeApp {
             chord_stem_selector_open: false,
             chord_skip: false,
             current_chord: None,
+            show_chord_suggestions: true,
             stem_analyses: Vec::new(),
             stem_colors: Vec::new(),
             note_stem_colors: vec![egui::Color32::from_rgb(148, 106, 255); PIANO_KEY_COUNT],
@@ -1428,8 +1423,6 @@ impl KeyScribeApp {
             bpm_input_str: String::new(),
             melody_min_note: None,
             melody_max_note: None,
-            melody_min_input_str: String::new(),
-            melody_max_input_str: String::new(),
             sheet_render_result_rx: None,
             sheet_preview_result_rx: None,
             stem_playback_cache: None,
