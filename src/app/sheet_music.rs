@@ -948,10 +948,12 @@ impl KeyScribeApp {
         };
 
         let mut config = LeadSheetPresetConfig::default();
-        config.quantization.min_duration_beats = 0.5;
-        config.quantization.grids = vec![1.0, 0.5];
-        // Allow sustained notes to span multiple beats in monophonic mode.
-        config.quantization.duration_grids = vec![4.0, 2.0, 1.0, 0.5];
+        // Use the full default quantization grid (1.0, 0.5, 0.25) so 16th
+        // notes are preserved, and the full duration grid (4.0, 3.0, 2.0,
+        // 1.5, 1.0, 0.75, 0.5, 0.25) so dotted and compound durations are
+        // available. The previous override limited everything to quarter
+        // and eighth notes, which destroyed rhythmic accuracy.
+        config.quantization.min_duration_beats = 0.25;
         config.chord_analysis.skip = job.chord_skip;
         let mut foundation = None;
 
@@ -1088,7 +1090,6 @@ impl KeyScribeApp {
             &preview.foundation,
             engraving_config,
         );
-        let _total_beats = total_beats_for_foundation(&preview.foundation);
 
         // Submit engraving job to background thread
         self.start_sheet_render(ctx, &musicxml, key);
@@ -1372,77 +1373,18 @@ impl KeyScribeApp {
             return Vec::new();
         }
 
-        let note_count = (PIANO_HIGH_MIDI - PIANO_LOW_MIDI + 1) as usize;
-        let mut out = Vec::new();
-        let step = self.note_timeline_step_sec;
-        let min_duration_sec = (step * MIN_SHEET_NOTE_FRAMES as f32).max(0.05);
-
-        for note_idx in 0..note_count {
-            let mut active_start: Option<usize> = None;
-            let mut max_prob: f32 = 0.0;
-
-            for (frame_idx, frame) in self.note_timeline.iter().enumerate() {
-                let prob = frame.get(note_idx).copied().unwrap_or(0.0).clamp(0.0, 1.0);
-                let active = prob >= threshold;
-
-                if active {
-                    max_prob = max_prob.max(prob);
-                    if active_start.is_none() {
-                        active_start = Some(frame_idx);
-                    }
-                } else if let Some(start_idx) = active_start.take() {
-                    let start_time = start_idx as f32 * step;
-                    let mut end_time = frame_idx as f32 * step;
-                    if end_time <= start_time {
-                        end_time = start_time + step;
-                    }
-
-                    if end_time - start_time < min_duration_sec {
-                        max_prob = 0.0;
-                        continue;
-                    }
-
-                    let velocity = (max_prob * 127.0).round().clamp(1.0, 127.0) as u8;
-                    out.push(NoteEvent {
-                        id: (out.len() + 1) as u32,
-                        pitch: (PIANO_LOW_MIDI as usize + note_idx) as u8,
-                        start_time,
-                        end_time,
-                        velocity,
-                        channel: None,
-                    });
-
-                    max_prob = 0.0;
-                }
-            }
-
-            if let Some(start_idx) = active_start {
-                let start_time = start_idx as f32 * step;
-                let end_time = self.note_timeline.len() as f32 * step;
-                let end_time = end_time.max(start_time + step);
-                if end_time - start_time >= min_duration_sec {
-                    let velocity = (max_prob * 127.0).round().clamp(1.0, 127.0) as u8;
-                    out.push(NoteEvent {
-                        id: (out.len() + 1) as u32,
-                        pitch: (PIANO_LOW_MIDI as usize + note_idx) as u8,
-                        start_time,
-                        end_time,
-                        velocity,
-                        channel: None,
-                    });
-                }
-            }
-        }
-
-        out.sort_by(|a, b| {
-            a.start_time
-                .partial_cmp(&b.start_time)
-                .unwrap_or(std::cmp::Ordering::Equal)
-                .then_with(|| a.pitch.cmp(&b.pitch))
-        });
-
-        merge_adjacent_notes(&mut out, step);
-        out
+        // Delegate to the unified static extractor so both code paths
+        // (per-stem and full-mix) produce identical results. The previous
+        // method version filtered short notes during extraction (before
+        // merge), which dropped notes that could have been merged into
+        // longer ones — producing different results from the static version.
+        let mut next_id: u32 = 1;
+        Self::extract_events_from_timeline_data(
+            &self.note_timeline,
+            self.note_timeline_step_sec,
+            threshold,
+            &mut next_id,
+        )
     }
 
     fn export_sheet_musicxml(&mut self, ctx: &egui::Context) {
@@ -1623,15 +1565,6 @@ impl KeyScribeApp {
             Some(app_data_dir().join(format!("{file_stem}.pdf")))
         }
     }
-}
-
-fn total_beats_for_foundation(foundation: &LeadSheetFoundation) -> f32 {
-    foundation
-        .melody_notes
-        .iter()
-        .map(|n| n.beat_start + n.beat_duration)
-        .fold(0.0f32, f32::max)
-        .max(1.0)
 }
 
 fn parse_svg_note_positions(svg_str: &str) -> Vec<NotePosition> {
@@ -1817,7 +1750,11 @@ fn parse_svg_note_positions(svg_str: &str) -> Vec<NotePosition> {
                     let note_h = 14.0 / svg_h;
                     positions.push(NotePosition {
                         note_id,
-                        x: (ncx - 7.0) / svg_w,
+                        // Apply the same margin offset as the bbox path
+                        // (line 1742). The missing margin_ox caused the
+                        // playback cursor to be horizontally misaligned
+                        // with notes on this code path.
+                        x: (ncx + margin_ox - 7.0) / svg_w,
                         y: (ncy + margin_oy - 7.0) / svg_h,
                         w: note_w,
                         h: note_h,
@@ -2360,7 +2297,11 @@ fn build_musicxml_document(
     } else {
         Vec::new()
     };
-    let mut current_clef: &'static str = "G";
+    let mut current_clef: &'static str = if config.is_lead_sheet || config.single_staff {
+        measure_clefs.first().copied().unwrap_or("G")
+    } else {
+        "G"
+    };
 
     for measure_idx in 0..total_measures {
         let measure_ticks = boundaries[measure_idx + 1] - boundaries[measure_idx];
@@ -2385,7 +2326,13 @@ fn build_musicxml_document(
                 let _ = write!(xml, "        <divisions>{}</divisions>\n", MUSICXML_DIVISIONS);
                 let _ = write!(xml, "        <key><fifths>0</fifths></key>\n");
                 if config.is_lead_sheet {
-                    let _ = write!(xml, "        <clef><sign>G</sign><line>2</line></clef>\n");
+                    // Use dynamic clef based on the first measure's average
+                    // pitch, just like single-staff mode. The old code always
+                    // hardcoded G clef, putting low melodies far below the
+                    // staff.
+                    let first_clef = measure_clefs.first().copied().unwrap_or("G");
+                    let (sign, line) = if first_clef == "F" { ("F", 4) } else { ("G", 2) };
+                    let _ = write!(xml, "        <clef><sign>{}</sign><line>{}</line></clef>\n", sign, line);
                 } else if config.single_staff {
                     let first_clef = measure_clefs.first().copied().unwrap_or("G");
                     let (sign, line) = if first_clef == "F" { ("F", 4) } else { ("G", 2) };
@@ -2435,7 +2382,18 @@ fn build_musicxml_document(
                     _ => {}
                 }
                 let _ = write!(xml, "        </direction-type>\n");
-                let _ = write!(xml, "        <sound type=\"dotted-quarter=quarter+dotted-quarter\"/>\n");
+                // MusicXML <sound> uses a "swing" attribute, not a "type"
+                // attribute. The old code produced invalid MusicXML that
+                // renderers would ignore or reject.
+                match style {
+                    SwingStyle::Swing => {
+                        let _ = write!(xml, "        <sound swing=\"straight\"/>\n");
+                    }
+                    SwingStyle::Triplet => {
+                        let _ = write!(xml, "        <sound swing=\"triplet\"/>\n");
+                    }
+                    _ => {}
+                }
                 let _ = write!(xml, "      </direction>\n");
             } else if prev_swing_style == Some(SwingStyle::Swing)
                 || prev_swing_style == Some(SwingStyle::Triplet)
@@ -2526,9 +2484,13 @@ fn build_musicxml_document(
                 let voice_map = build_voice_chunks(chunks.as_slice(), staff);
                 let voice_count = voice_map.len().max(1);
                 let mut rendered = 0usize;
+                let mut staff_has_content = false;
 
                 for (voice, mut voice_chunks) in voice_map {
                     voice_chunks.sort_by_key(|chunk| chunk.start_tick_in_measure);
+                    if !voice_chunks.is_empty() {
+                        staff_has_content = true;
+                    }
                     write_voice_sequence(
                         &mut xml,
                         voice_chunks.as_slice(),
@@ -2548,7 +2510,11 @@ fn build_musicxml_document(
                     }
                 }
 
-                if staff == 1 {
+                // Only emit the inter-staff backup if staff 1 actually
+                // wrote notes. Emitting a backup after an empty staff 1
+                // moves the cursor backwards and corrupts the measure
+                // layout in renderers.
+                if staff == 1 && staff_has_content {
                     let _ = write!(xml, "      <backup>\n");
                     let _ = write!(xml, "        <duration>{}</duration>\n", measure_ticks.max(1));
                     let _ = write!(xml, "      </backup>\n");
@@ -2873,18 +2839,23 @@ fn merge_adjacent_notes(notes: &mut Vec<NoteEvent>, step: f32) {
 }
 
 fn notes_to_spans(notes: &[QuantizedNote], config: SheetEngravingConfig) -> Vec<NoteSpan> {
-    fn snap_to_half_beat(value: f32) -> f32 {
+    // Snap to the nearest quarter-beat (0.25) — the finest grid the
+    // quantizer produces. The previous code snapped to half-beats (0.5),
+    // which destroyed 16th notes and dotted-eighth durations.
+    fn snap_to_grid(value: f32) -> f32 {
         if !value.is_finite() {
-            return 0.5;
+            return 0.25;
         }
-        (value / 0.5).round() * 0.5
+        (value / 0.25).round() * 0.25
     }
 
     let mut out = Vec::new();
     for note in notes {
         let start_tick = (note.beat_start * MUSICXML_DIVISIONS as f32).round().max(0.0) as i32;
-        // Preserve long durations so sustained melody notes do not collapse to whole notes.
-        let raw_dur = snap_to_half_beat(note.beat_duration).max(0.5);
+        // Preserve the exact quantized duration — the quantizer already
+        // snapped to a musical grid, so we should not re-snap to a coarser
+        // one. Minimum is a 16th note (0.25 beats).
+        let raw_dur = snap_to_grid(note.beat_duration).max(0.25);
         let duration_ticks = (raw_dur * MUSICXML_DIVISIONS as f32).round().max(1.0) as i32;
         let staff = if config.is_lead_sheet || config.single_staff {
             1
@@ -2940,7 +2911,9 @@ fn write_harmony(xml: &mut String, offset: i32, symbol: &str) {
     }
     let _ = write!(xml, "</root>\n");
 
-    let kind = chord_suffix_to_musicxml_kind(suffix);
+    // Split the suffix into the base kind and any alterations (b9, #9, #11, b5, #5).
+    let (base_suffix, alterations) = split_chord_alterations(suffix);
+    let kind = chord_suffix_to_musicxml_kind(base_suffix.as_str());
     let _ = write!(
         xml,
         "        <kind{}>{}</kind>\n",
@@ -2961,7 +2934,57 @@ fn write_harmony(xml: &mut String, offset: i32, symbol: &str) {
         let _ = write!(xml, "</bass>\n");
     }
 
+    // Emit <degree> elements for alterations so renderers display the
+    // correct chord symbol (e.g. "7b9" instead of just "9").
+    for alt in &alterations {
+        let _ = write!(xml, "        <degree>\n");
+        let _ = write!(xml, "          <degree-value>{}</degree-value>\n", alt.degree_value);
+        let _ = write!(xml, "          <degree-alter>{}</degree-alter>\n", alt.alter);
+        let _ = write!(xml, "          <degree-type>{}</degree-type>\n", alt.type_str);
+        let _ = write!(xml, "        </degree>\n");
+    }
+
     let _ = write!(xml, "      </harmony>\n");
+}
+
+struct ChordAlteration {
+    degree_value: u8,  // e.g. 9 for the 9th
+    alter: i8,         // -1 = flat, 1 = sharp
+    type_str: &'static str, // "add" or "alter"
+}
+
+/// Split a chord suffix into the base kind and a list of alterations.
+/// For example "7b9" → ("7", [Alteration { 9, -1, "alter" }])
+/// "7#11" → ("7", [Alteration { 11, 1, "add" }])
+fn split_chord_alterations(suffix: &str) -> (String, Vec<ChordAlteration>) {
+    // Known alteration patterns to extract from the suffix.
+    let patterns: &[(&str, u8, i8, &str)] = &[
+        ("b9", 9, -1, "alter"),
+        ("#9", 9, 1, "alter"),
+        ("b5", 5, -1, "alter"),
+        ("#5", 5, 1, "alter"),
+        ("b13", 13, -1, "alter"),
+        ("#11", 11, 1, "add"),
+    ];
+
+    let mut remaining = suffix.to_string();
+    let mut alterations = Vec::new();
+
+    // Check for compound alterations first (e.g. "b9b5")
+    if remaining.contains("b9") && remaining.contains("b5") {
+        alterations.push(ChordAlteration { degree_value: 9, alter: -1, type_str: "alter" });
+        alterations.push(ChordAlteration { degree_value: 5, alter: -1, type_str: "alter" });
+        remaining = remaining.replace("b9", "").replace("b5", "");
+    }
+
+    for (pat, degree, alter, type_str) in patterns {
+        if remaining.contains(pat) {
+            alterations.push(ChordAlteration { degree_value: *degree, alter: *alter, type_str });
+            remaining = remaining.replace(pat, "");
+        }
+    }
+
+    (remaining, alterations)
 }
 
 fn parse_chord_symbol(symbol: &str) -> (u8, &str, Option<u8>) {
@@ -3073,7 +3096,7 @@ fn write_rest_ticks(
         let _ = write!(xml, "        <staff>{}</staff>\n", staff.max(1));
         if token.time_mod.is_some() {
             let _ = write!(xml, "        <notations>\n");
-            write_tuplet_notation(xml, token.time_mod);
+            write_tuplet_notation(xml, token.time_mod, true, true);
             let _ = write!(xml, "        </notations>\n");
         }
         let _ = write!(xml, "      </note>\n");
@@ -3096,6 +3119,8 @@ fn write_note_element(
     tie_stop: bool,
     articulation: Articulation,
     beam: Option<&'static str>,
+    is_tuplet_start: bool,
+    is_tuplet_end: bool,
 ) {
     let (step, alter, octave) = midi_to_pitch_parts(pitch);
     let _ = write!(xml, "      <note id=\"{}\">\n", xml_escape(note_id));
@@ -3121,7 +3146,8 @@ fn write_note_element(
     for _ in 0..token.dots {
         let _ = write!(xml, "        <dot/>\n");
     }
-    let (_, alter, _) = midi_to_pitch_parts(pitch);
+    // `alter` is already computed from midi_to_pitch_parts at the top of
+    // this function — no need to call it again.
     if alter != 0 && token.note_type != "grace" {
         let acc = match alter { -2 => "double-flat", -1 => "flat", 1 => "sharp", 2 => "double-sharp", _ => "sharp" };
         let _ = write!(xml, "        <accidental>{}</accidental>\n", acc);
@@ -3171,7 +3197,7 @@ fn write_note_element(
             }
             _ => {}
         }
-        write_tuplet_notation(xml, token.time_mod);
+        write_tuplet_notation(xml, token.time_mod, is_tuplet_start, is_tuplet_end);
         let _ = write!(xml, "        </notations>\n");
     }
 
@@ -3184,30 +3210,43 @@ fn duration_tokens_for_ticks(
     _config: SheetEngravingConfig,
 ) -> Vec<DurationToken> {
     let d = divisions.max(1);
-    let min_tick = d / 2; // smallest unit = eighth note (240 at 480 div)
+    let min_tick = d / 4; // smallest unit = 16th note (120 at 480 div)
 
-    // Floor to nearest 8th boundary so we never exceed the true duration
+    // Floor to nearest 16th boundary so we never exceed the true duration.
     let total = (duration_ticks.max(0) / min_tick) * min_tick;
     if total < min_tick {
         return Vec::new();
     }
 
-    // DEBUG: undotted whole, half, quarter, eighth only
-    let candidates = [
+    // Candidate durations from longest to shortest, including dotted notes
+    // and triplets. Each entry is (ticks, note_type, dots, time_modification).
+    // Dotted note = base * 1.5. Triplet quarter = d*2/3, triplet eighth = d/3.
+    // At 480 divisions: whole=1920, half=960, half.=1440, quarter=480,
+    // quarter.=720, eighth=240, eighth.=360, 16th=120.
+    let candidates: &[DurationToken] = &[
         DurationToken { ticks: d * 4, note_type: "whole", dots: 0, time_mod: None },
+        DurationToken { ticks: d * 3, note_type: "half", dots: 1, time_mod: None },
         DurationToken { ticks: d * 2, note_type: "half", dots: 0, time_mod: None },
+        DurationToken { ticks: d + d / 2, note_type: "quarter", dots: 1, time_mod: None },
         DurationToken { ticks: d, note_type: "quarter", dots: 0, time_mod: None },
+        DurationToken { ticks: d / 2 + d / 4, note_type: "eighth", dots: 1, time_mod: None },
         DurationToken { ticks: d / 2, note_type: "eighth", dots: 0, time_mod: None },
+        DurationToken { ticks: d / 4 + d / 8, note_type: "16th", dots: 1, time_mod: None },
+        DurationToken { ticks: d / 4, note_type: "16th", dots: 0, time_mod: None },
+        // Triplet candidates (time_mod actual/normal)
+        DurationToken { ticks: d * 2 / 3, note_type: "quarter", dots: 0, time_mod: Some((2, 3)) },
+        DurationToken { ticks: d / 3, note_type: "eighth", dots: 0, time_mod: Some((2, 3)) },
+        DurationToken { ticks: d / 6, note_type: "16th", dots: 0, time_mod: Some((2, 3)) },
     ];
 
     let mut remaining = total;
-
     let mut out = Vec::new();
-    while remaining > 0 {
+
+    while remaining >= min_tick {
         let mut chosen: Option<DurationToken> = None;
-        for &candidate in &candidates {
+        for candidate in candidates {
             if candidate.ticks <= remaining {
-                chosen = Some(candidate);
+                chosen = Some(*candidate);
                 break;
             }
         }
@@ -3218,7 +3257,16 @@ fn duration_tokens_for_ticks(
                 out.push(token);
             }
             None => {
-                break;
+                // Remaining is smaller than the finest candidate; emit as
+                // a 16th so the measure still adds up.
+                let fallback = DurationToken {
+                    ticks: min_tick,
+                    note_type: "16th",
+                    dots: 0,
+                    time_mod: None,
+                };
+                remaining -= fallback.ticks;
+                out.push(fallback);
             }
         }
     }
@@ -3227,13 +3275,51 @@ fn duration_tokens_for_ticks(
 }
 
 fn build_voice_chunks(chunks: &[NoteChunk], staff: u8) -> BTreeMap<u8, Vec<NoteChunk>> {
-    let mut out: BTreeMap<u8, Vec<NoteChunk>> = BTreeMap::new();
-    for chunk in chunks {
-        if chunk.staff != staff {
-            continue;
-        }
-        out.entry(1).or_default().push(chunk.clone());
+    // Greedy voice assignment: sort notes by start position, then assign
+    // each to the lowest-numbered voice whose last note ends before this
+    // one starts. This separates overlapping notes (e.g. a sustained half
+    // note and a moving quarter-note line) into distinct voices so the
+    // MusicXML renderer doesn't truncate or reorder them.
+    let mut filtered: Vec<NoteChunk> = chunks
+        .iter()
+        .filter(|c| c.staff == staff)
+        .cloned()
+        .collect();
+    filtered.sort_by_key(|c| (c.start_tick_in_measure, c.pitch));
+
+    // Track the end tick of the last note in each voice.
+    let mut voice_end_ticks: Vec<i32> = Vec::new();
+    let mut voice_assignments: Vec<u8> = vec![0u8; filtered.len()];
+
+    for (i, chunk) in filtered.iter().enumerate() {
+        let start = chunk.start_tick_in_measure;
+        let end = start + chunk.duration_ticks;
+
+        // Find the first voice that is free (its last note ended at or
+        // before this note's start).
+        let assigned_voice = voice_end_ticks
+            .iter()
+            .position(|&end_tick| end_tick <= start);
+
+        let voice = match assigned_voice {
+            Some(idx) => {
+                voice_end_ticks[idx] = end;
+                (idx + 1) as u8
+            }
+            None => {
+                voice_end_ticks.push(end);
+                voice_end_ticks.len() as u8
+            }
+        };
+        voice_assignments[i] = voice;
     }
+
+    let mut out: BTreeMap<u8, Vec<NoteChunk>> = BTreeMap::new();
+    for (i, chunk) in filtered.into_iter().enumerate() {
+        let voice = voice_assignments[i];
+        out.entry(voice).or_default().push(chunk);
+    }
+
     out
 }
 
@@ -3325,22 +3411,28 @@ fn write_voice_sequence(
             group_end += 1;
         }
 
-        // Find max duration in the chord group
-        let group_dur = chunks[i..group_end]
+        // The voice cursor advances by the longest note in the group,
+        // but each note is written with its OWN duration. MusicXML chord
+        // notes (<chord/>) must share the same <duration>, so notes with
+        // differing durations starting at the same time should be in
+        // separate voices — which build_voice_chunks now handles. Within
+        // a single voice, simultaneous notes are true chords and should
+        // already have the same duration.
+        let group_max_dur = chunks[i..group_end]
             .iter()
             .map(|c| c.duration_ticks)
             .max()
             .unwrap_or(0);
-        let clamped_dur = group_dur.min(measure_ticks - cursor);
+        let clamped_max_dur = group_max_dur.min(measure_ticks - cursor);
 
-        // Write chord: first note normal, rest as chords.
-        // ALL chord notes share the same duration (max of group) — MusicXML
-        // requires chord notes to have identical durations, otherwise
-        // renderers count each as consuming separate time.
         for (j, chunk) in chunks[i..group_end].iter().enumerate() {
             let is_chord = j > 0;
-            if clamped_dur > 0 {
-                let tokens = duration_tokens_for_ticks(clamped_dur, divisions, config);
+            // Use this note's own duration, clamped to the remaining
+            // measure space. This preserves individual note lengths
+            // instead of stretching all to the group maximum.
+            let chunk_dur = chunk.duration_ticks.min(measure_ticks - cursor);
+            if chunk_dur > 0 {
+                let tokens = duration_tokens_for_ticks(chunk_dur, divisions, config);
                 let mut current_token_tick = chunk.absolute_tick;
                 
                 for (idx, token) in tokens.iter().enumerate() {
@@ -3348,6 +3440,10 @@ fn write_voice_sequence(
                     let local_tie_start = (idx + 1 < tokens.len()) || (idx + 1 == tokens.len() && chunk.tie_start);
                     
                     let beam = if j == 0 && idx == 0 { beam_of_group[i] } else { None };
+                    // Tuplet start goes on the first token of the first
+                    // chord note; tuplet stop goes on the last token.
+                    let is_tuplet_start = j == 0 && idx == 0 && token.time_mod.is_some();
+                    let is_tuplet_end = idx + 1 == tokens.len() && token.time_mod.is_some();
                     write_note_element(
                         xml,
                         &format!(
@@ -3367,13 +3463,15 @@ fn write_voice_sequence(
                         local_tie_stop,
                         chunk.articulation,
                         beam,
+                        is_tuplet_start,
+                        is_tuplet_end,
                     );
                     current_token_tick += token.ticks;
                 }
             }
         }
 
-        cursor = (cursor + clamped_dur).min(measure_ticks);
+        cursor = (cursor + clamped_max_dur).min(measure_ticks);
         i = group_end;
     }
 
@@ -3401,10 +3499,14 @@ fn write_time_mod(xml: &mut String, time_mod: Option<(u8, u8)>) {
     }
 }
 
-fn write_tuplet_notation(xml: &mut String, time_mod: Option<(u8, u8)>) {
+fn write_tuplet_notation(xml: &mut String, time_mod: Option<(u8, u8)>, is_tuplet_start: bool, is_tuplet_end: bool) {
     if time_mod.is_some() {
-        let _ = write!(xml, "          <tuplet type=\"start\"/>\n");
-        let _ = write!(xml, "          <tuplet type=\"stop\"/>\n");
+        if is_tuplet_start {
+            let _ = write!(xml, "          <tuplet type=\"start\"/>\n");
+        }
+        if is_tuplet_end {
+            let _ = write!(xml, "          <tuplet type=\"stop\"/>\n");
+        }
     }
 }
 

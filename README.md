@@ -1,51 +1,77 @@
 # KeyScribe
 
-KeyScribe is a desktop application for polyphonic note detection and sheet music generation from recorded audio. Built in Rust, it is optimized for accuracy, responsiveness, and portable distribution.
+KeyScribe is a desktop application for polyphonic note detection, sheet music generation, and video transcription from recorded audio. Built in Rust, it is optimized for accuracy, responsiveness, and portable distribution.
 
 [Visit website](https://keyscribe.frantzeselzaurdia.com/)
 
 > **Status: Beta (active development).**
 > The app is evolving quickly; behavior, UI, and outputs may change between releases.
 
+## Features
+
+- **Audio & Video Import:** Drag-and-drop or open via file dialog. Supports wav, mp3, flac, ogg, m4a, aac, mp4, mkv, avi, mov, webm.
+- **Waveform & Piano Roll:** Real-time interactive waveform display with an 88-key piano roll that highlights detected notes as the playhead moves.
+- **AI Stem Separation:** Separate audio into Vocals, Bass, Drums, and Other stems using Demucs. Visualize or listen to individual stems.
+- **Per-Stem Piano Roll:** Toggle individual stems on the piano roll to see which instrument is playing what.
+- **Video Playback:** Synchronized video with audio-master clock (VLC-style sync engine). Frame-accurate seeking, no accumulating drift.
+- **Sheet Music Generation (Experimental):** Generate MusicXML from detected notes. In-app engraved preview via Verovio. Supports lead sheet, piano grand staff, and single staff modes. Export to MusicXML or PDF via MuseScore.
+- **Chord Detection:** Automatic chord symbol extraction displayed on the piano roll and exported to sheet music.
+- **Speed & Pitch Controls:** Adjust playback speed (0.5×–2×) and pitch (-12 to +12 semitones) independently using high-quality time-stretching.
+- **Loop & Markers:** Create loop selections on the waveform. Add named markers with editable timestamps. Snap loop boundaries to markers.
+- **Analysis Cache:** Processed results are cached by audio hash so re-opening a file loads instantly without re-analysis.
+- **Audio Output Selection:** Choose your audio output device from the settings menu.
+- **Keyboard Shortcuts:** Space (play/replay), K (play/pause), arrows (seek ±5s), Ctrl+arrows (shift loop), M (add marker).
+
 ## How It Works: The Pipeline
 
 KeyScribe uses a hybrid architecture combining a high-performance Rust core with specialized Python subprocesses for state-of-the-art AI analysis.
 
-### 1. Importing an Audio File
-When you drag and drop or import an audio file, KeyScribe initiates a high-concurrency pipeline to provide immediate feedback:
+### 1. Importing an Audio or Video File
 
-*   **Audio Decoding (Rust):** The file is immediately decoded into a raw mono sample stream using `Symphonia`. A waveform visualization is generated and rendered instantly.
-*   **Hashing & Cache Check (Rust):** A unique hash of the audio is calculated. KeyScribe checks the local analysis cache to see if this song has been processed before. If a cache hit occurs, transcription data is loaded instantly.
-*   **Parallel Subprocesses (Python):** If no cache is found, KeyScribe spawns two independent Python subprocesses to run in parallel:
-    *   **Subprocess A (Transcription):** Runs the `main.py` runner (using a polyphonic transcription model like Basic Pitch) to estimate note probabilities across the full mix.
-    *   **Subprocess B (Stem Separation):** Runs the `demucs_runner.py` (using Meta's Demucs) to separate the audio into distinct stems (Vocals, Drums, Bass, Other).
-*   **Background Stem Analysis:** As soon as the stems are separated, the Rust core begins a second pass, analyzing each individual stem for note probabilities. This is what allows you to eventually "Visualize" or "Listen" to specific instruments.
+When you drag and drop or import a file, KeyScribe initiates a high-concurrency pipeline:
 
-### 2. Sheet Music Generation
-Once the initial analysis is complete, you can generate editable sheet music. This process is deterministic and follows these steps after you click **Generate**:
+- **Audio Decoding (Rust):** The audio track is decoded into a raw sample stream using `Symphonia`. A waveform visualization is generated and rendered instantly.
+- **Video Decoding (FFmpeg):** For video files, FFmpeg is spawned as a subprocess to pipe raw RGBA frames for synchronized playback.
+- **Hashing & Cache Check (Rust):** A unique hash of the audio is calculated. KeyScribe checks the local analysis cache. If a cache hit occurs, transcription data loads instantly.
+- **Parallel Subprocesses (Python):** If no cache is found, Python subprocesses run in parallel for transcription and stem separation.
 
-1.  **Stem Selection:** The generator takes the note probabilities from the specific stems you have enabled in the UI (e.g., just the "Other" stem for piano, or "Bass" for a bass clef part).
-2.  **Temporal Decoding (Viterbi):** The raw frame-by-frame probabilities are passed through a Viterbi-style decoder to find the most likely sequence of note onsets and durations, filtering out "ghost notes" and noise.
-3.  **Tempo & Beat Tracking:** The `beat_this_runner.py` subprocess is invoked to establish a precise tempo map (BPM) and align the detected notes with a musical grid.
-4.  **Quantization:** Detected notes are snapped to the nearest musical subdivision (quarter notes, eighth notes, etc.) based on your quantization settings.
-5.  **Chord Analysis:** The pipeline identifies harmonic structures to add chord symbols to the sheet.
-6.  **MusicXML Export:** Finally, the data is serialized into `MusicXML` format, which can be opened in MuseScore, Sibelius, or Finale for further editing.
+### 2. Stem Separation & Per-Stem Analysis
 
-## Features
+- **Stem Separation (Demucs):** The `demucs_runner.py` subprocess separates the audio into Vocals, Bass, Drums, and Other stems.
+- **Background Stem Analysis:** Each stem is independently analyzed for note probabilities. The UI lets you toggle which stems appear on the piano roll ("Visualize") or in the playback mix ("Listen").
 
-- **Real-time Visualization:** Waveform and 88-key piano roll interaction.
-- **AI Stem Separation:** Isolate vocals, bass, and drums to improve transcription accuracy.
-- **CQT Pro Mode:** Advanced Constant-Q Transform for cleaner note stability.
-- **Format Support:** wav, mp3, flac, ogg, m4a, aac.
-- **Cross-Platform:** Native bundles for Windows, macOS, and Linux.
+### 3. Sheet Music Generation
+
+Once the initial analysis is complete, you can generate sheet music from the **Sheet Music** tab:
+
+1. **Stem Selection:** Choose which stems feed the melody and chord detection (or use the full mix).
+2. **Tempo & Beat Tracking:** The `beat_this_runner.py` subprocess establishes a precise tempo map.
+3. **Quantization:** Detected notes are snapped to a musical grid (supports quarter, eighth, 16th, dotted, and triplet subdivisions).
+4. **Melody Extraction:** Monophonic (skyline or heuristic with outlier suppression) or polyphonic mode.
+5. **Chord Analysis:** Automatic chord symbol detection and per-bar chord changes.
+6. **MusicXML Export:** Serialized to MusicXML format — openable in MuseScore, Sibelius, Finale, etc.
+7. **In-App Preview:** Engraved sheet music rendered via Verovio with a live playback cursor.
+8. **PDF Export:** If MuseScore is installed, export engraved PDFs directly.
+
+### 4. Playback Sync Engine
+
+KeyScribe uses a VLC-style audio-master clock for drift-free playback:
+
+- **Master Clock:** The audio device's sample consumption is the single source of truth. All consumers (video, piano roll, waveform playhead) read from this clock.
+- **Latency Compensation:** The clock subtracts the estimated output buffer latency so the playhead tracks the sample currently audible through the speakers, not the sample queued in the device buffer.
+- **Video Sync:** The video player follows the master audio clock. Late frames are dropped, early frames are held, and hard seeks are only triggered on large drift (>400ms). Real frame rate is detected via ffprobe, eliminating PTS drift.
+- **Keyboard Sync:** The piano roll reads from the same master clock with nearest-frame rounding, keeping key highlights locked to the audible audio.
 
 ## Quick Start
 
 ### Prerequisites
+
 - **Rust 1.70+**
 - **Python 3.10+** (with `torch` and `demucs` installed in the project environment)
+- **FFmpeg** (for video playback)
 
 ### Build & Run
+
 ```bash
 # Build release
 cargo build --release
@@ -55,4 +81,5 @@ cargo run --release
 ```
 
 ## License
+
 GNU AGPL-3. See LICENSE.

@@ -815,6 +815,13 @@ impl KeyScribeApp {
     }
 
     pub(super) fn save_state_to_disk(&self) {
+        // Save the current playback position into the per-file map so we
+        // can resume from where the user left off when reopening this file.
+        let mut file_positions = self.file_positions.clone();
+        if let Some(hash) = &self.loaded_audio_hash {
+            file_positions.insert(hash.clone(), self.selected_time_sec.max(0.0));
+        }
+
         let state = PersistedState {
             last_file: self.loaded_path.clone(),
             recent_files: self.recent_file_paths.clone(),
@@ -858,6 +865,7 @@ impl KeyScribeApp {
             sheet_use_musescore: self.sheet_use_musescore,
             auto_separate: self.auto_separate,
             file_markers: self.file_markers.clone(),
+            file_positions,
         };
 
         if let Ok(raw) = serde_json::to_string_pretty(&state) {

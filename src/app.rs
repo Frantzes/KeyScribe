@@ -343,6 +343,10 @@ struct PersistedState {
     auto_separate: bool,
     #[serde(default)]
     file_markers: std::collections::HashMap<String, Vec<MarkerData>>,
+    /// Per-file playback positions (keyed by file hash) so the app can
+    /// resume from where the user left off when reopening a file.
+    #[serde(default)]
+    file_positions: std::collections::HashMap<String, f32>,
 }
 
 impl Default for PersistedState {
@@ -379,6 +383,7 @@ impl Default for PersistedState {
             sheet_use_musescore: false,
             auto_separate: default_auto_separate(),
             file_markers: std::collections::HashMap::new(),
+            file_positions: std::collections::HashMap::new(),
         }
     }
 }
@@ -1044,6 +1049,11 @@ pub struct KeyScribeApp {
     export_selected_stems: std::collections::HashSet<crate::leadsheet::StemType>,
     export_full_mix_midi: bool,
     file_markers: std::collections::HashMap<String, Vec<MarkerData>>,
+    /// Per-file playback positions (keyed by file hash) for resume-on-reopen.
+    file_positions: std::collections::HashMap<String, f32>,
+    /// When set, the playhead will jump to this position once the audio
+    /// hash is known and the per-file position map has been checked.
+    pending_restore_position: Option<f32>,
     dragging_marker: Option<usize>,
     context_menu_marker_idx: Option<usize>,
     context_menu_plot_x: Option<f32>,
@@ -1432,6 +1442,8 @@ impl KeyScribeApp {
             export_selected_stems: std::collections::HashSet::new(),
             export_full_mix_midi: false,
             file_markers: persisted.file_markers,
+            file_positions: persisted.file_positions,
+            pending_restore_position: None,
             dragging_marker: None,
             context_menu_marker_idx: None,
             context_menu_plot_x: None,

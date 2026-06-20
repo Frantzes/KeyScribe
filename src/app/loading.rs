@@ -107,10 +107,21 @@ impl KeyScribeApp {
         self.cancel_active_processing();
         self.stop();
 
+        // Save the current position before clearing it so we can restore
+        // it after the file hash arrives. On startup (reset_state=false)
+        // we preserve whatever was persisted. On manual open (reset_state=true)
+        // we clear it — the per-file map will be checked once the hash arrives.
+        let saved_pos = if !reset_state {
+            Some(self.selected_time_sec.max(0.0))
+        } else {
+            None
+        };
+
         self.loaded_path = Some(path.clone());
         push_recent_file_path(&mut self.recent_file_paths, path.as_path());
         self.loaded_audio_hash = None;
         self.selected_time_sec = 0.0;
+        self.pending_restore_position = saved_pos;
         self.audio_raw = None;
         self.processed_samples.clear();
         self.processed_playback_samples = Arc::new(Vec::new());
@@ -230,6 +241,28 @@ impl KeyScribeApp {
         match event {
             StreamingAudioEvent::SourceHash(source_hash) => {
                 self.loaded_audio_hash = source_hash;
+
+                // Once we know the file hash, check the per-file position
+                // map for a saved resume position. This takes priority over
+                // the startup-preserved position (which was set before the
+                // hash was known and may be stale if the state file's
+                // selected_time_sec didn't match this file).
+                if let Some(hash) = &self.loaded_audio_hash {
+                    if let Some(&saved) = self.file_positions.get(hash) {
+                        if saved > 0.5 {
+                            self.pending_restore_position = Some(saved);
+                        }
+                    }
+                }
+
+                // Apply the pending restore position now that the hash is
+                // known. We clamp it later once the duration is known.
+                if let Some(pos) = self.pending_restore_position.take() {
+                    if pos > 0.5 {
+                        self.selected_time_sec = pos;
+                    }
+                }
+
                 if self.loaded_audio_hash.is_none() {
                     self.cache_status_message = Some(
                         "Analysis cache: precheck unavailable (source hash failed).".to_string(),
@@ -353,6 +386,15 @@ impl KeyScribeApp {
                 self.live_stream_playback = false;
                 self.loading_cache_waveform_preloaded = false;
                 self.loading_preview_cache.clear();
+
+                // Clamp the restored playhead to the actual duration now
+                // that we know it. If the saved position was near the end
+                // of a file that was later trimmed, this prevents seeking
+                // past the end.
+                let duration = self.source_duration();
+                if duration > 0.0 && self.selected_time_sec > duration {
+                    self.selected_time_sec = duration * 0.95;
+                }
 
                 // Only rebuild the waveform from scratch when the cache didn't already
                 // provide one — otherwise keep the cached waveform to avoid unnecessary

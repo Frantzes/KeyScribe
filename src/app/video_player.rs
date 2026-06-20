@@ -103,7 +103,17 @@ impl VideoPlayer {
         self.current_time = audio_clock_sec;
     }
 
-    pub fn draw(&mut self, ui: &mut egui::Ui, audio_clock_sec: f32, _playing: bool) {
+    pub fn draw(&mut self, ui: &mut egui::Ui, audio_clock_sec: f32, playing: bool) {
+        // When paused, show the last displayed frame without touching the
+        // frame scheduling loop. The decoder thread keeps producing frames
+        // while paused and the channel buffered ahead, but their PTS values
+        // are in the future — trying to schedule them would drain or replace
+        // the current texture, causing a black frame.
+        if !playing && self.texture.is_some() {
+            self.render_texture(ui);
+            return;
+        }
+
         self.sync_to_audio_clock(audio_clock_sec);
 
         // Ensure we have a frame queued for the scheduling loop.
@@ -166,6 +176,10 @@ impl VideoPlayer {
             break;
         }
 
+        self.render_texture(ui);
+    }
+
+    fn render_texture(&self, ui: &mut egui::Ui) {
         if let Some(tex) = &self.texture {
             let avail_size = ui.available_size();
             let aspect_ratio = VIDEO_WIDTH as f32 / VIDEO_HEIGHT as f32;
