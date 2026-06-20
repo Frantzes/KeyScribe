@@ -68,7 +68,7 @@ KeyScribe uses a VLC-style audio-master clock for drift-free playback:
 
 - **Rust 1.70+**
 - **Python 3.10+** (with `torch` and `demucs` installed in the project environment)
-- **FFmpeg** (for video playback)
+- **FFmpeg (Also bundled)** (for video playback)
 
 ### Build & Run
 
