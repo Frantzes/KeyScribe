@@ -1059,6 +1059,18 @@ pub struct KeyScribeApp {
     context_menu_plot_x: Option<f32>,
     marker_edit_index: Option<usize>,
     marker_edit_str: String,
+    streaming_stretch: Option<StreamingStretchState>,
+}
+
+struct StreamingStretchState {
+    rx: std::sync::mpsc::Receiver<Vec<f32>>,
+    cancel: Arc<AtomicBool>,
+    channels: u16,
+    sample_rate: u32,
+    speed: f32,
+    timeline_start_sec: f32,
+    started: bool,
+    accumulated: Vec<f32>,
 }
 
 struct StemPlaybackCache {
@@ -1449,6 +1461,7 @@ impl KeyScribeApp {
             context_menu_plot_x: None,
             marker_edit_index: None,
             marker_edit_str: String::new(),
+            streaming_stretch: None,
         };
 
         app.refresh_audio_output_devices();

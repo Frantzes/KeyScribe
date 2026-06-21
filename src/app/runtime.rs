@@ -166,6 +166,7 @@ impl KeyScribeApp {
         self.last_param_change_at = None;
         self.queued_param_update = false;
         self.restart_playback_after_processing = false;
+        self.cancel_streaming_stretch();
     }
 
     pub(super) fn refresh_audio_output_devices(&mut self) {
@@ -210,6 +211,12 @@ impl KeyScribeApp {
         }
     }
 
+    pub(super) fn cancel_streaming_stretch(&mut self) {
+        if let Some(state) = self.streaming_stretch.take() {
+            state.cancel.store(true, Ordering::Release);
+        }
+    }
+
     pub(super) fn request_param_update_preserving_playback(&mut self) {
         self.refresh_timeline_for_current_params();
 
@@ -228,45 +235,51 @@ impl KeyScribeApp {
             return;
         }
 
-        // When speed/pitch are back to identity, skip the costly processing
-        // pipeline and directly use the raw samples. This prevents unnecessary
-        // buffer clones, waveform rebuilds, and thread spawns that cause lag
-        // while seeking during a parameter update.
-        if speed_pitch_is_identity(self.speed, self.pitch_semitones) {
-            // Cancel any in-flight param render so is_processing resets.
-            self.cancel_active_processing();
+        // Cancel any in-flight processing and streaming — we're switching modes
+        self.cancel_active_processing();
+        self.cancel_streaming_stretch();
 
-            if let Some(raw) = &self.audio_raw {
-                self.processed_samples = raw.samples_mono.to_vec();
-                self.processed_playback_samples = Arc::clone(&raw.samples_interleaved);
-                self.processed_playback_channels = raw.channels;
+        let was_playing = self.is_playing();
+        let resume_pos = self.current_position_sec().min(self.source_duration());
 
+        // Swap buffers to raw samples. For identity, this is the final state.
+        // For non-identity, streaming will stretch from raw in real-time.
+        if let Some(raw) = &self.audio_raw {
+            self.processed_samples = raw.samples_mono.to_vec();
+            self.processed_playback_samples = Arc::clone(&raw.samples_interleaved);
+            self.processed_playback_channels = raw.channels;
+
+            // The waveform is in source-time coordinates (0..source_duration),
+            // which doesn't change with speed — streaming uses timeline_rate =
+            // speed so the clock maps back to source time. Skip the expensive
+            // rebuild (full-sample scan + peak-normalize) on speed changes.
+            if self.waveform.is_empty() {
                 let waveform = build_waveform_for_processed(
                     &self.processed_samples,
                     raw.sample_rate,
                     self.audio_quality_mode.waveform_points(),
-                    self.speed,
+                    1.0,
                 );
                 self.set_waveform_data(waveform, false);
             }
+        }
 
-            self.note_timeline = Arc::clone(&self.base_note_timeline);
-            self.note_timeline_step_sec = self.base_note_timeline_step_sec;
-            self.selected_time_sec = self.selected_time_sec.min(self.source_duration());
-            self.playing_preview_buffer = false;
+        self.note_timeline = Arc::clone(&self.base_note_timeline);
+        self.note_timeline_step_sec = self.base_note_timeline_step_sec;
+        self.selected_time_sec = resume_pos;
 
-            if self.restart_playback_after_processing {
-                self.restart_playback_after_processing = false;
-                self.play_from_selected();
-            }
+        if !was_playing {
             return;
         }
 
-        let was_playing = self.stop_if_playing();
-        if was_playing {
-            self.request_rebuild(true, RebuildMode::ParametersPreview);
+        if speed_pitch_is_identity(self.speed, self.pitch_semitones) {
+            // Identity: play raw samples directly — instant, preserves stereo
+            self.play_from_selected();
         } else {
-            self.request_rebuild(false, RebuildMode::ParametersOnly);
+            // Non-identity: start streaming time-stretch from current position.
+            // First chunk arrives in <10ms, so playback starts almost instantly.
+            // Pitch is preserved, channels are preserved, no UI freeze.
+            self.start_streaming_playback(resume_pos);
         }
     }
 

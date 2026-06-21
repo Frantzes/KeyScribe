@@ -221,6 +221,128 @@ pub(crate) fn apply_speed_and_pitch_interleaved_with_cancel(
     Some(out)
 }
 
+/// Streaming time-stretch: processes interleaved audio in chunks and sends
+/// each output chunk via the provided sender. Uses a single multi-channel
+/// `Stretch` instance, preserving the original channel count (no mono bug).
+///
+/// The first chunk arrives after just a few milliseconds of processing,
+/// enabling instant playback start while the rest streams in the background.
+/// Subsequent chunks are appended to the running sink, creating a seamless
+/// pitch-preserved speed change with no UI freeze.
+pub fn stretch_streaming_interleaved(
+    samples: &[f32],
+    channels: u16,
+    sample_rate: u32,
+    start_frame: usize,
+    speed: f32,
+    pitch_semitones: f32,
+    cancel: &AtomicBool,
+    tx: &std::sync::mpsc::Sender<Vec<f32>>,
+) -> Option<()> {
+    let ch = channels.max(1) as usize;
+    let clamped_speed = speed.clamp(0.25, 4.0);
+
+    if samples.is_empty() || sample_rate == 0 {
+        return Some(());
+    }
+
+    let total_input_frames = samples.len() / ch;
+    if start_frame >= total_input_frames {
+        return Some(());
+    }
+
+    let remaining_input_frames = total_input_frames - start_frame;
+    let target_output_frames =
+        ((remaining_input_frames as f32) / clamped_speed).round().max(1.0) as usize;
+
+    let mut stretch = Stretch::preset_default(ch as u32, sample_rate);
+    stretch.set_transpose_factor_semitones(pitch_semitones, None);
+
+    let input_latency = stretch.input_latency();
+    let output_latency = stretch.output_latency();
+
+    // Seek: prime the stretcher with the first `input_latency` frames.
+    if input_latency > 0 {
+        let seek_end = (start_frame + input_latency).min(total_input_frames);
+        let seek_len = seek_end - start_frame;
+        let mut seek_input = vec![0.0f32; input_latency * ch];
+        if seek_len > 0 {
+            let src = &samples[start_frame * ch..seek_end * ch];
+            seek_input[..seek_len * ch].copy_from_slice(src);
+        }
+        stretch.seek(&seek_input, clamped_speed as f64);
+    }
+
+    const BLOCK_OUT: usize = 4096;
+    let mut in_pos = start_frame + input_latency.min(remaining_input_frames);
+    let mut rendered = 0usize;
+    let mut skip_front = output_latency;
+
+    let max_in_len = ((BLOCK_OUT as f32) * clamped_speed).ceil().max(1.0) as usize;
+    let scratch_in_len = max_in_len.max(input_latency.max(1));
+    let mut input_scratch = vec![0.0f32; scratch_in_len * ch];
+    let mut output_chunk = vec![0.0f32; BLOCK_OUT * ch];
+
+    while rendered < target_output_frames {
+        if cancel.load(Ordering::Relaxed) {
+            return None;
+        }
+
+        let out_len = (target_output_frames - rendered).min(BLOCK_OUT);
+        let in_len = ((out_len as f32) * clamped_speed).ceil().max(1.0) as usize;
+
+        if in_pos + in_len <= total_input_frames {
+            let input_chunk = &samples[in_pos * ch..(in_pos + in_len) * ch];
+            in_pos += in_len;
+            stretch.process(input_chunk, &mut output_chunk[..out_len * ch]);
+        } else {
+            let available = total_input_frames.saturating_sub(in_pos).min(in_len);
+            if available > 0 {
+                let src = &samples[in_pos * ch..(in_pos + available) * ch];
+                input_scratch[..available * ch].copy_from_slice(src);
+                in_pos += available;
+            }
+            if available < in_len {
+                input_scratch[available * ch..in_len * ch].fill(0.0);
+            }
+            stretch.process(&input_scratch[..in_len * ch], &mut output_chunk[..out_len * ch]);
+        }
+
+        let skip_frames = skip_front.min(out_len);
+        skip_front -= skip_frames;
+        let usable = &output_chunk[skip_frames * ch..out_len * ch];
+        if !usable.is_empty() {
+            if tx.send(usable.to_vec()).is_err() {
+                return None;
+            }
+        }
+        rendered += out_len;
+    }
+
+    // Flush remaining output latency
+    if output_latency > 0 {
+        let mut flushed = 0usize;
+        while flushed < output_latency {
+            if cancel.load(Ordering::Relaxed) {
+                return None;
+            }
+            let len = (output_latency - flushed).min(BLOCK_OUT);
+            stretch.flush(&mut output_chunk[..len * ch]);
+            let skip_frames = skip_front.min(len);
+            skip_front -= skip_frames;
+            let usable = &output_chunk[skip_frames * ch..len * ch];
+            if !usable.is_empty() {
+                if tx.send(usable.to_vec()).is_err() {
+                    return None;
+                }
+            }
+            flushed += len;
+        }
+    }
+
+    Some(())
+}
+
 pub fn get_ffmpeg_command() -> std::process::Command {
     let ffmpeg_exe = if cfg!(windows) {
         "ffmpeg.exe"

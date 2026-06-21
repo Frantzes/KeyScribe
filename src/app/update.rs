@@ -114,6 +114,7 @@ impl eframe::App for KeyScribeApp {
         self.poll_processing_result();
         self.poll_separation_result();
         self.poll_stem_analysis_result();
+        self.poll_streaming_playback();
         self.poll_sheet_preview(ctx);
         self.poll_sheet_rendering(ctx);
         self.sync_playhead_from_engine();

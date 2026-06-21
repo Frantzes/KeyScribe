@@ -52,6 +52,8 @@ struct ArcSamplesSource {
     channels: u16,
     sample_rate: u32,
     fade_frames: usize,
+    fade_in: bool,
+    fade_out: bool,
     consumed: Arc<AtomicUsize>,
 }
 
@@ -73,6 +75,36 @@ impl ArcSamplesSource {
             channels,
             sample_rate,
             fade_frames,
+            fade_in: true,
+            fade_out: true,
+            consumed,
+        }
+    }
+
+    /// Create a source with explicit fade control. Used for streaming
+    /// time-stretch where chunk boundaries must be seamless (no fades)
+    /// to prevent amplitude modulation artifacts.
+    fn new_with_fades(
+        samples: Arc<Vec<f32>>,
+        start_idx: usize,
+        end_idx: usize,
+        channels: u16,
+        sample_rate: u32,
+        consumed: Arc<AtomicUsize>,
+        fade_in: bool,
+        fade_out: bool,
+    ) -> Self {
+        let fade_frames = (sample_rate as f32 * 0.005) as usize; // 5ms fade
+        Self {
+            samples,
+            idx: start_idx,
+            start: start_idx,
+            end: end_idx,
+            channels,
+            sample_rate,
+            fade_frames,
+            fade_in,
+            fade_out,
             consumed,
         }
     }
@@ -94,10 +126,10 @@ impl Iterator for ArcSamplesSource {
         let frame_idx = (self.idx - self.start) / ch;
         let total_frames = (self.end - self.start) / ch;
         
-        if frame_idx < self.fade_frames {
+        if self.fade_in && frame_idx < self.fade_frames {
             let fade = frame_idx as f32 / self.fade_frames as f32;
             value *= fade;
-        } else if total_frames.saturating_sub(frame_idx) <= self.fade_frames {
+        } else if self.fade_out && total_frames.saturating_sub(frame_idx) <= self.fade_frames {
             let remain = total_frames.saturating_sub(frame_idx);
             let fade = remain as f32 / self.fade_frames as f32;
             value *= fade;
@@ -503,6 +535,125 @@ impl AudioEngine {
             self.started_at = Some(Instant::now());
             self.is_playing = true;
         }
+
+        Ok(())
+    }
+
+    /// Append a chunk of stretched audio to the running sink for streaming
+    /// time-stretch. Unlike `append_samples`, this uses NO fades at chunk
+    /// boundaries to prevent amplitude modulation artifacts. The consumed
+    /// counter stays continuous across chunks for accurate clock tracking.
+    pub fn append_streaming_chunk(
+        &mut self,
+        samples: &[f32],
+        channels: u16,
+        sample_rate: u32,
+        timeline_rate: f32,
+    ) -> Result<()> {
+        if samples.is_empty() || sample_rate == 0 {
+            return Ok(());
+        }
+
+        let channels = channels.max(1);
+        let channels_usize = channels as usize;
+        let frame_count = samples.len() / channels_usize;
+        if frame_count == 0 {
+            return Ok(());
+        }
+
+        let Some(sink) = self.sink.as_ref() else {
+            return Ok(());
+        };
+
+        let timeline_rate = timeline_rate.clamp(0.25, 4.0);
+        let data = Arc::new(samples[..frame_count * channels_usize].to_vec());
+        let total = data.len();
+        let shared_consumed = self
+            .consumed_samples
+            .clone()
+            .unwrap_or_else(|| Arc::new(AtomicUsize::new(0)));
+        // No fade-in or fade-out — seamless chunk boundaries
+        let source = ArcSamplesSource::new_with_fades(
+            data,
+            0,
+            total,
+            channels,
+            sample_rate,
+            Arc::clone(&shared_consumed),
+            false,
+            false,
+        );
+        sink.append(source);
+        self.duration_sec += (frame_count as f32 / sample_rate as f32) * timeline_rate;
+        self.timeline_rate = timeline_rate;
+        self.consumed_samples = Some(shared_consumed);
+        self.playback_channels = channels;
+        self.playback_sample_rate = sample_rate;
+
+        // If playback reached queue end and new audio arrives, resume timeline tracking.
+        if !self.is_playing && !sink.is_paused() {
+            self.started_at = Some(Instant::now());
+            self.is_playing = true;
+        }
+
+        Ok(())
+    }
+
+    /// Start playback of the first streaming chunk. Uses a fade-in to prevent
+    /// a click at playback start, but NO fade-out so the next chunk can be
+    /// appended seamlessly.
+    pub fn play_streaming_first_chunk(
+        &mut self,
+        samples: &[f32],
+        channels: u16,
+        sample_rate: u32,
+        timeline_start_sec: f32,
+        timeline_rate: f32,
+    ) -> Result<()> {
+        self.stop();
+
+        if samples.is_empty() || sample_rate == 0 {
+            return Ok(());
+        }
+
+        let channels = channels.max(1);
+        let channels_usize = channels as usize;
+        let frame_count = samples.len() / channels_usize;
+        if frame_count == 0 {
+            return Ok(());
+        }
+
+        let timeline_rate = timeline_rate.clamp(0.25, 4.0);
+        let sink = Sink::try_new(&self.stream_handle).context("Failed to create playback sink")?;
+        sink.set_volume(self.volume.clamp(0.0, 1.5));
+        let consumed = Arc::new(AtomicUsize::new(0));
+        let data = Arc::new(samples[..frame_count * channels_usize].to_vec());
+        let total = data.len();
+        // Fade-in only, no fade-out — next chunk will be appended seamlessly
+        let source = ArcSamplesSource::new_with_fades(
+            data,
+            0,
+            total,
+            channels,
+            sample_rate,
+            Arc::clone(&consumed),
+            true,
+            false,
+        );
+
+        sink.append(source);
+        sink.play();
+
+        let duration = frame_count as f32 / sample_rate as f32;
+        self.start_pos_sec = timeline_start_sec.max(0.0);
+        self.duration_sec = self.start_pos_sec + duration * timeline_rate;
+        self.timeline_rate = timeline_rate;
+        self.started_at = Some(Instant::now());
+        self.is_playing = true;
+        self.sink = Some(sink);
+        self.consumed_samples = Some(consumed);
+        self.playback_channels = channels;
+        self.playback_sample_rate = sample_rate;
 
         Ok(())
     }
