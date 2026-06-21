@@ -168,7 +168,8 @@ if [[ -z "$BINARY_PATH" ]]; then
 fi
 
 MODEL_SOURCE_DIR="$REPO_ROOT/models"
-mapfile -t MODEL_FILES < <(find "$MODEL_SOURCE_DIR" -maxdepth 1 -type f -name '*.onnx' | sort)
+MODEL_FILES=()
+while IFS= read -r; do MODEL_FILES+=("$REPLY"); done < <(find "$MODEL_SOURCE_DIR" -maxdepth 1 -type f -name '*.onnx' | sort)
 if [[ ${#MODEL_FILES[@]} -eq 0 ]]; then
     echo "Missing model files in models/" >&2
     exit 1
