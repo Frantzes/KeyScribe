@@ -81,11 +81,14 @@ exit /b 0
         Write-Warning "Close Keyscribe, then run apply-update.cmd in $bundleDir to finish replacing the executable."
     }
 
-    $modelPath = Join-Path $repoRoot "models/basic-pitch.onnx"
-    if (-not (Test-Path $modelPath)) {
-        throw "Missing model file: models/basic-pitch.onnx"
+    $modelSourceDir = Join-Path $repoRoot "models"
+    $modelFiles = @(Get-ChildItem -Path $modelSourceDir -Filter "*.onnx" -File -ErrorAction Stop)
+    if ($modelFiles.Count -eq 0) {
+        throw "Missing model files in models/"
     }
-    Copy-Item -Path $modelPath -Destination (Join-Path $modelsDir "basic-pitch.onnx") -Force
+    foreach ($modelFile in $modelFiles) {
+        Copy-Item -Path $modelFile.FullName -Destination (Join-Path $modelsDir $modelFile.Name) -Force
+    }
 
     $directMlCandidates = @(
         (Join-Path $repoRoot "target/$Target/release/DirectML.dll"),
@@ -113,16 +116,52 @@ exit /b 0
         Write-Warning "DirectML.dll not found. If the app fails to start on another machine, include DirectML.dll next to keyscribe.exe."
     }
 
+    # --- FFmpeg Bundling ---
+    $ffmpegDir = Join-Path $repoRoot "vendor/ffmpeg"
+    $ffmpegExePath = Join-Path $ffmpegDir "ffmpeg.exe"
+    
+    if (-not (Test-Path $ffmpegExePath)) {
+        Write-Host "FFmpeg not found in vendor/ffmpeg. Downloading static build..."
+        New-Item -ItemType Directory -Path $ffmpegDir -Force | Out-Null
+        
+        $ffmpegZip = Join-Path $ffmpegDir "ffmpeg.zip"
+        # Using the BtbN GPL static build from the aggregator site (points to github releases)
+        $ffmpegUrl = "https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-master-latest-win64-gpl.zip"
+        
+        Invoke-WebRequest -Uri $ffmpegUrl -OutFile $ffmpegZip
+        
+        Write-Host "Extracting FFmpeg..."
+        Expand-Archive -Path $ffmpegZip -DestinationPath $ffmpegDir -Force
+        
+        # The zip contains a subfolder like ffmpeg-7.1-essentials_build/bin/ffmpeg.exe
+        $extractedExe = Get-ChildItem -Path $ffmpegDir -Filter "ffmpeg.exe" -Recurse | Select-Object -First 1
+        if ($extractedExe) {
+            Move-Item -Path $extractedExe.FullName -Destination $ffmpegExePath -Force
+        }
+        
+        Remove-Item -Path $ffmpegZip -Force
+        # Clean up the extra folders from the zip
+        Get-ChildItem -Path $ffmpegDir -Directory | Remove-Item -Recurse -Force
+    }
+
+    if (Test-Path $ffmpegExePath) {
+        Copy-Item -Path $ffmpegExePath -Destination (Join-Path $bundleDir "ffmpeg.exe") -Force
+        Write-Host "Included ffmpeg.exe from: $ffmpegExePath"
+    } else {
+        Write-Warning "Failed to prepare ffmpeg.exe. Video features may not work."
+    }
+
     $bundleReadmePath = Join-Path $bundleDir "README-portable.txt"
     Set-Content -Path $bundleReadmePath -Encoding UTF8 -Value @"
 KeyScribe portable Windows bundle
 
 Contents:
 - keyscribe.exe
-- models/basic-pitch.onnx
+- ffmpeg.exe
+- models/*.onnx
 - DirectML.dll (if discovered)
 
-Run keyscribe.exe from this folder so the relative model path works.
+Run keyscribe.exe from this folder so the relative model and ffmpeg paths work.
 "@
 
     $shouldZip = -not $SkipZip -and -not $PersonalUpdate

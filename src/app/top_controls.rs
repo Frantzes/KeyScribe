@@ -12,6 +12,44 @@ const CONTROLS_PANEL_VERTICAL_PADDING: f32 = UI_VSPACE_COMPACT;
 const SLIDER_PAIR_VERTICAL_SPACING: f32 = UI_VSPACE_TIGHT;
 const SHORTCUTS_MODAL_WIDTH: f32 = 470.0;
 
+fn get_dir_size(path: impl AsRef<std::path::Path>) -> std::io::Result<u64> {
+    let mut size = 0;
+    if path.as_ref().is_dir() {
+        for entry in std::fs::read_dir(path)? {
+            let entry = entry?;
+            let p = entry.path();
+            if p.is_dir() {
+                size += get_dir_size(&p).unwrap_or(0);
+            } else {
+                size += entry.metadata()?.len();
+            }
+        }
+    }
+    Ok(size)
+}
+
+fn format_size(size: u64) -> String {
+    let kb = size as f64 / 1024.0;
+    let mb = kb / 1024.0;
+    let gb = mb / 1024.0;
+
+    if gb >= 1.0 {
+        format!("{:.2} GB", gb)
+    } else if mb >= 1.0 {
+        format!("{:.2} MB", mb)
+    } else if kb >= 1.0 {
+        format!("{:.2} KB", kb)
+    } else {
+        format!("{} B", size)
+    }
+}
+
+#[derive(Clone)]
+struct SeparationModelOption {
+    label: String,
+    path: std::path::PathBuf,
+}
+
 impl KeyScribeApp {
     fn draw_toolbar_separator(ui: &mut egui::Ui) {
         Self::draw_toolbar_separator_with_bleed(ui, 0.0);
@@ -24,6 +62,122 @@ impl KeyScribeApp {
     fn responsive_menu_min_width(ui: &egui::Ui) -> f32 {
         let viewport_w = ui.ctx().input(|i| i.screen_rect().width());
         (viewport_w * 0.48).clamp(220.0, TOOLBAR_MENU_MIN_WIDTH)
+    }
+
+    fn available_separation_models() -> Vec<SeparationModelOption> {
+        let mut options = Vec::new();
+
+        // HTDemucs 6s is our primary model, now handled via Python
+        options.push(SeparationModelOption {
+            label: "HTDemucs (6 Stems)".to_string(),
+            path: std::path::PathBuf::from("htdemucs_6s"),
+        });
+
+        let mut seen_names = std::collections::BTreeSet::<String>::new();
+        seen_names.insert("htdemucs_6s".to_string());
+
+        for directory in Self::separation_model_search_dirs() {
+            let Ok(entries) = std::fs::read_dir(&directory) else {
+                continue;
+            };
+
+            for entry in entries.flatten() {
+                let path = entry.path();
+                let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or("");
+                if stem.is_empty() || seen_names.contains(stem) {
+                    continue;
+                }
+
+                let is_onnx = path
+                    .extension()
+                    .and_then(|ext| ext.to_str())
+                    .map(|ext| ext.eq_ignore_ascii_case("onnx"))
+                    .unwrap_or(false);
+
+                if is_onnx && Self::is_supported_separation_model(path.as_path()) {
+                    seen_names.insert(stem.to_string());
+                    options.push(SeparationModelOption {
+                        label: Self::separation_model_label(path.as_path()),
+                        path,
+                    });
+                }
+            }
+        }
+
+        options.sort_by(|a, b| a.label.cmp(&b.label));
+        options
+    }
+
+    fn is_supported_separation_model(path: &std::path::Path) -> bool {
+        let stem = path
+            .file_stem()
+            .and_then(|value| value.to_str())
+            .unwrap_or("")
+            .to_ascii_lowercase();
+
+        // Skip basic-pitch which is a transcription model
+        if stem.contains("basic-pitch") || stem.contains("basic pitch") || stem.contains("pitch") {
+            return false;
+        }
+
+        // Skip models that we are now handling via Python/builtin
+        if stem == "htdemucs_6s" || stem == "kim_inst" {
+            return false;
+        }
+
+        stem.contains("demucs")
+            || stem.contains("htdemucs")
+            || stem.contains("inst")
+            || stem.contains("separat")
+            || stem.contains("stem")
+    }
+
+    fn separation_model_search_dirs() -> Vec<std::path::PathBuf> {
+        let mut dirs = Vec::new();
+
+        if let Ok(exe_path) = std::env::current_exe() {
+            if let Some(parent) = exe_path.parent() {
+                dirs.push(parent.join("models"));
+            }
+        }
+
+        dirs.push(std::path::PathBuf::from("models"));
+        dirs
+    }
+
+    fn separation_model_label(path: &std::path::Path) -> String {
+        let raw = path
+            .file_stem()
+            .and_then(|stem| stem.to_str())
+            .unwrap_or("Unknown model");
+        let pretty = raw.replace(['_', '-'], " ");
+        let mut chars = pretty.chars();
+        match chars.next() {
+            Some(first) => first.to_uppercase().collect::<String>() + chars.as_str(),
+            None => "Unknown model".to_string(),
+        }
+    }
+
+    pub(super) fn selected_separation_model_path(&self) -> Option<std::path::PathBuf> {
+        let options = Self::available_separation_models();
+        if options.is_empty() {
+            return None;
+        }
+
+        if let Some(selected) = &self.selected_separation_model_path {
+            if options.iter().any(|option| option.path == *selected) {
+                return Some(selected.clone());
+            }
+        }
+
+        if let Some(preferred) = options.iter().find(|option| {
+            let lower = option.label.to_ascii_lowercase();
+            lower.contains("htdemucs") || lower.contains("demucs")
+        }) {
+            return Some(preferred.path.clone());
+        }
+
+        options.first().map(|option| option.path.clone())
     }
 
     pub(super) fn draw_audio_settings_menu(&mut self, ui: &mut egui::Ui) {
@@ -121,11 +275,140 @@ impl KeyScribeApp {
         if preprocess_changed || cqt_changed {
             self.request_rebuild_preserving_playback();
         }
+
+        Self::draw_toolbar_separator(ui);
+
+        ui.label("Separation Model");
+        let models = Self::available_separation_models();
+        let selected_model_label = self
+            .selected_separation_model_path()
+            .and_then(|selected_path| {
+                models
+                    .iter()
+                    .find(|option| option.path == selected_path)
+                    .map(|option| option.label.clone())
+            })
+            .unwrap_or_else(|| "No models found".to_string());
+
+        egui::ComboBox::from_id_source("separation_model_selector")
+            .selected_text(selected_model_label)
+            .show_ui(ui, |ui| {
+                if models.is_empty() {
+                    ui.label(egui::RichText::new("Add one or more .onnx files in models/").weak());
+                }
+
+                for option in &models {
+                    let selected = self
+                        .selected_separation_model_path
+                        .as_ref()
+                        .map(|path| path == &option.path)
+                        .unwrap_or(false);
+
+                    if ui
+                        .selectable_label(selected, option.label.as_str())
+                        .clicked()
+                    {
+                        self.selected_separation_model_path = Some(option.path.clone());
+                        self.separated_stems = None;
+                        self.enabled_listening_indices.clear();
+                        self.enabled_stem_indices.clear();
+                        self.refresh_note_timeline_from_selected_stems();
+                    }
+                }
+            });
+
+        Self::draw_toolbar_separator(ui);
+
+        ui.horizontal(|ui| {
+            if self.is_separating {
+                ui.add_enabled(false, egui::Button::new("Separating..."));
+            } else if ui.button("Run Separation").clicked() {
+                self.run_instrument_separation();
+            }
+        });
+    }
+
+    pub(super) fn run_instrument_separation(&mut self) {
+        if self.is_separating {
+            return;
+        }
+
+        let Some(ref loaded_path) = self.loaded_path else {
+            self.last_error = Some("No audio file loaded for separation".to_string());
+            return;
+        };
+
+        let Some(ref song_hash) = self.loaded_audio_hash else {
+            self.last_error = Some("Audio hash not available".to_string());
+            return;
+        };
+
+        let model_name = self
+            .selected_separation_model_path()
+            .and_then(|p| p.file_stem().map(|s| s.to_string_lossy().to_string()))
+            .unwrap_or_else(|| "htdemucs_6s".to_string());
+
+        let canonical_path = loaded_path.canonicalize().unwrap_or_else(|_| loaded_path.clone());
+        let config = crate::leadsheet::SeparationConfig {
+            model_name,
+            song_hash: Some(song_hash.clone()),
+            source_path: Some(canonical_path),
+            cache_dir: Some(app_cache_base_dir()),
+        };
+
+        self.last_error = None;
+        let (tx, rx) = mpsc::channel::<SeparationResult>();
+        self.separation_rx = Some(rx);
+        self.is_separating = true;
+        self.separation_attempted = false;
+        self.separation_progress.store(0, Ordering::Release);
+
+        let progress_atomic = Arc::clone(&self.separation_progress);
+        thread::spawn(move || {
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let mut separator = match crate::leadsheet::InstrumentSeparator::new(config) {
+                    Ok(s) => s,
+                    Err(e) => {
+                        let _ = tx.send(SeparationResult {
+                            stems: Vec::new(),
+                            error: Some(format!("Failed to initialize separator: {e}")),
+                        });
+                        return;
+                    }
+                };
+
+                let progress_cb = Some(Box::new(move |p: f32| {
+                    progress_atomic.store((p * 1000.0) as u32, Ordering::Release);
+                }) as Box<dyn Fn(f32) + Send + Sync>);
+
+                match separator.separate(&[], 0, 0, progress_cb) {
+                    Ok(stems) => {
+                        let _ = tx.send(SeparationResult { stems, error: None });
+                    }
+                    Err(e) => {
+                        let _ = tx.send(SeparationResult {
+                            stems: Vec::new(),
+                            error: Some(format!("Separation failed: {e}")),
+                        });
+                    }
+                }
+            }));
+
+            if let Err(_) = result {
+                let _ = tx.send(SeparationResult {
+                    stems: Vec::new(),
+                    error: Some("Separation process panicked".to_string()),
+                });
+            }
+        });
     }
 
     pub(super) fn draw_preferences_menu(&mut self, ui: &mut egui::Ui) {
         setting_toggle_row(ui, &mut self.dark_mode, "Dark Mode");
         let _ = setting_toggle_row(ui, &mut self.show_note_hist_window, "Show Probability Pane");
+        let _ = setting_toggle_row(ui, &mut self.show_video_pane, "Show Video Pane");
+        let _ = setting_toggle_row(ui, &mut self.show_chord_suggestions, "Show Chord Suggestions");
+        let _ = setting_toggle_row(ui, &mut self.auto_separate, "Separate Instruments Automatically");
         Self::draw_toolbar_separator(ui);
 
         ui.label("Highlight Presets");
@@ -246,6 +529,35 @@ impl KeyScribeApp {
                 }
             });
         }
+
+        Self::draw_toolbar_separator(ui);
+
+        if self.cache_size_bytes.is_none() {
+            let cache_dir = crate::app::analysis_cache_dir();
+            let legacy_dir = crate::app::app_cache_base_dir().join(".transcriber_cache");
+            let stems_dir = crate::app::app_cache_base_dir().join("stems");
+            let size = get_dir_size(&cache_dir).unwrap_or(0) 
+                     + get_dir_size(&legacy_dir).unwrap_or(0)
+                     + get_dir_size(&stems_dir).unwrap_or(0);
+            self.cache_size_bytes = Some(Some(size));
+        }
+
+        let size_text = match self.cache_size_bytes {
+            Some(Some(size)) => format!(" ({})", format_size(size)),
+            _ => String::new(),
+        };
+
+        if ui.button(format!("Clean cache{}", size_text)).clicked() {
+            let cache_dir = crate::app::analysis_cache_dir();
+            let legacy_dir = crate::app::app_cache_base_dir().join(".transcriber_cache");
+            let stems_dir = crate::app::app_cache_base_dir().join("stems");
+            let _ = std::fs::remove_dir_all(&cache_dir);
+            let _ = std::fs::create_dir_all(&cache_dir);
+            let _ = std::fs::remove_dir_all(&legacy_dir);
+            let _ = std::fs::remove_dir_all(&stems_dir);
+            let _ = std::fs::create_dir_all(&stems_dir);
+            self.cache_size_bytes = Some(Some(0));
+        }
     }
 
     #[cfg(not(feature = "desktop-ui"))]
@@ -303,6 +615,29 @@ impl KeyScribeApp {
                 });
             });
 
+            ui.menu_button("Export", |ui| {
+                ui.set_min_width(Self::responsive_menu_min_width(ui));
+                
+                let has_stems = self.separated_stems.is_some();
+                let can_export_midi = has_stems || !self.note_timeline.is_empty();
+                if ui.add_enabled(has_stems, egui::Button::new("Export Stems...")).clicked() {
+                    self.export_stems_modal_open = true;
+                    if let Some(stems) = &self.separated_stems {
+                        self.export_selected_stems = stems.iter().map(|s| s.stem_type.clone()).collect();
+                    }
+                    ui.close_menu();
+                }
+                
+                if ui.add_enabled(can_export_midi, egui::Button::new("Export MIDI...")).clicked() {
+                    self.export_midi_modal_open = true;
+                    self.export_full_mix_midi = !self.note_timeline.is_empty();
+                    if let Some(stems) = &self.separated_stems {
+                        self.export_selected_stems = stems.iter().map(|s| s.stem_type.clone()).collect();
+                    }
+                    ui.close_menu();
+                }
+            });
+
             ui.menu_button("Settings", |ui| {
                 ui.set_min_width(Self::responsive_menu_min_width(ui));
                 self.draw_audio_settings_menu(ui);
@@ -352,10 +687,6 @@ impl KeyScribeApp {
                     .spacing([14.0, 8.0])
                     .striped(true)
                     .show(ui, |ui| {
-                        ui.monospace("Space");
-                        ui.label("Replay from the selected time");
-                        ui.end_row();
-
                         ui.monospace("K");
                         ui.label("Play or pause");
                         ui.end_row();
@@ -369,10 +700,83 @@ impl KeyScribeApp {
                         ui.end_row();
 
                         ui.monospace("Ctrl + Left/Right Arrow");
-                        ui.label("Shift loop range by 5 seconds (when loop is active)");
+                        ui.label("Shift loop range by 1 second (when loop is active)");
                         ui.end_row();
                     });
 
+                ui.add_space(UI_VSPACE_COMPACT);
+                ui.label("Waveform Navigation");
+                egui::Grid::new("waveform_nav_help_grid")
+                    .num_columns(2)
+                    .min_col_width(140.0)
+                    .spacing([14.0, 8.0])
+                    .striped(true)
+                    .show(ui, |ui| {
+                        ui.monospace("Ctrl + Scroll Wheel Up");
+                        ui.label("Zoom in on the waveform");
+                        ui.end_row();
+
+                        ui.monospace("Ctrl + Scroll Wheel Down");
+                        ui.label("Zoom out on the waveform");
+                        ui.end_row();
+
+                        ui.monospace("Shift + Scroll Wheel Up");
+                        ui.label("Navigate forward in time");
+                        ui.end_row();
+
+                        ui.monospace("Shift + Scroll Wheel Down");
+                        ui.label("Navigate backward in time");
+                        ui.end_row();
+                    });
+
+                ui.add_space(UI_VSPACE_COMPACT);
+                ui.label("Markers & Looping");
+                egui::Grid::new("markers_help_grid")
+                    .num_columns(2)
+                    .min_col_width(140.0)
+                    .spacing([14.0, 8.0])
+                    .striped(true)
+                    .show(ui, |ui| {
+                        ui.monospace("L");
+                        ui.label("Toggle loop on/off");
+                        ui.end_row();
+
+                        ui.monospace("Space");
+                        ui.label("If looping, jump to beginning of loop");
+                        ui.end_row();
+
+                        ui.monospace("M");
+                        ui.label("Add a marker at the current playhead");
+                        ui.end_row();
+
+                        ui.monospace("Right Click on Waveform");
+                        ui.label("Add a marker at your cursor");
+                        ui.end_row();
+
+                        ui.monospace("Left Click Marker Letter");
+                        ui.label("Jump directly to the marker's time");
+                        ui.end_row();
+
+                        ui.monospace("Right Click Marker Letter");
+                        ui.label("Open menu to loop, edit precise time, or delete");
+                        ui.end_row();
+
+                        ui.monospace("Right Click Drag Marker");
+                        ui.label("Move marker smoothly");
+                        ui.end_row();
+
+                        ui.monospace("Left Click Drag Waveform");
+                        ui.label("Create a loop selection");
+                        ui.end_row();
+
+                        ui.monospace("Type Letter in Loop Box");
+                        ui.label("Snap the loop point to that marker's time");
+                        ui.end_row();
+                    });
+
+                ui.add_space(UI_VSPACE_COMPACT);
+                ui.label(egui::RichText::new("Run separation to load instrument stems. You can enable automatic separation in Settings (Recommended unless you have a very very old computer).").weak());
+                
                 ui.add_space(UI_VSPACE_COMPACT);
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     if ui.button("Close").clicked() {
@@ -800,6 +1204,9 @@ impl KeyScribeApp {
                                 "Analyzing track in background... waveform and playback stay available."
                             }
                             RebuildMode::ParametersPreview => "Buffering speed/pitch preview...",
+                            _ if speed_pitch_is_identity(self.speed, self.pitch_semitones) => {
+                                "Building playback buffer..."
+                            }
                             _ => "Rendering full speed/pitch update...",
                         };
                         let processing_color = egui::Color32::from_rgb(
@@ -850,6 +1257,7 @@ impl KeyScribeApp {
                     };
 
                     let show_rendered_row = self.is_audio_loading;
+                    let show_separation_row = self.is_separating;
                     let transcription_ready_from_cache = self.preprocess_audio
                         && self.loading_cache_timeline_preloaded
                         && !self.note_timeline.is_empty()
@@ -863,7 +1271,7 @@ impl KeyScribeApp {
                             && !transcription_ready_from_cache
                     };
 
-                    if show_rendered_row || show_transcribed_row {
+                    if show_rendered_row || show_transcribed_row || show_separation_row {
                         let draw_progress_row =
                             |ui: &mut egui::Ui,
                              label: &str,
@@ -920,6 +1328,17 @@ impl KeyScribeApp {
                                 buffered_ratio,
                                 self.loading_total_samples.is_none(),
                                 rendered_detail.as_str(),
+                            );
+                        }
+
+                        if show_separation_row {
+                            let progress = self.separation_progress.load(Ordering::Acquire) as f32 / 1000.0;
+                            draw_progress_row(
+                                ui,
+                                "Separating",
+                                progress,
+                                true,
+                                &format!("{:.0}% complete", progress * 100.0),
                             );
                         }
 
@@ -989,6 +1408,6 @@ impl KeyScribeApp {
                 });
         });
 
-            self.draw_keyboard_shortcuts_modal(ctx);
+        self.draw_keyboard_shortcuts_modal(ctx);
     }
 }

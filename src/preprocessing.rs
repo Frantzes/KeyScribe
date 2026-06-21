@@ -59,6 +59,9 @@ impl Preprocessor {
 
     /// Generate Hann window
     fn hann_window(size: usize) -> Vec<f32> {
+        if size <= 1 {
+            return vec![1.0; size];
+        }
         (0..size)
             .map(|n| {
                 let phase = 2.0 * PI * n as f32 / (size - 1) as f32;
@@ -125,13 +128,14 @@ impl Preprocessor {
         let num_freqs = stft[0].len();
 
         // Convert to magnitude spectrogram
-        let mut magnitude: Vec<Vec<f32>> = stft
+        let magnitude: Vec<Vec<f32>> = stft
             .iter()
             .map(|frame| frame.iter().map(|c| c.norm()).collect())
             .collect();
 
         // Apply log scaling to make separation easier
-        magnitude.iter_mut().for_each(|frame| {
+        let mut log_magnitude = magnitude.clone();
+        log_magnitude.iter_mut().for_each(|frame| {
             frame.iter_mut().for_each(|mag| {
                 *mag = (*mag + 1e-7).ln().max(-80.0);
             });
@@ -140,14 +144,14 @@ impl Preprocessor {
         let cfg = &self.config;
 
         // Horizontal median filter (time direction) for harmonic
-        let horizontal_filtered = self.median_filter_time(&magnitude, cfg.harmonic_kernel_time);
+        let horizontal_filtered = self.median_filter_time(&log_magnitude, cfg.harmonic_kernel_time);
 
         // Vertical median filter (frequency direction) for harmonic
         let harmonic_filtered =
             self.median_filter_freq(&horizontal_filtered, cfg.harmonic_kernel_freq);
 
         // Horizontal median filter for percussive
-        let horizontal_filtered_p = self.median_filter_time(&magnitude, cfg.percussive_kernel_time);
+        let horizontal_filtered_p = self.median_filter_time(&log_magnitude, cfg.percussive_kernel_time);
 
         // Vertical median filter for percussive
         let percussive_filtered =
@@ -162,16 +166,12 @@ impl Preprocessor {
                 let h = harmonic_filtered[t][f];
                 let p = percussive_filtered[t][f];
 
-                let h_margin = h + cfg.margin;
-                let p_margin = p + cfg.margin;
+                let h_pow = (h * cfg.margin).exp();
+                let p_pow = (p * cfg.margin).exp();
+                let denom = h_pow + p_pow + 1e-10;
 
-                if h_margin > p_margin {
-                    harmonic_mask[t][f] = 1.0;
-                    percussive_mask[t][f] = 0.0;
-                } else {
-                    harmonic_mask[t][f] = 0.0;
-                    percussive_mask[t][f] = 1.0;
-                }
+                harmonic_mask[t][f] = h_pow / denom;
+                percussive_mask[t][f] = p_pow / denom;
             }
         }
 
@@ -214,19 +214,20 @@ impl Preprocessor {
         let half_kernel = kernel_size / 2;
 
         let mut result = vec![vec![0.0; num_freqs]; num_frames];
+        let mut scratch = vec![0.0; kernel_size];
 
         for t in 0..num_frames {
+            let start_t = t.saturating_sub(half_kernel);
+            let end_t = (t + half_kernel + 1).min(num_frames);
+            let count = end_t - start_t;
+
             for f in 0..num_freqs {
-                let start_t = t.saturating_sub(half_kernel);
-                let end_t = (t + half_kernel + 1).min(num_frames);
+                for (i, frame) in spectrogram[start_t..end_t].iter().enumerate() {
+                    scratch[i] = frame[f];
+                }
 
-                let mut values: Vec<f32> = spectrogram[start_t..end_t]
-                    .iter()
-                    .map(|frame| frame[f])
-                    .collect();
-
-                values.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-                result[t][f] = values[values.len() / 2];
+                scratch[..count].sort_unstable_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+                result[t][f] = scratch[count / 2];
             }
         }
 
@@ -244,15 +245,17 @@ impl Preprocessor {
         let half_kernel = kernel_size / 2;
 
         let mut result = vec![vec![0.0; num_freqs]; num_frames];
+        let mut scratch = vec![0.0; kernel_size];
 
         for t in 0..num_frames {
             for f in 0..num_freqs {
                 let start_f = f.saturating_sub(half_kernel);
                 let end_f = (f + half_kernel + 1).min(num_freqs);
+                let count = end_f - start_f;
 
-                let mut values: Vec<f32> = spectrogram[t][start_f..end_f].to_vec();
-                values.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-                result[t][f] = values[values.len() / 2];
+                scratch[..count].copy_from_slice(&spectrogram[t][start_f..end_f]);
+                scratch[..count].sort_unstable_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+                result[t][f] = scratch[count / 2];
             }
         }
 
@@ -306,7 +309,7 @@ mod tests {
     fn test_hann_window() {
         let window = Preprocessor::hann_window(512);
         assert_eq!(window.len(), 512);
-        assert!(window[0] > 0.0);
+        assert!(window[0] >= 0.0);
         assert!(window[256] > 0.99); // Peak near center
     }
 

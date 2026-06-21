@@ -20,6 +20,19 @@ pub fn build_waveform_for_processed(
             pt[0] *= speed_for_waveform;
         }
     }
+    // Peak-normalize the waveform for visualization: scale amplitudes so the
+    // loudest point reaches ±1.0 and fills the display height. Playback audio
+    // is untouched.
+    let max_amp = waveform
+        .iter()
+        .map(|pt| pt[1].abs())
+        .fold(0.0f64, f64::max);
+    if max_amp > f64::EPSILON {
+        let scale = 1.0 / max_amp;
+        for pt in &mut waveform {
+            pt[1] *= scale;
+        }
+    }
     waveform
 }
 

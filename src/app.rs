@@ -20,16 +20,18 @@ use serde::{Deserialize, Serialize};
 use rfd::FileDialog;
 
 use crate::analysis::{
-    analyze_with_full_pipeline, detect_note_probabilities, detect_note_probabilities_cqt_preview,
-    PIANO_HIGH_MIDI, PIANO_LOW_MIDI,
+    analyze_with_full_pipeline, detect_note_probabilities, PIANO_HIGH_MIDI, PIANO_KEY_COUNT,
+    PIANO_LOW_MIDI,
 };
 use crate::audio_io::{
     load_audio_file_streaming, load_audio_preview_chunk, AudioData, AudioPreviewChunk,
     StreamingAudioEvent,
 };
 use crate::core::processing::build_waveform_for_processed;
-use crate::dsp::{apply_speed_and_pitch, apply_speed_and_pitch_interleaved};
-use crate::playback::{available_output_devices, AudioEngine, AudioOutputDeviceOption};
+use crate::dsp::{apply_speed_and_pitch_interleaved, apply_speed_and_pitch_interleaved_with_cancel, apply_speed_and_pitch_with_cancel};
+use crate::leadsheet::StemType;
+use crate::leadsheet::LeadSheetFoundation;
+use crate::playback::{available_output_devices, AudioEngine, AudioOutputDeviceOption, ClockSnapshot};
 use crate::theme::{apply_brand_theme, ACCENT_PURPLE, ERROR_RED};
 use crate::ui::keyboard::{
     draw_piano_view, draw_probability_pane, keyboard_white_key_width, MIN_PIANO_KEY_HEIGHT,
@@ -40,13 +42,16 @@ use crate::ui::utils::{accent_soft, color_to_hex, parse_hex_color, push_recent_c
 use crate::ui::widgets::icon_button;
 
 mod cache;
+mod export;
 mod loading;
 mod media_controls;
 mod playback;
 mod processing;
 mod runtime;
+mod sheet_music;
 mod top_controls;
 mod update;
+mod video_player;
 use media_controls::{draw_media_controls, media_controls_height_for_width, setting_toggle_row};
 
 const STATE_FILE_NAME: &str = ".keyscribe_state.json";
@@ -55,11 +60,13 @@ const MAX_STATE_FILE_BYTES: u64 = 256 * 1024;
 const PROBABILITY_UPDATE_INTERVAL: Duration = Duration::from_millis(16);
 const KEY_HIGHLIGHT_MAX_SEC_MIN: f32 = 0.01;
 const KEY_HIGHLIGHT_MAX_SEC_MAX: f32 = 1.0;
+const VISUALIZATION_TIMING_OFFSET_MS_MIN: f32 = -500.0;
+const VISUALIZATION_TIMING_OFFSET_MS_MAX: f32 = 500.0;
 const NOTE_HIGHLIGHT_ACTIVATION_THRESHOLD: f32 = 0.12;
-const FFT_TIMELINE_STEP_SEC: f32 = 0.05;
 const FFT_WINDOW_SIZE: usize = 4096;
 const LOOP_MIN_DURATION_SEC: f32 = 0.01;
 const SEEK_STEP_SEC: f32 = 5.0;
+pub(crate) const AUTO_SEPARATE_MAX_DURATION_SEC: f64 = 600.0; // 10 minutes
 const PARAM_UPDATE_PREVIEW_SEC: f32 = 8.0;
 const PARAM_UPDATE_LIVE_DEBOUNCE: Duration = Duration::from_millis(120);
 const ANALYSIS_CACHE_DIR_NAME: &str = ".keyscribe_cache";
@@ -67,17 +74,17 @@ const LEGACY_ANALYSIS_CACHE_DIR_NAME: &str = ".transcriber_cache";
 const ANALYSIS_CACHE_LIBRARY_DIR_NAME: &str = "library";
 const ANALYSIS_CACHE_VERSION: u32 = 4;
 const ANALYSIS_CACHE_ZSTD_LEVEL: i32 = 9;
-const ANALYSIS_CACHE_MAX_COMPRESSED_BYTES: usize = 128 * 1024 * 1024;
-const ANALYSIS_CACHE_MAX_DECOMPRESSED_BYTES: usize = 1024 * 1024 * 1024;
+const ANALYSIS_CACHE_MAX_COMPRESSED_BYTES: usize = 4 * 1024 * 1024 * 1024;
+const ANALYSIS_CACHE_MAX_DECOMPRESSED_BYTES: usize = 8 * 1024 * 1024 * 1024;
 const ANALYSIS_CACHE_MAX_DECOMPRESS_RATIO: usize = 64;
-const ANALYSIS_CACHE_MAX_TIMELINE_FRAMES: usize = 120_000;
-const ANALYSIS_CACHE_MAX_WAVEFORM_POINTS: usize = 64_000;
-const STARTUP_MAX_AUDIO_FILE_BYTES: u64 = 2 * 1024 * 1024 * 1024;
+const ANALYSIS_CACHE_MAX_TIMELINE_FRAMES: usize = 10_000_000;
+const ANALYSIS_CACHE_MAX_WAVEFORM_POINTS: usize = 5_000_000;
+const STARTUP_MAX_AUDIO_FILE_BYTES: u64 = 10 * 1024 * 1024 * 1024;
 const ALBUM_ART_MAX_BYTES: usize = 32 * 1024 * 1024;
 const ALBUM_ART_MAX_DIMENSION: usize = 4096;
-const AUDIO_STREAM_CHUNK_SAMPLES: usize = 44_100;
-const AUDIO_LOADING_MAX_EVENTS_PER_FRAME: usize = 2;
-const STREAMING_WAVEFORM_REBUILD_INTERVAL: Duration = Duration::from_millis(220);
+const AUDIO_STREAM_CHUNK_SAMPLES: usize = 441_000;
+const AUDIO_LOADING_MAX_EVENTS_PER_FRAME: usize = 8;
+const STREAMING_WAVEFORM_REBUILD_INTERVAL: Duration = Duration::from_millis(1000);
 const STREAMING_WAVEFORM_REBUILD_SAMPLE_DELTA: usize = AUDIO_STREAM_CHUNK_SAMPLES * 2;
 const LOADING_PREVIEW_CACHE_CHUNK_SEC: f32 = 16.0;
 const LOADING_PREVIEW_CACHE_STRIDE_SEC: f32 = 8.0;
@@ -149,8 +156,16 @@ fn default_key_highlight_max_sec() -> f32 {
     0.1
 }
 
+fn default_visualization_timing_offset_ms() -> f32 {
+    0.0
+}
+
 fn default_playback_volume() -> f32 {
     0.8
+}
+
+fn default_piano_scale() -> f32 {
+    1.0
 }
 
 fn default_audio_quality_mode() -> AudioQualityMode {
@@ -203,8 +218,31 @@ fn default_dark_mode() -> bool {
     true
 }
 
+fn default_video_panel_height() -> f32 {
+    300.0
+}
+
 fn default_use_cqt_analysis() -> bool {
     true
+}
+
+fn default_auto_separate() -> bool {
+    false
+}
+
+fn assign_stem_colors(stems: &[crate::leadsheet::SeparatedStem]) -> Vec<egui::Color32> {
+    stems
+        .iter()
+        .map(|s| match s.stem_type {
+            StemType::Vocals => egui::Color32::from_rgb(255, 170, 60),
+            StemType::Bass => egui::Color32::from_rgb(72, 162, 255),
+            StemType::Piano => egui::Color32::from_rgb(148, 106, 255),
+            StemType::Guitar => egui::Color32::from_rgb(56, 204, 142),
+            StemType::Drums => egui::Color32::from_rgb(160, 160, 160),
+            StemType::Other => egui::Color32::from_rgb(238, 190, 73),
+            StemType::Custom(_) => egui::Color32::from_rgb(220, 160, 220),
+        })
+        .collect()
 }
 
 fn default_highlight_hex() -> String {
@@ -222,7 +260,36 @@ fn push_recent_file_path(recent_paths: &mut Vec<PathBuf>, path: &Path) {
     recent_paths.truncate(MAX_RECENT_FILES);
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(serde::Deserialize, serde::Serialize, Clone)]
+#[serde(untagged)]
+pub enum MarkerData {
+    Legacy(f32),
+    Detailed { time: f32, desc: String },
+}
+
+impl MarkerData {
+    pub fn time(&self) -> f32 {
+        match self {
+            Self::Legacy(t) => *t,
+            Self::Detailed { time, .. } => *time,
+        }
+    }
+    pub fn desc(&self) -> &str {
+        match self {
+            Self::Legacy(_) => "",
+            Self::Detailed { desc, .. } => desc,
+        }
+    }
+    pub fn set_time(&mut self, new_time: f32) {
+        *self = Self::Detailed { time: new_time, desc: self.desc().to_string() };
+    }
+    pub fn set_desc(&mut self, new_desc: String) {
+        *self = Self::Detailed { time: self.time(), desc: new_desc };
+    }
+}
+
+#[derive(serde::Deserialize, serde::Serialize)]
+#[serde(default)]
 struct PersistedState {
     last_file: Option<PathBuf>,
     #[serde(default)]
@@ -234,12 +301,20 @@ struct PersistedState {
     key_color_sensitivity: f32,
     #[serde(default = "default_key_highlight_max_sec")]
     key_highlight_max_sec: f32,
+    #[serde(default = "default_visualization_timing_offset_ms")]
+    visualization_timing_offset_ms: f32,
     piano_zoom: f32,
     piano_key_height: f32,
+    #[serde(default = "default_piano_scale")]
+    piano_scale: f32,
     waveform_panel_height: f32,
     probability_panel_height: f32,
     piano_panel_height: f32,
+    #[serde(default = "default_video_panel_height")]
+    video_panel_height: f32,
     show_note_hist_window: bool,
+    #[serde(default)]
+    show_video_pane: bool,
     #[serde(default = "default_use_cqt_analysis")]
     use_cqt_analysis: bool,
     #[serde(default = "default_preprocess_audio")]
@@ -258,6 +333,20 @@ struct PersistedState {
     highlight_hex: String,
     #[serde(default)]
     recent_highlight_hex: Vec<String>,
+    #[serde(default)]
+    saved_visualize_stem_indices: Option<Vec<usize>>,
+    #[serde(default)]
+    saved_listen_stem_indices: Option<Vec<usize>>,
+    #[serde(default)]
+    sheet_use_musescore: bool,
+    #[serde(default)]
+    auto_separate: bool,
+    #[serde(default)]
+    file_markers: std::collections::HashMap<String, Vec<MarkerData>>,
+    /// Per-file playback positions (keyed by file hash) so the app can
+    /// resume from where the user left off when reopening a file.
+    #[serde(default)]
+    file_positions: std::collections::HashMap<String, f32>,
 }
 
 impl Default for PersistedState {
@@ -270,12 +359,16 @@ impl Default for PersistedState {
             pitch_semitones: 0.0,
             key_color_sensitivity: default_key_color_sensitivity(),
             key_highlight_max_sec: default_key_highlight_max_sec(),
+            visualization_timing_offset_ms: default_visualization_timing_offset_ms(),
             piano_zoom: 1.0,
             piano_key_height: 72.0,
+            piano_scale: 1.0,
             waveform_panel_height: 320.0,
             probability_panel_height: 130.0,
             piano_panel_height: 170.0,
+            video_panel_height: 300.0,
             show_note_hist_window: true,
+            show_video_pane: true,
             use_cqt_analysis: default_use_cqt_analysis(),
             preprocess_audio: true,
             playback_volume: 0.8,
@@ -285,6 +378,12 @@ impl Default for PersistedState {
             dark_mode: true,
             highlight_hex: default_highlight_hex(),
             recent_highlight_hex: Vec::new(),
+            saved_visualize_stem_indices: None,
+            saved_listen_stem_indices: None,
+            sheet_use_musescore: false,
+            auto_separate: default_auto_separate(),
+            file_markers: std::collections::HashMap::new(),
+            file_positions: std::collections::HashMap::new(),
         }
     }
 }
@@ -366,7 +465,7 @@ fn app_data_dir() -> PathBuf {
     app_portable_base_dir()
 }
 
-fn app_cache_base_dir() -> PathBuf {
+pub(crate) fn app_cache_base_dir() -> PathBuf {
     if is_running_from_macos_app_bundle() {
         if let Some(project_dirs) = app_project_dirs() {
             return project_dirs.cache_dir().to_path_buf();
@@ -382,14 +481,14 @@ fn ensure_parent_dir(path: &Path) -> bool {
         .unwrap_or(true)
 }
 
-fn is_supported_audio_extension(path: &Path) -> bool {
+fn is_supported_media_extension(path: &Path) -> bool {
     let Some(ext) = path.extension().and_then(|ext| ext.to_str()) else {
         return false;
     };
 
     matches!(
         ext.to_ascii_lowercase().as_str(),
-        "wav" | "mp3" | "flac" | "ogg" | "m4a" | "aac"
+        "wav" | "mp3" | "flac" | "ogg" | "m4a" | "aac" | "mp4" | "mkv" | "avi" | "mov" | "webm"
     )
 }
 
@@ -416,7 +515,7 @@ fn is_safe_startup_audio_path(path: &Path) -> bool {
     if !path.is_absolute() || is_windows_network_path(path) {
         return false;
     }
-    if !is_supported_audio_extension(path) || !path.is_file() {
+    if !is_supported_media_extension(path) || !path.is_file() {
         return false;
     }
 
@@ -479,11 +578,11 @@ fn unpack_waveform_points(points: &[[f32; 2]]) -> Vec<[f64; 2]> {
     points.iter().map(|&[x, y]| [x as f64, y as f64]).collect()
 }
 
-fn analysis_cache_dir() -> PathBuf {
+pub(crate) fn analysis_cache_dir() -> PathBuf {
     app_cache_base_dir().join(ANALYSIS_CACHE_DIR_NAME)
 }
 
-fn analysis_cache_library_dir() -> PathBuf {
+pub(crate) fn analysis_cache_library_dir() -> PathBuf {
     analysis_cache_dir().join(ANALYSIS_CACHE_LIBRARY_DIR_NAME)
 }
 
@@ -596,7 +695,6 @@ fn fnv1a64_update(mut hash: u64, bytes: &[u8]) -> u64 {
 
 fn analysis_cache_variant_key(
     sample_rate: u32,
-    raw_sample_len: usize,
     audio_quality_mode: AudioQualityMode,
     speed: f32,
     pitch_semitones: f32,
@@ -605,7 +703,6 @@ fn analysis_cache_variant_key(
 ) -> String {
     let mut hash = 14695981039346656037u64;
     hash = fnv1a64_update(hash, &sample_rate.to_le_bytes());
-    hash = fnv1a64_update(hash, &(raw_sample_len as u64).to_le_bytes());
     hash = fnv1a64_update(hash, &[audio_quality_mode.cache_code()]);
     hash = fnv1a64_update(hash, &speed.to_bits().to_le_bytes());
     hash = fnv1a64_update(hash, &pitch_semitones.to_bits().to_le_bytes());
@@ -691,6 +788,38 @@ fn speed_pitch_is_identity(speed: f32, pitch_semitones: f32) -> bool {
     (speed.clamp(0.25, 4.0) - 1.0).abs() < 1.0e-4 && pitch_semitones.abs() < 1.0e-4
 }
 
+fn estimated_duration_sec(total_samples: Option<usize>, sample_rate: u32) -> f32 {
+    if sample_rate > 0 {
+        total_samples
+            .map(|ts| ts as f32 / sample_rate as f32)
+            .unwrap_or(0.0)
+    } else {
+        0.0
+    }
+}
+
+fn adaptive_waveform_budget(base_budget: usize, total_samples: Option<usize>, sample_rate: u32) -> usize {
+    let estimated_sec = estimated_duration_sec(total_samples, sample_rate);
+    if estimated_sec > 1800.0 {
+        base_budget.min(3000)
+    } else if estimated_sec > 300.0 {
+        base_budget / 2
+    } else {
+        base_budget
+    }
+}
+
+fn adaptive_rebuild_delta(base_delta: usize, total_samples: Option<usize>, sample_rate: u32) -> usize {
+    let estimated_sec = estimated_duration_sec(total_samples, sample_rate);
+    if estimated_sec > 1800.0 {
+        base_delta * 4
+    } else if estimated_sec > 300.0 {
+        base_delta * 2
+    } else {
+        base_delta
+    }
+}
+
 fn shuffle_f32_bytes(samples: &[f32]) -> Vec<u8> {
     let len = samples.len();
     let mut shuffled = vec![0u8; len * 4];
@@ -756,8 +885,16 @@ pub struct KeyScribeApp {
     loaded_audio_hash: Option<String>,
     audio_raw: Option<AudioData>,
     processed_samples: Vec<f32>,
-    processed_playback_samples: Vec<f32>,
+    processed_playback_samples: Arc<Vec<f32>>,
     processed_playback_channels: u16,
+    separated_stems: Option<Vec<crate::leadsheet::SeparatedStem>>,
+    selected_separation_model_path: Option<PathBuf>,
+    enabled_listening_indices: std::collections::BTreeSet<usize>,
+    enabled_stem_indices: std::collections::BTreeSet<usize>,
+    pending_listening_indices: std::collections::BTreeSet<usize>,
+    pending_stem_indices: std::collections::BTreeSet<usize>,
+    show_visualize_selector: bool,
+    show_listen_selector: bool,
     waveform: Vec<[f64; 2]>,
     waveform_version: u64,
     loop_waveform_cache_version: u64,
@@ -772,24 +909,42 @@ pub struct KeyScribeApp {
     note_probs: Vec<f32>,
     note_probs_smoothed: Vec<f32>,
     note_highlight_hold_remaining: Vec<f32>,
+    main_content_tab: MainContentTab,
+    sheet_preview_cache_key: Option<SheetPreviewCacheKey>,
+    sheet_preview_cache: Option<SheetPreviewData>,
+    sheet_preview_error: Option<String>,
     selected_time_sec: f32,
+    sheet_engraving_cache_key: Option<SheetPreviewCacheKey>,
+    sheet_engraving_pages: Vec<EngravedSheetPage>,
+    sheet_engraving_error: Option<String>,
+    sheet_config_modal_open: bool,
+    sheet_use_musescore: bool,
     speed: f32,
     pitch_semitones: f32,
     key_color_sensitivity: f32,
     key_highlight_max_sec: f32,
+    visualization_timing_offset_ms: f32,
     piano_zoom: f32,
     piano_key_height: f32,
+    piano_scale: f32,
     waveform_panel_height: f32,
     probability_panel_height: f32,
     piano_panel_height: f32,
+    video_panel_height: f32,
     piano_panel_height_needs_init: bool,
     piano_scroll_px: f32,
     piano_has_focus: bool,
     piano_drag_last_x: Option<f32>,
     last_error: Option<String>,
     engine: Option<AudioEngine>,
+    /// Master audio clock snapshot captured once per UI frame. This is the
+    /// single source of truth that the video player and keyboard transcription
+    /// follow, guaranteeing they can never drift relative to each other or to
+    /// the audible audio (VLC audio-master synchronization model).
+    master_clock: Option<ClockSnapshot>,
     processing_rx: Option<Receiver<ProcessingResult>>,
     processing_epoch: Arc<AtomicU64>,
+    processing_cancel_flag: Option<Arc<AtomicBool>>,
     active_rebuild_mode: RebuildMode,
     active_job_id: Option<u64>,
     next_job_id: u64,
@@ -809,6 +964,8 @@ pub struct KeyScribeApp {
     restart_playback_after_processing: bool,
     last_prob_update: Instant,
     show_note_hist_window: bool,
+    show_video_pane: bool,
+    video_player: Option<video_player::VideoPlayer>,
     playback_volume: f32,
     audio_quality_mode: AudioQualityMode,
     audio_output_device_id: Option<String>,
@@ -823,6 +980,8 @@ pub struct KeyScribeApp {
     last_state_save_at: Instant,
     waveform_reset_view: bool,
     loop_selection: Option<(f32, f32)>,
+    loop_start_input_str: String,
+    loop_end_input_str: String,
     drag_select_anchor_sec: Option<f32>,
     loop_playback_enabled: bool,
     playing_preview_buffer: bool,
@@ -834,13 +993,15 @@ pub struct KeyScribeApp {
     audio_loading_rx: Option<Receiver<StreamingAudioEvent>>,
     audio_loading_cancel: Option<Arc<AtomicBool>>,
     is_audio_loading: bool,
+    is_separating: bool,
+    separation_attempted: bool,
+    separation_progress: Arc<std::sync::atomic::AtomicU32>,
+    separation_rx: Option<Receiver<SeparationResult>>,
     loading_sample_rate: u32,
     loading_total_samples: Option<usize>,
     loading_decoded_samples: usize,
     loading_last_waveform_rebuild_at: Option<Instant>,
     loading_last_waveform_rebuild_samples: usize,
-    loading_raw_samples: Vec<f32>,
-    loading_raw_samples_interleaved: Vec<f32>,
     loading_source_channels: u16,
     loading_provisional_timeline: Vec<Vec<f32>>,
     loading_next_transcribe_time_sec: f32,
@@ -850,6 +1011,91 @@ pub struct KeyScribeApp {
     manual_import_path: String,
     mobile_ui_tweaks_applied: bool,
     show_shortcuts_help_modal: bool,
+    auto_separate: bool,
+    // Sheet music mode and stem source selectors
+    sheet_music_mode: SheetMusicMode,
+    melody_stem_indices: std::collections::BTreeSet<usize>,
+    melody_stem_selector_open: bool,
+    melody_mode: MelodyMode,
+    melody_heuristic: bool,
+    melody_outlier_semitones: u8,
+    chord_stem_indices: std::collections::BTreeSet<usize>,
+    chord_stem_selector_open: bool,
+    chord_skip: bool,
+    current_chord: Option<String>,
+    show_chord_suggestions: bool,
+    stem_analyses: Vec<StemAnalysis>,
+    stem_colors: Vec<egui::Color32>,
+    note_stem_colors: Vec<egui::Color32>,
+    stem_analysis_rx: Option<Receiver<StemAnalysisResult>>,
+    saved_visualize_stem_indices: Option<Vec<usize>>,
+    saved_listen_stem_indices: Option<Vec<usize>>,
+    manual_bpm: Option<f32>,
+    manual_swing: Option<crate::leadsheet::types::SwingStyle>,
+    bpm_input_str: String,
+    melody_min_note: Option<u8>,
+    melody_max_note: Option<u8>,
+    sheet_render_result_rx: Option<std::sync::mpsc::Receiver<SheetRenderResult>>,
+    sheet_preview_result_rx:
+        Option<std::sync::mpsc::Receiver<(SheetPreviewCacheKey, Result<SheetPreviewData, String>)>>,
+    stem_playback_cache: Option<StemPlaybackCache>,
+    cache_size_bytes: Option<Option<u64>>,
+
+    // Export UI
+    export_stems_modal_open: bool,
+    export_midi_modal_open: bool,
+    export_selected_stems: std::collections::HashSet<crate::leadsheet::StemType>,
+    export_full_mix_midi: bool,
+    file_markers: std::collections::HashMap<String, Vec<MarkerData>>,
+    /// Per-file playback positions (keyed by file hash) for resume-on-reopen.
+    file_positions: std::collections::HashMap<String, f32>,
+    /// When set, the playhead will jump to this position once the audio
+    /// hash is known and the per-file position map has been checked.
+    pending_restore_position: Option<f32>,
+    dragging_marker: Option<usize>,
+    context_menu_marker_idx: Option<usize>,
+    context_menu_plot_x: Option<f32>,
+    marker_edit_index: Option<usize>,
+    marker_edit_str: String,
+    streaming_stretch: Option<StreamingStretchState>,
+}
+
+struct StreamingStretchState {
+    rx: std::sync::mpsc::Receiver<Vec<f32>>,
+    cancel: Arc<AtomicBool>,
+    channels: u16,
+    sample_rate: u32,
+    speed: f32,
+    timeline_start_sec: f32,
+    started: bool,
+    accumulated: Vec<f32>,
+}
+
+struct StemPlaybackCache {
+    samples: Arc<Vec<f32>>,
+    processed_samples: Option<Arc<Vec<f32>>>,
+    channels: u16,
+    sample_rate: u32,
+    listening_key: Vec<usize>,
+    processed_speed: f32,
+    processed_pitch: f32,
+}
+
+struct SeparationResult {
+    stems: Vec<crate::leadsheet::SeparatedStem>,
+    error: Option<String>,
+}
+
+#[derive(Clone)]
+struct StemAnalysis {
+    stem_index: usize,
+    timeline: Arc<Vec<Vec<f32>>>,
+    step_sec: f32,
+}
+
+struct StemAnalysisResult {
+    analyses: Vec<StemAnalysis>,
+    error: Option<String>,
 }
 
 struct ProcessingResult {
@@ -858,7 +1104,7 @@ struct ProcessingResult {
     cache_lookup_hit: Option<bool>,
     source_hash: Option<String>,
     processed_samples: Vec<f32>,
-    processed_playback_samples: Vec<f32>,
+    processed_playback_samples: Arc<Vec<f32>>,
     processed_playback_channels: u16,
     waveform: Vec<[f64; 2]>,
     note_timeline: Arc<Vec<Vec<f32>>>,
@@ -872,6 +1118,7 @@ struct ProcessingResult {
 struct PreviewPlayback {
     samples: Vec<f32>,
     channels: u16,
+    sample_rate: u32,
     timeline_start_sec: f32,
 }
 
@@ -882,6 +1129,117 @@ struct LoadingPreviewCacheEntry {
     channels: u16,
     samples_interleaved: Arc<Vec<f32>>,
     last_used_at: Instant,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum MainContentTab {
+    Waveform,
+    SheetMusic,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SheetMusicMode {
+    LeadSheet,
+    PianoGrandStaff,
+    SingleStaff,
+}
+
+impl SheetMusicMode {
+    fn label(&self) -> &'static str {
+        match self {
+            Self::LeadSheet => "Lead Sheet",
+            Self::PianoGrandStaff => "Piano (Grand Staff)",
+            Self::SingleStaff => "Single Staff",
+        }
+    }
+
+    fn is_lead_sheet(&self) -> bool {
+        matches!(self, Self::LeadSheet)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MelodyMode {
+    Monophonic,
+    Polyphonic,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct SheetPreviewCacheKey {
+    timeline_ptr: usize,
+    timeline_len: usize,
+    timeline_step_bits: u32,
+    threshold_bits: u32,
+    separation_selection_bits: u64,
+    mode_bits: u8,
+    melody_stem_bits: u64,
+    chord_stem_bits: u64,
+    swing_style_bit: Option<u8>,
+    stem_analysis_key: u64,
+    melody_note_range_bits: u32,
+    melody_mode_bits: u32,
+    use_musescore: bool,
+}
+
+#[derive(Clone)]
+struct SheetPreviewData {
+    foundation: LeadSheetFoundation,
+    cursor_offset_sec: f32,
+    melody_events: Vec<crate::leadsheet::NoteEvent>,
+}
+
+#[derive(Clone)]
+struct NotePosition {
+    note_id: u32,
+    x: f32,
+    y: f32,
+    w: f32,
+    h: f32,
+    tick: i32,
+    duration_ticks: i32,
+}
+
+struct SheetRenderJob {
+    musicxml: String,
+    key: SheetPreviewCacheKey,
+}
+
+struct SheetPreviewJob {
+    key: SheetPreviewCacheKey,
+    threshold: f32,
+    melody_events: Vec<crate::leadsheet::NoteEvent>,
+    melody_mode: MelodyMode,
+    melody_outlier_semitones: u8,
+    melody_heuristic: bool,
+    bass_audio: Option<Vec<f32>>,
+    drum_audio: Option<Vec<f32>>,
+    full_mix: Option<Vec<f32>>,
+    sample_rate: u32,
+    manual_bpm: Option<f32>,
+    chord_skip: bool,
+    chord_notes: Option<Vec<crate::leadsheet::NoteEvent>>,
+    source_duration: f32,
+}
+
+struct SheetRenderResult {
+    key: SheetPreviewCacheKey,
+    pages: Vec<SheetRawPage>,
+    error: Option<String>,
+}
+
+struct SheetRawPage {
+    width_px: usize,
+    height_px: usize,
+    rgba_data: Vec<u8>,
+    note_positions: Vec<NotePosition>,
+}
+
+#[derive(Clone)]
+struct EngravedSheetPage {
+    texture: egui::TextureHandle,
+    width_px: usize,
+    height_px: usize,
+    note_positions: Vec<NotePosition>,
 }
 
 #[derive(Default)]
@@ -902,6 +1260,7 @@ enum RebuildMode {
     Full,
     ParametersOnly,
     ParametersPreview,
+    VisualizationOnly,
 }
 
 impl KeyScribeApp {
@@ -922,8 +1281,16 @@ impl KeyScribeApp {
             loaded_audio_hash: None,
             audio_raw: None,
             processed_samples: Vec::new(),
-            processed_playback_samples: Vec::new(),
+            processed_playback_samples: Arc::new(Vec::new()),
             processed_playback_channels: 1,
+            separated_stems: None,
+            selected_separation_model_path: None,
+            enabled_listening_indices: std::collections::BTreeSet::new(),
+            enabled_stem_indices: std::collections::BTreeSet::new(),
+            pending_listening_indices: std::collections::BTreeSet::new(),
+            pending_stem_indices: std::collections::BTreeSet::new(),
+            show_visualize_selector: false,
+            show_listen_selector: false,
             waveform: Vec::new(),
             waveform_version: 0,
             loop_waveform_cache_version: u64::MAX,
@@ -937,8 +1304,19 @@ impl KeyScribeApp {
             base_note_timeline_step_sec: 0.0,
             note_probs: vec![0.0; (PIANO_HIGH_MIDI - PIANO_LOW_MIDI + 1) as usize],
             note_probs_smoothed: vec![0.0; (PIANO_HIGH_MIDI - PIANO_LOW_MIDI + 1) as usize],
-            note_highlight_hold_remaining:
-                vec![0.0; (PIANO_HIGH_MIDI - PIANO_LOW_MIDI + 1) as usize],
+            note_highlight_hold_remaining: vec![
+                0.0;
+                (PIANO_HIGH_MIDI - PIANO_LOW_MIDI + 1) as usize
+            ],
+            main_content_tab: MainContentTab::Waveform,
+            sheet_preview_cache_key: None,
+            sheet_preview_cache: None,
+            sheet_preview_error: None,
+            sheet_engraving_cache_key: None,
+            sheet_engraving_pages: Vec::new(),
+            sheet_engraving_error: None,
+            sheet_config_modal_open: false,
+            sheet_use_musescore: persisted.sheet_use_musescore,
             selected_time_sec: persisted.selected_time_sec.max(0.0),
             speed: persisted.speed.clamp(0.5, 2.0),
             pitch_semitones: persisted.pitch_semitones.clamp(-12.0, 12.0),
@@ -946,13 +1324,19 @@ impl KeyScribeApp {
             key_highlight_max_sec: persisted
                 .key_highlight_max_sec
                 .clamp(KEY_HIGHLIGHT_MAX_SEC_MIN, KEY_HIGHLIGHT_MAX_SEC_MAX),
+            visualization_timing_offset_ms: persisted.visualization_timing_offset_ms.clamp(
+                VISUALIZATION_TIMING_OFFSET_MS_MIN,
+                VISUALIZATION_TIMING_OFFSET_MS_MAX,
+            ),
             piano_zoom: persisted.piano_zoom.clamp(PIANO_ZOOM_MIN, PIANO_ZOOM_MAX),
             piano_key_height: persisted
                 .piano_key_height
                 .clamp(MIN_PIANO_KEY_HEIGHT, 220.0),
+            piano_scale: persisted.piano_scale.clamp(0.25, 1.0),
             waveform_panel_height: persisted.waveform_panel_height.clamp(120.0, 5000.0),
             probability_panel_height: persisted.probability_panel_height.clamp(0.0, 5000.0),
             piano_panel_height: persisted.piano_panel_height.clamp(80.0, 5000.0),
+            video_panel_height: persisted.video_panel_height.clamp(100.0, 5000.0),
             piano_panel_height_needs_init: true,
             piano_scroll_px: 0.0,
             piano_has_focus: false,
@@ -962,8 +1346,10 @@ impl KeyScribeApp {
                 persisted.audio_output_device_id.as_deref(),
             )
             .ok(),
+            master_clock: None,
             processing_rx: None,
             processing_epoch: Arc::new(AtomicU64::new(0)),
+            processing_cancel_flag: None,
             active_rebuild_mode: RebuildMode::Full,
             active_job_id: None,
             next_job_id: 1,
@@ -983,6 +1369,8 @@ impl KeyScribeApp {
             restart_playback_after_processing: false,
             last_prob_update: Instant::now(),
             show_note_hist_window: persisted.show_note_hist_window,
+            show_video_pane: persisted.show_video_pane,
+            video_player: None,
             playback_volume: persisted.playback_volume.clamp(0.0, 1.5),
             audio_quality_mode: persisted.audio_quality_mode,
             audio_output_device_id: persisted.audio_output_device_id.clone(),
@@ -1001,6 +1389,8 @@ impl KeyScribeApp {
             last_state_save_at: Instant::now(),
             waveform_reset_view: true,
             loop_selection: None,
+            loop_start_input_str: String::new(),
+            loop_end_input_str: String::new(),
             drag_select_anchor_sec: None,
             loop_playback_enabled: false,
             playing_preview_buffer: false,
@@ -1012,25 +1402,64 @@ impl KeyScribeApp {
             audio_loading_rx: None,
             audio_loading_cancel: None,
             is_audio_loading: false,
+            is_separating: false,
+            separation_attempted: false,
+            separation_progress: Arc::new(std::sync::atomic::AtomicU32::new(0)),
+            separation_rx: None,
             loading_sample_rate: 0,
             loading_total_samples: None,
             loading_decoded_samples: 0,
             loading_last_waveform_rebuild_at: None,
             loading_last_waveform_rebuild_samples: 0,
-            loading_raw_samples: Vec::new(),
-            loading_raw_samples_interleaved: Vec::new(),
             loading_source_channels: 1,
             loading_provisional_timeline: Vec::new(),
             loading_next_transcribe_time_sec: 0.0,
             loading_timeline_frames_pending_sync: 0,
             loading_preview_cache: Vec::new(),
             touch_loop_select_mode: false,
-            manual_import_path: startup_path
-                .as_ref()
-                .map(|path| path.to_string_lossy().to_string())
-                .unwrap_or_default(),
+            manual_import_path: String::new(),
             mobile_ui_tweaks_applied: false,
             show_shortcuts_help_modal: false,
+            auto_separate: persisted.auto_separate,
+            sheet_music_mode: SheetMusicMode::LeadSheet,
+            melody_stem_indices: std::collections::BTreeSet::new(),
+            melody_stem_selector_open: false,
+            melody_mode: MelodyMode::Monophonic,
+            melody_heuristic: true,
+            melody_outlier_semitones: 12,
+            chord_stem_indices: std::collections::BTreeSet::new(),
+            chord_stem_selector_open: false,
+            chord_skip: false,
+            current_chord: None,
+            show_chord_suggestions: true,
+            stem_analyses: Vec::new(),
+            stem_colors: Vec::new(),
+            note_stem_colors: vec![egui::Color32::from_rgb(148, 106, 255); PIANO_KEY_COUNT],
+            stem_analysis_rx: None,
+            saved_visualize_stem_indices: persisted.saved_visualize_stem_indices.clone(),
+            saved_listen_stem_indices: persisted.saved_listen_stem_indices.clone(),
+            manual_bpm: None,
+            manual_swing: None,
+            bpm_input_str: String::new(),
+            melody_min_note: None,
+            melody_max_note: None,
+            sheet_render_result_rx: None,
+            sheet_preview_result_rx: None,
+            stem_playback_cache: None,
+            cache_size_bytes: None,
+            export_stems_modal_open: false,
+            export_midi_modal_open: false,
+            export_selected_stems: std::collections::HashSet::new(),
+            export_full_mix_midi: false,
+            file_markers: persisted.file_markers,
+            file_positions: persisted.file_positions,
+            pending_restore_position: None,
+            dragging_marker: None,
+            context_menu_marker_idx: None,
+            context_menu_plot_x: None,
+            marker_edit_index: None,
+            marker_edit_str: String::new(),
+            streaming_stretch: None,
         };
 
         app.refresh_audio_output_devices();
@@ -1048,7 +1477,7 @@ impl KeyScribeApp {
 
         if let Some(path) = startup_path {
             if is_safe_startup_audio_path(path.as_path()) {
-                app.start_audio_loading(path, &_cc.egui_ctx);
+                app.start_audio_loading(path, &_cc.egui_ctx, false);
             }
         }
 

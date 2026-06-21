@@ -1,5 +1,4 @@
 use super::*;
-use crate::core::processing::build_waveform_for_processed;
 
 impl KeyScribeApp {
     #[allow(clippy::too_many_arguments)]
@@ -20,7 +19,6 @@ impl KeyScribeApp {
 
         let variant_key = analysis_cache_variant_key(
             sample_rate,
-            raw_sample_len,
             audio_quality_mode,
             speed,
             pitch_semitones,
@@ -28,11 +26,11 @@ impl KeyScribeApp {
             preprocess_audio,
         );
 
+        let strict_paths = analysis_cache_candidate_file_paths(song_hash, &variant_key);
+
         let expected_speed_bits = speed.to_bits();
         let expected_pitch_bits = pitch_semitones.to_bits();
-
-        let strict_paths = analysis_cache_candidate_file_paths(song_hash, &variant_key);
-        let strict_count = strict_paths.len();
+        let _strict_count = strict_paths.len();
         let mut candidate_paths = strict_paths;
         for path in analysis_cache_song_file_paths(song_hash) {
             if !candidate_paths.iter().any(|existing| existing == &path) {
@@ -41,7 +39,7 @@ impl KeyScribeApp {
         }
         diag.total_candidates = candidate_paths.len();
 
-        for (idx, cache_path) in candidate_paths.into_iter().enumerate() {
+        for (_idx, cache_path) in candidate_paths.into_iter().enumerate() {
             if !cache_path.is_file() {
                 continue;
             }
@@ -76,11 +74,28 @@ impl KeyScribeApp {
                 continue;
             }
 
-            // Strict pass (variant-key path) enforces exact raw length when known;
-            // fallback pass over all blobs for this song hash tolerates metadata drift.
-            if raw_sample_len > 0 && idx < strict_count && cache.raw_sample_len != raw_sample_len {
-                diag.strict_len_mismatches += 1;
-                continue;
+            // Strict pass (variant-key path) enforces exact raw length when known.
+            // When the writer stored the actual-decoded count and the reader only
+            // has the container's metadata n_frames, a slight mismatch is normal.
+            // Instead of hard-rejecting, check whether the cached timeline duration
+            // is close enough to the expected duration to trust the cache.
+            if raw_sample_len > 0 && cache.raw_sample_len != raw_sample_len {
+                let expected_dur = raw_sample_len as f64 / sample_rate as f64;
+                let cached_dur = cache.base_note_timeline.len() as f64
+                    * cache.base_note_timeline_step_sec as f64;
+                let drift = if expected_dur > 0.0 {
+                    (cached_dur - expected_dur).abs() / expected_dur
+                } else {
+                    1.0
+                };
+                // Within 2 % and 2 seconds → still a valid match (just metadata
+                // rounding). Anything beyond that is genuinely a different file.
+                if drift > 0.02 && (cached_dur - expected_dur).abs() > 2.0 {
+                    diag.strict_len_mismatches += 1;
+                    continue;
+                }
+                // Fall through — accept the cache even though raw_sample_len
+                // doesn't match exactly.
             }
 
             if !cache.base_note_timeline_step_sec.is_finite()
@@ -138,26 +153,47 @@ impl KeyScribeApp {
         );
 
         if let Some((base_timeline, base_step_sec, cached_waveform)) = cached_timeline {
-            self.base_note_timeline = Arc::clone(&base_timeline);
-            self.base_note_timeline_step_sec = base_step_sec;
-            let (note_timeline, note_step_sec) = Self::transform_note_timeline(
-                base_timeline,
-                base_step_sec,
-                self.speed,
-                self.pitch_semitones,
-            );
-            self.note_timeline = note_timeline;
-            self.note_timeline_step_sec = note_step_sec;
-            self.loading_cache_timeline_preloaded = true;
-            if let Some(waveform) = cached_waveform {
-                self.set_waveform_data(waveform, true);
-                self.loading_cache_waveform_preloaded = true;
+            // If the cached timeline covers a drastically different duration than
+            // what the container metadata reports (e.g. a cache from a short
+            // alternate audio track vs the real full-length program track),
+            // discard the stale blob so a full re-render runs.
+            if raw_sample_len_opt.is_some() && self.loading_sample_rate > 0 {
+                let expected_dur = raw_sample_len as f32 / self.loading_sample_rate as f32;
+                let cached_dur = base_timeline.len() as f32 * base_step_sec;
+                let drift = if expected_dur > 0.0 {
+                    (cached_dur - expected_dur).abs() / expected_dur
+                } else {
+                    1.0
+                };
+                // Only flag caches where the duration is off by more than 30 %
+                // or 60 seconds absolute. This is deliberately coarse — we only
+                // want to catch the "wrong audio track" scenario (e.g. 6 min vs
+                // 69 min).  Normal rounding / encoder-padding differences are
+                // well inside these bounds so valid caches are never zapped.
+                if drift > 0.30 && (cached_dur - expected_dur).abs() > 60.0 {
+                    self.loading_cache_timeline_preloaded = false;
+                    self.loading_cache_waveform_preloaded = false;
+                    self.cache_status_message = Some(
+                        "Analysis cache: stale (duration mismatch), re-rendering."
+                            .to_string(),
+                    );
+                    self.cache_status_message_at = Some(Instant::now());
+                } else {
+                    // Valid cache — apply it.
+                    self.apply_prechecked_cache(
+                        base_timeline,
+                        base_step_sec,
+                        cached_waveform,
+                    );
+                }
             } else {
-                self.loading_cache_waveform_preloaded = false;
+                // No metadata frame count to validate against — trust the cache.
+                self.apply_prechecked_cache(
+                    base_timeline,
+                    base_step_sec,
+                    cached_waveform,
+                );
             }
-            self.update_note_probabilities(true);
-            self.cache_status_message =
-                Some("Analysis cache: transcription loaded during render.".to_string());
         } else {
             self.loading_cache_timeline_preloaded = false;
             self.loading_cache_waveform_preloaded = false;
@@ -176,11 +212,11 @@ impl KeyScribeApp {
                 )
             } else if precheck_diag.existing_files == 0 {
                 format!(
-                    "Analysis cache: no early hit (hash {hash_short}, no cache blobs found for this hash)."
+                    "Analysis cache: first-time transcription — no cached data yet (hash {hash_short})."
                 )
             } else {
                 format!(
-                    "Analysis cache: no early hit (hash {hash_short}, blobs {}, parsed {}, mismatches {}, failures {} [read {}, decompress {}, deserialize {}]).",
+                    "Analysis cache: cache miss — re-analysing (hash {hash_short}, blobs {}, parsed {}, mismatches {}, failures {} [read {}, decompress {}, deserialize {}]).",
                     precheck_diag.existing_files,
                     precheck_diag.parsed_blobs,
                     mismatch_total,
@@ -194,97 +230,32 @@ impl KeyScribeApp {
         self.cache_status_message_at = Some(Instant::now());
     }
 
-    #[allow(dead_code)]
-    pub(super) fn try_restore_analysis_cache(&mut self, source_path: &Path) -> bool {
-        let Some(audio) = &self.audio_raw else {
-            return false;
-        };
-        let sample_rate = audio.sample_rate;
-        let raw_sample_len = audio.samples_mono.len();
-        let raw_samples = Arc::clone(&audio.samples_mono);
-        let raw_playback_samples = Arc::clone(&audio.samples_interleaved);
-        let raw_playback_channels = audio.channels.max(1);
-
-        let song_hash = if let Some(hash) = self.loaded_audio_hash.clone() {
-            hash
-        } else {
-            let Some(hash) = compute_file_hash(source_path) else {
-                return false;
-            };
-            self.loaded_audio_hash = Some(hash.clone());
-            hash
-        };
-
-        let Some((
-            processed_samples,
-            base_note_timeline,
-            base_note_timeline_step_sec,
-            cached_waveform,
-        )) =
-            Self::load_analysis_cache_for_variant(
-                song_hash.as_str(),
-                sample_rate,
-                raw_sample_len,
-                raw_samples.as_slice(),
-                self.audio_quality_mode,
-                self.speed,
-                self.pitch_semitones,
-                self.use_cqt_analysis,
-                self.preprocess_audio,
-            )
-        else {
-            return false;
-        };
-
-        if self.preprocess_audio
-            && (base_note_timeline.is_empty() || base_note_timeline_step_sec <= 0.0)
-        {
-            return false;
-        }
-
-        let (note_timeline, note_timeline_step_sec) = if self.preprocess_audio {
-            Self::transform_note_timeline(
-                Arc::clone(&base_note_timeline),
-                base_note_timeline_step_sec,
-                self.speed,
-                self.pitch_semitones,
-            )
-        } else {
-            (Arc::new(Vec::new()), 0.0)
-        };
-
-        self.processed_samples = processed_samples;
-        self.processed_playback_channels = raw_playback_channels;
-        self.processed_playback_samples = if speed_pitch_is_identity(self.speed, self.pitch_semitones)
-        {
-            raw_playback_samples.as_ref().to_vec()
-        } else {
-            apply_speed_and_pitch_interleaved(
-                raw_playback_samples.as_slice(),
-                raw_playback_channels,
-                sample_rate,
-                self.speed,
-                self.pitch_semitones,
-            )
-        };
-        let waveform = cached_waveform.unwrap_or_else(|| {
-            build_waveform_for_processed(
-                self.processed_samples.as_slice(),
-                sample_rate,
-                self.audio_quality_mode.waveform_points(),
-                self.speed,
-            )
-        });
-        self.set_waveform_data(waveform, true);
+    fn apply_prechecked_cache(
+        &mut self,
+        base_timeline: Arc<Vec<Vec<f32>>>,
+        base_step_sec: f32,
+        cached_waveform: Option<Vec<[f64; 2]>>,
+    ) {
+        self.base_note_timeline = Arc::clone(&base_timeline);
+        self.base_note_timeline_step_sec = base_step_sec;
+        let (note_timeline, note_step_sec) = Self::transform_note_timeline(
+            base_timeline,
+            base_step_sec,
+            self.speed,
+            self.pitch_semitones,
+        );
         self.note_timeline = note_timeline;
-        self.note_timeline_step_sec = note_timeline_step_sec;
-        self.base_note_timeline = base_note_timeline;
-        self.base_note_timeline_step_sec = base_note_timeline_step_sec;
-        self.selected_time_sec = self.selected_time_sec.min(self.source_duration());
-        self.playing_preview_buffer = false;
+        self.note_timeline_step_sec = note_step_sec;
+        self.loading_cache_timeline_preloaded = true;
+        if let Some(waveform) = cached_waveform {
+            self.set_waveform_data(waveform, true);
+            self.loading_cache_waveform_preloaded = true;
+        } else {
+            self.loading_cache_waveform_preloaded = false;
+        }
         self.update_note_probabilities(true);
-
-        true
+        self.cache_status_message =
+            Some("Analysis cache: transcription loaded during render.".to_string());
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -301,7 +272,6 @@ impl KeyScribeApp {
     ) -> Option<(Vec<f32>, Arc<Vec<Vec<f32>>>, f32, Option<Vec<[f64; 2]>>)> {
         let variant_key = analysis_cache_variant_key(
             sample_rate,
-            raw_sample_len,
             audio_quality_mode,
             speed,
             pitch_semitones,
@@ -325,14 +295,27 @@ impl KeyScribeApp {
                 continue;
             }
 
-            let cache_matches = cache.cache_version == ANALYSIS_CACHE_VERSION
+            let mut cache_matches = cache.cache_version == ANALYSIS_CACHE_VERSION
                 && cache.sample_rate == sample_rate
-                && cache.raw_sample_len == raw_sample_len
                 && cache.audio_quality_mode_code == audio_quality_mode.cache_code()
                 && cache.speed_bits == expected_speed_bits
                 && cache.pitch_bits == expected_pitch_bits
                 && cache.use_cqt_analysis == use_cqt_analysis
                 && cache.preprocess_audio == preprocess_audio;
+
+            if cache_matches && raw_sample_len > 0 && cache.raw_sample_len != raw_sample_len {
+                let expected_dur = raw_sample_len as f64 / sample_rate as f64;
+                let cached_dur = cache.base_note_timeline.len() as f64
+                    * cache.base_note_timeline_step_sec as f64;
+                let drift = if expected_dur > 0.0 {
+                    (cached_dur - expected_dur).abs() / expected_dur
+                } else {
+                    1.0
+                };
+                if drift > 0.02 && (cached_dur - expected_dur).abs() > 2.0 {
+                    cache_matches = false;
+                }
+            }
 
             if !cache_matches {
                 continue;
@@ -411,7 +394,6 @@ impl KeyScribeApp {
 
         let variant_key = analysis_cache_variant_key(
             sample_rate,
-            raw_sample_len,
             audio_quality_mode,
             speed,
             pitch_semitones,

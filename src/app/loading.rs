@@ -26,11 +26,20 @@ impl KeyScribeApp {
         for value in &mut self.note_highlight_hold_remaining {
             *value = 0.0;
         }
+        if !self.note_stem_colors.is_empty() {
+            self.note_stem_colors
+                .fill(self.highlight_color);
+        }
     }
 
     pub(super) fn note_visuals_ready(&self) -> bool {
         let has_preprocessed_timeline =
             !self.note_timeline.is_empty() && self.note_timeline_step_sec > 0.0;
+        let has_stem_analyses = !self.stem_analyses.is_empty();
+
+        if self.separated_stems.is_some() {
+            return self.audio_raw.is_some() && (has_stem_analyses || has_preprocessed_timeline);
+        }
 
         if self.is_audio_loading {
             return self.preprocess_audio
@@ -68,6 +77,7 @@ impl KeyScribeApp {
             RebuildMode::Full => CoreRebuildMode::Full,
             RebuildMode::ParametersOnly => CoreRebuildMode::ParametersOnly,
             RebuildMode::ParametersPreview => CoreRebuildMode::ParametersPreview,
+            RebuildMode::VisualizationOnly => CoreRebuildMode::ParametersPreview,
         };
 
         let quality_multiplier = match self.audio_quality_mode {
@@ -87,26 +97,40 @@ impl KeyScribeApp {
         )
     }
 
-    pub(super) fn start_audio_loading(&mut self, path: PathBuf, ctx: &egui::Context) {
+    pub(super) fn start_audio_loading(
+        &mut self,
+        path: PathBuf,
+        ctx: &egui::Context,
+        reset_state: bool,
+    ) {
         self.cancel_audio_loading();
         self.cancel_active_processing();
         self.stop();
+
+        // Save the current position before clearing it so we can restore
+        // it after the file hash arrives. On startup (reset_state=false)
+        // we preserve whatever was persisted. On manual open (reset_state=true)
+        // we clear it — the per-file map will be checked once the hash arrives.
+        let saved_pos = if !reset_state {
+            Some(self.selected_time_sec.max(0.0))
+        } else {
+            None
+        };
 
         self.loaded_path = Some(path.clone());
         push_recent_file_path(&mut self.recent_file_paths, path.as_path());
         self.loaded_audio_hash = None;
         self.selected_time_sec = 0.0;
+        self.pending_restore_position = saved_pos;
         self.audio_raw = None;
         self.processed_samples.clear();
-        self.processed_playback_samples.clear();
+        self.processed_playback_samples = Arc::new(Vec::new());
         self.processed_playback_channels = 1;
         self.clear_waveform_data();
         self.note_timeline = Arc::new(Vec::new());
         self.note_timeline_step_sec = 0.0;
         self.base_note_timeline = Arc::new(Vec::new());
         self.base_note_timeline_step_sec = 0.0;
-        self.loading_raw_samples.clear();
-        self.loading_raw_samples_interleaved.clear();
         self.loading_source_channels = 1;
         self.loading_sample_rate = 0;
         self.loading_total_samples = None;
@@ -127,10 +151,54 @@ impl KeyScribeApp {
         self.loading_cache_timeline_preloaded = false;
         self.loading_cache_waveform_preloaded = false;
         self.loading_preview_cache.clear();
+
+        // Reset speed/pitch to identity when loading new audio.
+        // This avoids needing separate raw-vs-processed audio buffers during streaming
+        // and eliminates per-chunk DSP overhead. User can re-apply speed/pitch after load.
+        self.speed = 1.0;
+        self.pitch_semitones = 0.0;
+
+        let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("").to_lowercase();
+        if matches!(ext.as_str(), "mp4" | "mkv" | "avi" | "mov" | "webm") {
+            self.video_player = Some(crate::app::video_player::VideoPlayer::new(path.to_string_lossy().to_string()));
+        } else {
+            self.video_player = None;
+        }
+
+        if reset_state {
+            // Reset loop state for new audio
+            self.loop_selection = None;
+            self.loop_enabled = false;
+            self.loop_playback_enabled = false;
+            self.drag_select_anchor_sec = None;
+
+            // Clear all stem state from previous song
+            self.saved_visualize_stem_indices = None;
+            self.saved_listen_stem_indices = None;
+            self.pending_stem_indices.clear();
+            self.pending_listening_indices.clear();
+            self.show_visualize_selector = false;
+            self.show_listen_selector = false;
+            self.melody_stem_indices.clear();
+            self.chord_stem_indices.clear();
+            self.current_chord = None;
+        }
+
         if self.preprocess_audio {
             self.cache_status_message = Some("Analysis cache: precheck pending...".to_string());
             self.cache_status_message_at = Some(Instant::now());
         }
+        // Clear all stem state from previous song
+        self.separated_stems = None;
+        self.stem_analyses.clear();
+        self.stem_colors.clear();
+        self.stem_analysis_rx = None;
+        self.is_separating = false;
+        self.separation_attempted = false;
+        self.separation_rx = None;
+        self.enabled_stem_indices.clear();
+        self.enabled_listening_indices.clear();
+        self.stem_playback_cache = None;
         self.clear_note_visuals();
 
         let (tx, rx) = mpsc::channel::<StreamingAudioEvent>();
@@ -173,6 +241,28 @@ impl KeyScribeApp {
         match event {
             StreamingAudioEvent::SourceHash(source_hash) => {
                 self.loaded_audio_hash = source_hash;
+
+                // Once we know the file hash, check the per-file position
+                // map for a saved resume position. This takes priority over
+                // the startup-preserved position (which was set before the
+                // hash was known and may be stale if the state file's
+                // selected_time_sec didn't match this file).
+                if let Some(hash) = &self.loaded_audio_hash {
+                    if let Some(&saved) = self.file_positions.get(hash) {
+                        if saved > 0.5 {
+                            self.pending_restore_position = Some(saved);
+                        }
+                    }
+                }
+
+                // Apply the pending restore position now that the hash is
+                // known. We clamp it later once the duration is known.
+                if let Some(pos) = self.pending_restore_position.take() {
+                    if pos > 0.5 {
+                        self.selected_time_sec = pos;
+                    }
+                }
+
                 if self.loaded_audio_hash.is_none() {
                     self.cache_status_message = Some(
                         "Analysis cache: precheck unavailable (source hash failed).".to_string(),
@@ -200,6 +290,15 @@ impl KeyScribeApp {
                     samples_mono: Arc::new(Vec::new()),
                     metadata,
                 });
+
+                // Pre-allocate vector capacities to avoid repeated reallocations
+                // and memcpy cascades during streaming for long files.
+                if let Some(total) = total_samples {
+                    self.processed_samples.reserve(total);
+                    Arc::make_mut(&mut self.processed_playback_samples)
+                        .reserve(total * self.loading_source_channels as usize);
+                }
+
                 self.album_art_texture = self.create_album_art_texture(ctx);
                 self.maybe_precheck_analysis_cache();
             }
@@ -219,74 +318,29 @@ impl KeyScribeApp {
                 self.loading_total_samples = total_samples.or(self.loading_total_samples);
                 self.loading_source_channels = playback_channels;
 
-                self.loading_raw_samples.extend_from_slice(&samples_mono);
-                self.loading_raw_samples_interleaved
-                    .extend_from_slice(&samples_interleaved);
-
-                let mut processed_chunk = samples_mono;
-                if !speed_pitch_is_identity(self.speed, self.pitch_semitones) {
-                    processed_chunk = apply_speed_and_pitch(
-                        &processed_chunk,
-                        self.loading_sample_rate,
-                        self.speed,
-                        self.pitch_semitones,
-                    );
-                }
-
-                let processed_chunk_playback =
-                    if speed_pitch_is_identity(self.speed, self.pitch_semitones) {
-                        samples_interleaved
-                    } else {
-                        apply_speed_and_pitch_interleaved(
-                            &samples_interleaved,
-                            playback_channels,
-                            self.loading_sample_rate,
-                            self.speed,
-                            self.pitch_semitones,
-                        )
-                    };
-
                 let was_empty = self.processed_samples.is_empty();
-                self.processed_samples.extend_from_slice(&processed_chunk);
-                self.processed_playback_samples
-                    .extend_from_slice(&processed_chunk_playback);
+                self.processed_samples.extend_from_slice(&samples_mono);
+                Arc::make_mut(&mut self.processed_playback_samples)
+                    .extend_from_slice(&samples_interleaved);
                 self.processed_playback_channels = playback_channels;
                 let processed_len = self.processed_samples.len();
-                if !self.loading_cache_waveform_preloaded
-                    && self.should_rebuild_streaming_waveform(processed_len)
-                {
+                let waveform_budget = adaptive_waveform_budget(
+                    self.audio_quality_mode.waveform_points(),
+                    self.loading_total_samples,
+                    self.loading_sample_rate,
+                );
+                let should_rebuild = !self.loading_cache_waveform_preloaded
+                    && self.should_rebuild_streaming_waveform(processed_len);
+                if should_rebuild {
                     let waveform = build_waveform_for_processed(
                         &self.processed_samples,
                         self.loading_sample_rate,
-                        self.audio_quality_mode.waveform_points(),
-                        self.speed,
+                        waveform_budget,
+                        1.0,
                     );
                     let should_reset_view = was_empty && !waveform.is_empty();
                     self.set_waveform_data(waveform, should_reset_view);
                     self.mark_streaming_waveform_rebuild(processed_len);
-                }
-
-                if self.live_stream_playback
-                    && !self.playing_preview_buffer
-                    && !self.loop_playback_enabled
-                {
-                    let playback_rate = self.playback_rate();
-                    if let Some(engine) = &mut self.engine {
-                        if engine.has_active_sink() {
-                            if let Err(err) = engine.append_samples(
-                                &processed_chunk_playback,
-                                playback_channels,
-                                self.loading_sample_rate,
-                                playback_rate,
-                            ) {
-                                self.last_error =
-                                    Some(format!("Playback stream append error: {err}"));
-                                self.live_stream_playback = false;
-                            }
-                        } else {
-                            self.live_stream_playback = false;
-                        }
-                    }
                 }
             }
             StreamingAudioEvent::Finished {
@@ -301,16 +355,30 @@ impl KeyScribeApp {
                 self.loading_total_samples = total_samples.or(self.loading_total_samples);
                 self.loading_source_channels = channels.max(1);
 
-                let raw_samples = std::mem::take(&mut self.loading_raw_samples);
-                let raw_interleaved = std::mem::take(&mut self.loading_raw_samples_interleaved);
+                // Build AudioData from the accumulated processed samples.
+                // Since speed/pitch is identity during loading, processed == raw.
+                let mono = std::mem::take(&mut self.processed_samples);
+                let interleaved = Arc::clone(&self.processed_playback_samples);
                 self.audio_raw = Some(AudioData {
                     sample_rate,
                     channels: self.loading_source_channels,
-                    samples_interleaved: Arc::new(raw_interleaved),
-                    samples_mono: Arc::new(raw_samples),
+                    samples_mono: Arc::new(mono.clone()),
+                    samples_interleaved: interleaved,
                     metadata,
                 });
+                self.processed_samples = mono;
+                // self.processed_playback_samples is already the interleaved data
+                self.processed_playback_channels = self.loading_source_channels;
                 self.album_art_texture = self.create_album_art_texture(ctx);
+
+                // Build final waveform at full quality now that loading is complete.
+                let final_waveform = build_waveform_for_processed(
+                    &self.processed_samples,
+                    self.loading_sample_rate,
+                    self.audio_quality_mode.waveform_points(),
+                    1.0,
+                );
+                self.set_waveform_data(final_waveform, true);
 
                 self.is_audio_loading = false;
                 self.audio_loading_rx = None;
@@ -318,6 +386,28 @@ impl KeyScribeApp {
                 self.live_stream_playback = false;
                 self.loading_cache_waveform_preloaded = false;
                 self.loading_preview_cache.clear();
+
+                // Clamp the restored playhead to the actual duration now
+                // that we know it. If the saved position was near the end
+                // of a file that was later trimmed, this prevents seeking
+                // past the end.
+                let duration = self.source_duration();
+                if duration > 0.0 && self.selected_time_sec > duration {
+                    self.selected_time_sec = duration * 0.95;
+                }
+
+                // Only rebuild the waveform from scratch when the cache didn't already
+                // provide one — otherwise keep the cached waveform to avoid unnecessary
+                // full-array scans on every load of the same file.
+                if self.waveform.is_empty() {
+                    let final_waveform = build_waveform_for_processed(
+                        &self.processed_samples,
+                        self.loading_sample_rate,
+                        self.audio_quality_mode.waveform_points(),
+                        1.0,
+                    );
+                    self.set_waveform_data(final_waveform, true);
+                }
 
                 let rebuild_mode = if self.preprocess_audio {
                     if self.loading_cache_timeline_preloaded {
@@ -338,8 +428,6 @@ impl KeyScribeApp {
                 self.loading_cache_timeline_preloaded = false;
                 self.loading_cache_waveform_preloaded = false;
                 self.loading_preview_cache.clear();
-                self.loading_raw_samples.clear();
-                self.loading_raw_samples_interleaved.clear();
                 self.last_error = Some(message);
             }
         }

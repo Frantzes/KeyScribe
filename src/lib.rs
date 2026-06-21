@@ -4,6 +4,7 @@ pub mod core;
 pub mod cqt;
 pub mod dsp;
 pub mod inference;
+pub mod leadsheet;
 pub mod pipeline;
 pub mod preprocessing;
 pub mod ring_buffer;

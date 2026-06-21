@@ -79,8 +79,14 @@ impl KeyScribeApp {
             return true;
         }
 
+        let delta = adaptive_rebuild_delta(
+            STREAMING_WAVEFORM_REBUILD_SAMPLE_DELTA,
+            self.loading_total_samples,
+            self.loading_sample_rate,
+        );
+
         if processed_sample_len.saturating_sub(self.loading_last_waveform_rebuild_samples)
-            >= STREAMING_WAVEFORM_REBUILD_SAMPLE_DELTA
+            >= delta
         {
             return true;
         }
@@ -140,15 +146,27 @@ impl KeyScribeApp {
         self.request_rebuild(was_playing, RebuildMode::Full);
     }
 
+    pub(super) fn request_rebuild_preserving_playback_and_waveform(&mut self) {
+        if self.is_audio_loading {
+            return;
+        }
+
+        self.request_rebuild(false, RebuildMode::VisualizationOnly);
+    }
+
     pub(super) fn cancel_active_processing(&mut self) {
         let cancel_epoch = self.next_job_id;
         self.next_job_id = self.next_job_id.saturating_add(1);
         self.processing_epoch.store(cancel_epoch, Ordering::Release);
+        if let Some(flag) = &self.processing_cancel_flag {
+            flag.store(true, Ordering::Release);
+        }
         self.clear_processing_job();
         self.pending_param_change = false;
         self.last_param_change_at = None;
         self.queued_param_update = false;
         self.restart_playback_after_processing = false;
+        self.cancel_streaming_stretch();
     }
 
     pub(super) fn refresh_audio_output_devices(&mut self) {
@@ -193,6 +211,12 @@ impl KeyScribeApp {
         }
     }
 
+    pub(super) fn cancel_streaming_stretch(&mut self) {
+        if let Some(state) = self.streaming_stretch.take() {
+            state.cancel.store(true, Ordering::Release);
+        }
+    }
+
     pub(super) fn request_param_update_preserving_playback(&mut self) {
         self.refresh_timeline_for_current_params();
 
@@ -211,11 +235,51 @@ impl KeyScribeApp {
             return;
         }
 
-        let was_playing = self.stop_if_playing();
-        if was_playing {
-            self.request_rebuild(true, RebuildMode::ParametersPreview);
+        // Cancel any in-flight processing and streaming — we're switching modes
+        self.cancel_active_processing();
+        self.cancel_streaming_stretch();
+
+        let was_playing = self.is_playing();
+        let resume_pos = self.current_position_sec().min(self.source_duration());
+
+        // Swap buffers to raw samples. For identity, this is the final state.
+        // For non-identity, streaming will stretch from raw in real-time.
+        if let Some(raw) = &self.audio_raw {
+            self.processed_samples = raw.samples_mono.to_vec();
+            self.processed_playback_samples = Arc::clone(&raw.samples_interleaved);
+            self.processed_playback_channels = raw.channels;
+
+            // The waveform is in source-time coordinates (0..source_duration),
+            // which doesn't change with speed — streaming uses timeline_rate =
+            // speed so the clock maps back to source time. Skip the expensive
+            // rebuild (full-sample scan + peak-normalize) on speed changes.
+            if self.waveform.is_empty() {
+                let waveform = build_waveform_for_processed(
+                    &self.processed_samples,
+                    raw.sample_rate,
+                    self.audio_quality_mode.waveform_points(),
+                    1.0,
+                );
+                self.set_waveform_data(waveform, false);
+            }
+        }
+
+        self.note_timeline = Arc::clone(&self.base_note_timeline);
+        self.note_timeline_step_sec = self.base_note_timeline_step_sec;
+        self.selected_time_sec = resume_pos;
+
+        if !was_playing {
+            return;
+        }
+
+        if speed_pitch_is_identity(self.speed, self.pitch_semitones) {
+            // Identity: play raw samples directly — instant, preserves stereo
+            self.play_from_selected();
         } else {
-            self.request_rebuild(false, RebuildMode::ParametersOnly);
+            // Non-identity: start streaming time-stretch from current position.
+            // First chunk arrives in <10ms, so playback starts almost instantly.
+            // Pitch is preserved, channels are preserved, no UI freeze.
+            self.start_streaming_playback(resume_pos);
         }
     }
 
@@ -251,6 +315,7 @@ impl KeyScribeApp {
         self.processing_started_at = None;
         self.processing_estimated_total_sec = 0.0;
         self.processing_audio_duration_sec = 0.0;
+        self.processing_cancel_flag = None;
     }
 
     pub(super) fn apply_processing_result(&mut self, result: ProcessingResult) {
@@ -298,12 +363,12 @@ impl KeyScribeApp {
                 self.restart_playback_after_processing = false;
                 if let Some(preview) = result.preview_playback {
                     let playback_rate = self.playback_rate();
-                    if let Some(raw) = &self.audio_raw {
+                    if self.audio_raw.is_some() {
                         if let Some(engine) = &mut self.engine {
                             if let Err(err) = engine.play_chunk_at_timeline(
                                 &preview.samples,
                                 preview.channels,
-                                raw.sample_rate,
+                                preview.sample_rate,
                                 preview.timeline_start_sec,
                                 playback_rate,
                             ) {
@@ -344,10 +409,16 @@ impl KeyScribeApp {
             None
         };
 
-        self.processed_samples = result.processed_samples;
-        self.processed_playback_samples = result.processed_playback_samples;
-        self.processed_playback_channels = result.processed_playback_channels;
-        self.set_waveform_data(result.waveform, true);
+        if result.mode != RebuildMode::VisualizationOnly {
+            self.processed_samples = result.processed_samples;
+            self.processed_playback_samples = result.processed_playback_samples;
+            self.processed_playback_channels = result.processed_playback_channels;
+
+            // Only reset waveform view on initial Full load, not on background param updates.
+            let reset_view = result.mode == RebuildMode::Full && self.waveform.is_empty();
+            self.set_waveform_data(result.waveform, reset_view);
+        }
+
         self.note_timeline = result.note_timeline;
         self.note_timeline_step_sec = result.note_timeline_step_sec;
         self.base_note_timeline = result.base_note_timeline;
@@ -396,7 +467,12 @@ impl KeyScribeApp {
             .map(|at| at.elapsed() >= PARAM_UPDATE_LIVE_DEBOUNCE)
             .unwrap_or(!pointer_down);
 
-        if pointer_down && !debounce_elapsed {
+        if pointer_down {
+            self.refresh_timeline_for_current_params();
+            return;
+        }
+
+        if !debounce_elapsed {
             return;
         }
 
@@ -504,15 +580,15 @@ impl KeyScribeApp {
             }
         };
 
-        if !is_supported_audio_extension(path.as_path()) {
-            return Err("Unsupported audio format. Use wav, mp3, flac, ogg, m4a, or aac.".into());
+        if !super::is_supported_media_extension(path.as_path()) {
+            return Err("Unsupported media format. Use wav, mp3, flac, ogg, m4a, aac, mp4, mkv, avi, mov, or webm.".into());
         }
         if !path.is_file() {
             return Err(format!("Audio file not found: {}", path.display()));
         }
 
         self.manual_import_path = path.to_string_lossy().to_string();
-        self.start_audio_loading(path, ctx);
+        self.start_audio_loading(path, ctx, true);
         Ok(())
     }
 
@@ -537,7 +613,7 @@ impl KeyScribeApp {
     #[cfg(feature = "desktop-ui")]
     pub(super) fn import_audio_with_ctx(&mut self, ctx: &egui::Context) {
         let picked = FileDialog::new()
-            .add_filter("Audio", &["wav", "mp3", "flac", "ogg", "m4a", "aac"])
+            .add_filter("Media", &["wav", "mp3", "flac", "ogg", "m4a", "aac", "mp4", "mkv", "avi", "mov", "webm"])
             .pick_file();
 
         if let Some(path) = picked {
@@ -550,48 +626,6 @@ impl KeyScribeApp {
     #[cfg(not(feature = "desktop-ui"))]
     pub(super) fn import_audio_with_ctx(&mut self, ctx: &egui::Context) {
         self.import_audio_from_manual_path(ctx);
-    }
-
-    #[allow(dead_code)]
-    pub(super) fn apply_loaded_audio(
-        &mut self,
-        path: PathBuf,
-        audio: AudioData,
-        ctx: &egui::Context,
-    ) {
-        self.cancel_active_processing();
-        self.loaded_audio_hash = None;
-        self.loaded_path = Some(path);
-        self.loading_preview_cache.clear();
-        self.selected_time_sec = 0.0;
-        self.audio_raw = Some(audio);
-        self.note_timeline = Arc::new(Vec::new());
-        self.note_timeline_step_sec = 0.0;
-        self.base_note_timeline = Arc::new(Vec::new());
-        self.base_note_timeline_step_sec = 0.0;
-        if let Some(raw) = &self.audio_raw {
-            self.processed_playback_channels = raw.channels.max(1);
-            if speed_pitch_is_identity(self.speed, self.pitch_semitones) {
-                self.processed_samples = raw.samples_mono.as_ref().to_vec();
-                self.processed_playback_samples = raw.samples_interleaved.as_ref().to_vec();
-                let waveform = build_waveform_for_processed(
-                    self.processed_samples.as_slice(),
-                    raw.sample_rate,
-                    self.audio_quality_mode.waveform_points(),
-                    1.0,
-                );
-                self.set_waveform_data(waveform, false);
-            } else {
-                self.processed_samples.clear();
-                self.processed_playback_samples.clear();
-                self.clear_waveform_data();
-            }
-        }
-        self.waveform_reset_view = true;
-        self.playing_preview_buffer = false;
-        self.live_stream_playback = false;
-        self.album_art_texture = self.create_album_art_texture(ctx);
-        self.update_note_probabilities(true);
     }
 
     pub(super) fn create_album_art_texture(
