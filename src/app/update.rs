@@ -7,9 +7,9 @@ impl eframe::App for KeyScribeApp {
         self.apply_mobile_ui_tweaks_once(ctx);
 
         let wants_keyboard = ctx.wants_keyboard_input();
-        let (space_pressed, k_pressed, left_pressed, right_pressed, m_pressed, ctrl_held) = ctx.input(|i| {
+        let (space_pressed, k_pressed, left_pressed, right_pressed, m_pressed, l_pressed, ctrl_held) = ctx.input(|i| {
             if wants_keyboard {
-                (false, false, false, false, false, i.modifiers.ctrl)
+                (false, false, false, false, false, false, i.modifiers.ctrl)
             } else {
                 (
                     i.key_pressed(egui::Key::Space),
@@ -17,6 +17,7 @@ impl eframe::App for KeyScribeApp {
                     i.key_pressed(egui::Key::ArrowLeft),
                     i.key_pressed(egui::Key::ArrowRight),
                     i.key_pressed(egui::Key::M),
+                    i.key_pressed(egui::Key::L),
                     i.modifiers.ctrl,
                 )
             }
@@ -26,13 +27,23 @@ impl eframe::App for KeyScribeApp {
             self.handle_space_replay();
         }
         if k_pressed {
-            self.handle_toggle_play_pause();
+            self.handle_k_play_pause();
         }
         if m_pressed {
             if let Some(hash) = &self.loaded_audio_hash {
                 let markers = self.file_markers.entry(hash.clone()).or_default();
                 markers.push(crate::app::MarkerData::Detailed { time: self.selected_time_sec, desc: String::new() });
                 markers.sort_by(|a, b| a.time().partial_cmp(&b.time()).unwrap());
+            }
+        }
+        if l_pressed {
+            self.loop_enabled = !self.loop_enabled;
+            if !self.loop_enabled {
+                self.loop_selection = None;
+                self.loop_playback_enabled = false;
+                if self.is_playing() {
+                    self.play_from_selected();
+                }
             }
         }
         if left_pressed {

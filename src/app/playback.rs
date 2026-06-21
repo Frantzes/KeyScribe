@@ -587,6 +587,34 @@ impl KeyScribeApp {
         }
     }
 
+    pub(super) fn handle_k_play_pause(&mut self) {
+        if self.audio_raw.is_none() {
+            return;
+        }
+
+        if self.is_playing() {
+            if let Some(engine) = &mut self.engine {
+                engine.pause();
+            }
+            self.loop_playback_enabled = false;
+            return;
+        }
+
+        let can_resume = self
+            .engine
+            .as_ref()
+            .map(|engine| engine.has_active_sink())
+            .unwrap_or(false);
+
+        if can_resume {
+            if let Some(engine) = &mut self.engine {
+                engine.resume();
+            }
+        } else {
+            self.play_from_selected();
+        }
+    }
+
     pub(super) fn maybe_restart_playback_for_listen_sync(&mut self) {
         if !self.is_playing() {
             return;

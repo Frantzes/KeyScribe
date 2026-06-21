@@ -695,7 +695,6 @@ fn fnv1a64_update(mut hash: u64, bytes: &[u8]) -> u64 {
 
 fn analysis_cache_variant_key(
     sample_rate: u32,
-    raw_sample_len: usize,
     audio_quality_mode: AudioQualityMode,
     speed: f32,
     pitch_semitones: f32,
@@ -704,7 +703,6 @@ fn analysis_cache_variant_key(
 ) -> String {
     let mut hash = 14695981039346656037u64;
     hash = fnv1a64_update(hash, &sample_rate.to_le_bytes());
-    hash = fnv1a64_update(hash, &(raw_sample_len as u64).to_le_bytes());
     hash = fnv1a64_update(hash, &[audio_quality_mode.cache_code()]);
     hash = fnv1a64_update(hash, &speed.to_bits().to_le_bytes());
     hash = fnv1a64_update(hash, &pitch_semitones.to_bits().to_le_bytes());

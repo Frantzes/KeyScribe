@@ -19,7 +19,6 @@ impl KeyScribeApp {
 
         let variant_key = analysis_cache_variant_key(
             sample_rate,
-            raw_sample_len,
             audio_quality_mode,
             speed,
             pitch_semitones,
@@ -27,10 +26,10 @@ impl KeyScribeApp {
             preprocess_audio,
         );
 
+        let strict_paths = analysis_cache_candidate_file_paths(song_hash, &variant_key);
+
         let expected_speed_bits = speed.to_bits();
         let expected_pitch_bits = pitch_semitones.to_bits();
-
-        let strict_paths = analysis_cache_candidate_file_paths(song_hash, &variant_key);
         let _strict_count = strict_paths.len();
         let mut candidate_paths = strict_paths;
         for path in analysis_cache_song_file_paths(song_hash) {
@@ -273,7 +272,6 @@ impl KeyScribeApp {
     ) -> Option<(Vec<f32>, Arc<Vec<Vec<f32>>>, f32, Option<Vec<[f64; 2]>>)> {
         let variant_key = analysis_cache_variant_key(
             sample_rate,
-            raw_sample_len,
             audio_quality_mode,
             speed,
             pitch_semitones,
@@ -396,7 +394,6 @@ impl KeyScribeApp {
 
         let variant_key = analysis_cache_variant_key(
             sample_rate,
-            raw_sample_len,
             audio_quality_mode,
             speed,
             pitch_semitones,

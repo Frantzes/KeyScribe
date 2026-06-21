@@ -110,7 +110,12 @@ impl KeyScribeApp {
                 return;
             }
 
-            let sample_rate = processing_sample_rate;
+            let is_original_mix = enabled_indices.is_empty();
+            let sample_rate = if is_original_mix {
+                raw_sample_rate
+            } else {
+                processing_sample_rate
+            };
 
             let (
                 raw_analysis_samples,
@@ -118,6 +123,7 @@ impl KeyScribeApp {
                 raw_playback_samples,
                 raw_playback_channels,
             ) = if let Some(stems) = maybe_stems {
+
                 let enabled_stems: Vec<_> = enabled_indices
                     .into_iter()
                     .filter_map(|idx| stems.get(idx).cloned())
@@ -131,6 +137,8 @@ impl KeyScribeApp {
 
                 let mono_analysis = if !melodic_stems.is_empty() {
                     crate::leadsheet::blend_for_chords(melodic_stems.as_slice())
+                } else if is_original_mix {
+                    raw_samples_mono.clone()
                 } else {
                     let total_mono_len = stems
                         .iter()
@@ -140,7 +148,9 @@ impl KeyScribeApp {
                     Arc::new(vec![0.0f32; total_mono_len])
                 };
 
-                let (interleaved, channels) = if !listening_indices.is_empty() {
+                let (interleaved, channels) = if is_original_mix {
+                    (raw_samples_interleaved, raw_channels)
+                } else if !listening_indices.is_empty() {
                     let listen_stems: Vec<_> = listening_indices
                         .iter()
                         .copied()
@@ -160,7 +170,9 @@ impl KeyScribeApp {
                     crate::leadsheet::blend_interleaved_stems(stems.as_slice())
                 };
 
-                let mono_render = if !listening_indices.is_empty() {
+                let mono_render = if is_original_mix {
+                    raw_samples_mono.clone()
+                } else if !listening_indices.is_empty() {
                     let listen_stems: Vec<_> = listening_indices
                         .iter()
                         .copied()
@@ -1097,7 +1109,7 @@ impl KeyScribeApp {
     }
 
     pub(super) fn refresh_note_timeline_from_selected_stems_preserving(&mut self) {
-        if self.stem_analyses.is_empty() {
+        if self.stem_analyses.is_empty() || self.enabled_stem_indices.is_empty() {
             self.request_rebuild_preserving_playback_and_waveform();
         } else {
             self.update_note_probabilities(true);

@@ -687,10 +687,6 @@ impl KeyScribeApp {
                     .spacing([14.0, 8.0])
                     .striped(true)
                     .show(ui, |ui| {
-                        ui.monospace("Space");
-                        ui.label("Replay from the selected time");
-                        ui.end_row();
-
                         ui.monospace("K");
                         ui.label("Play or pause");
                         ui.end_row();
@@ -741,6 +737,14 @@ impl KeyScribeApp {
                     .spacing([14.0, 8.0])
                     .striped(true)
                     .show(ui, |ui| {
+                        ui.monospace("L");
+                        ui.label("Toggle loop on/off");
+                        ui.end_row();
+
+                        ui.monospace("Space");
+                        ui.label("If looping, jump to beginning of loop");
+                        ui.end_row();
+
                         ui.monospace("M");
                         ui.label("Add a marker at the current playhead");
                         ui.end_row();
