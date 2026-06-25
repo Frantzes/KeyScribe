@@ -1,0 +1,130 @@
+name: Build
+
+on:
+  push:
+    branches: [main, feat/**]
+  pull_request:
+    branches: [main]
+
+env:
+  CARGO_TERM_COLOR: always
+  ASSETS_URL: https://github.com/Frantzes/KeyScribe/releases/download/assets-v1
+
+jobs:
+  build-windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+
+      - name: Cache ONNX models
+        id: cache-models
+        uses: actions/cache@v4
+        with:
+          path: models/
+          key: onnx-models-v1
+
+      - name: Download ONNX models
+        if: steps.cache-models.outputs.cache-hit != 'true'
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Path models -Force | Out-Null
+          foreach ($m in @("htdemucs_6s.onnx", "beat_this_small.onnx", "mel_spectrogram.onnx")) {
+            Invoke-WebRequest -Uri "$env:ASSETS_URL/$m" -OutFile "models/$m" -UseBasicParsing
+          }
+
+      - name: Cache vendor DLLs
+        id: cache-vendor
+        uses: actions/cache@v4
+        with:
+          path: |
+            vendor/onnxruntime/
+            vendor/ort-gpu/
+            vendor/cudnn/
+          key: vendor-dlls-v1
+
+      - name: Download vendor DLLs
+        if: steps.cache-vendor.outputs.cache-hit != 'true'
+        shell: pwsh
+        run: |
+          # ONNX Runtime CPU DLLs
+          New-Item -ItemType Directory -Path vendor/onnxruntime -Force | Out-Null
+          foreach ($dll in @("onnxruntime.dll", "DirectML.dll")) {
+            Invoke-WebRequest -Uri "$env:ASSETS_URL/$dll" -OutFile "vendor/onnxruntime/$dll" -UseBasicParsing
+          }
+
+      - name: Build
+        run: cargo build --release
+
+      - name: Package portable zip
+        shell: pwsh
+        run: scripts/build-windows.ps1 -SkipCargoBuild
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: keyscribe-windows
+          path: build/windows/keyscribe-windows-x64/
+
+  build-linux:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+
+      - name: Cache ONNX models
+        id: cache-models
+        uses: actions/cache@v4
+        with:
+          path: models/
+          key: onnx-models-v1
+
+      - name: Download ONNX models
+        if: steps.cache-models.outputs.cache-hit != 'true'
+        run: |
+          mkdir -p models
+          for m in htdemucs_6s.onnx beat_this_small.onnx mel_spectrogram.onnx; do
+            curl -fL "${{ env.ASSETS_URL }}/$m" -o "models/$m"
+          done
+
+      - name: Build
+        run: cargo build --release
+
+      - name: Package portable zip
+        run: bash scripts/build-linux.sh --skip-cargo-build
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: keyscribe-linux
+          path: build/linux/
+
+  build-macos:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+
+      - name: Cache ONNX models
+        id: cache-models
+        uses: actions/cache@v4
+        with:
+          path: models/
+          key: onnx-models-v1
+
+      - name: Download ONNX models
+        if: steps.cache-models.outputs.cache-hit != 'true'
+        run: |
+          mkdir -p models
+          for m in htdemucs_6s.onnx beat_this_small.onnx mel_spectrogram.onnx; do
+            curl -fL "${{ env.ASSETS_URL }}/$m" -o "models/$m"
+          done
+
+      - name: Build
+        run: cargo build --release
+
+      - name: Package portable zip
+        run: bash scripts/build-macos.sh --skip-cargo-build --portable-only
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: keyscribe-macos
+          path: build/macos/

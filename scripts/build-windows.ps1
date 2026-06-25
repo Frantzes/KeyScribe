@@ -81,13 +81,41 @@ exit /b 0
         Write-Warning "Close Keyscribe, then run apply-update.cmd in $bundleDir to finish replacing the executable."
     }
 
+    # --- Download ONNX models if missing ---
     $modelSourceDir = Join-Path $repoRoot "models"
+    New-Item -ItemType Directory -Path $modelSourceDir -Force | Out-Null
+
+    $assetBase = "https://github.com/Frantzes/KeyScribe/releases/download/assets-v1"
+    $requiredModels = @("htdemucs_6s.onnx", "beat_this_small.onnx", "mel_spectrogram.onnx")
+
+    foreach ($modelName in $requiredModels) {
+        $modelPath = Join-Path $modelSourceDir $modelName
+        if (-not (Test-Path $modelPath)) {
+            Write-Host "Downloading $modelName from GitHub Releases..."
+            Invoke-WebRequest -Uri "$assetBase/$modelName" -OutFile $modelPath -UseBasicParsing
+        }
+    }
+
     $modelFiles = @(Get-ChildItem -Path $modelSourceDir -Filter "*.onnx" -File -ErrorAction Stop)
     if ($modelFiles.Count -eq 0) {
         throw "Missing model files in models/"
     }
     foreach ($modelFile in $modelFiles) {
         Copy-Item -Path $modelFile.FullName -Destination (Join-Path $modelsDir $modelFile.Name) -Force
+    }
+
+    # --- ONNX Runtime CPU DLLs (for development / CPU fallback) ---
+    $ortCpuVendorDir = Join-Path $repoRoot "vendor\onnxruntime"
+    $ortCpuBase = "https://github.com/Frantzes/KeyScribe/releases/download/assets-v1"
+    $ortCpuDlls = @("onnxruntime.dll", "DirectML.dll")
+
+    foreach ($dll in $ortCpuDlls) {
+        $dllPath = Join-Path $ortCpuVendorDir $dll
+        if (-not (Test-Path $dllPath)) {
+            Write-Host "Downloading $dll from GitHub Releases..."
+            New-Item -ItemType Directory -Path $ortCpuVendorDir -Force | Out-Null
+            Invoke-WebRequest -Uri "$ortCpuBase/$dll" -OutFile $dllPath -UseBasicParsing
+        }
     }
 
     # --- CUDA / cuDNN Bundling ---

@@ -117,7 +117,27 @@ if [[ -z "$BINARY_PATH" ]]; then
     exit 1
 fi
 
+# --- Download ONNX models if missing ---
 MODEL_SOURCE_DIR="$REPO_ROOT/models"
+mkdir -p "$MODEL_SOURCE_DIR"
+
+ASSET_BASE="https://github.com/Frantzes/KeyScribe/releases/download/assets-v1"
+REQUIRED_MODELS=("htdemucs_6s.onnx" "beat_this_small.onnx" "mel_spectrogram.onnx")
+
+for MODEL_NAME in "${REQUIRED_MODELS[@]}"; do
+    if [ ! -f "$MODEL_SOURCE_DIR/$MODEL_NAME" ]; then
+        echo "Downloading $MODEL_NAME from GitHub Releases..."
+        if command -v curl >/dev/null 2>&1; then
+            curl -fL "$ASSET_BASE/$MODEL_NAME" -o "$MODEL_SOURCE_DIR/$MODEL_NAME"
+        elif command -v wget >/dev/null 2>&1; then
+            wget -qO "$MODEL_SOURCE_DIR/$MODEL_NAME" "$ASSET_BASE/$MODEL_NAME"
+        else
+            echo "Error: curl or wget required to download models." >&2
+            exit 1
+        fi
+    fi
+done
+
 mapfile -t MODEL_FILES < <(find "$MODEL_SOURCE_DIR" -maxdepth 1 -type f -name '*.onnx' | sort)
 if [ ${#MODEL_FILES[@]} -eq 0 ]; then
     echo "Missing model files in models/" >&2

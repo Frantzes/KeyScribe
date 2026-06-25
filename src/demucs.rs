@@ -1,7 +1,7 @@
 //! Demucs stem separation via ONNX Runtime.
 //!
-//! The `htdemucs_6s_faster_(fp16weights)` model is loaded from
-//! `models/htdemucs_6s_faster_(fp16weights).onnx`.
+//! The `htdemucs_6s` model is loaded from
+//! `models/htdemucs_6s.onnx`.
 //! This module handles:
 //!   - loading the ONNX session (resolved next to the executable, then cwd),
 //!   - preloading the CUDA/cuDNN runtime DLLs bundled next to the executable,
@@ -54,7 +54,7 @@ pub struct DemucsSeparator {
 }
 
 impl DemucsSeparator {
-    /// Load a Demucs ONNX model by name (e.g. "htdemucs_6s_faster_(fp16weights)").
+    /// Load a Demucs ONNX model by name (e.g. "htdemucs_6s").
     /// The file `{name}.onnx` is resolved next to the running executable
     /// (portable bundle), then the working directory.
     ///
