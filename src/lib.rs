@@ -1,7 +1,9 @@
 pub mod analysis;
 pub mod audio_io;
+pub mod beat_this;
 pub mod core;
 pub mod cqt;
+pub mod demucs;
 pub mod dsp;
 pub mod inference;
 pub mod leadsheet;

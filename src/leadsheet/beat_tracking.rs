@@ -1,5 +1,4 @@
-use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::path::Path;
 
 use anyhow::{anyhow, Context, Result};
 use serde::{Deserialize, Serialize};
@@ -37,26 +36,16 @@ pub enum BeatTrackDevice {
     Cuda,
 }
 
-impl BeatTrackDevice {
-    fn as_str(self) -> &'static str {
-        match self {
-            BeatTrackDevice::Auto => "auto",
-            BeatTrackDevice::Cpu => "cpu",
-            BeatTrackDevice::Cuda => "cuda",
-        }
-    }
-}
-
 pub fn run_beat_this(audio_path: &Path, config: &BeatTrackConfig) -> Result<BeatTrackResult> {
     let mut results = run_beat_this_multi(&[audio_path], config)?;
     results.pop().ok_or_else(|| anyhow!("No result from beat tracker"))
 }
 
-/// Run beat_this on multiple audio files in a single Python process call.
-/// The model is loaded once and reused across all files.
+/// Run beat_this on multiple audio files.
+/// The tracker is created once and reused across all files.
 pub fn run_beat_this_multi(
     audio_paths: &[&Path],
-    config: &BeatTrackConfig,
+    _config: &BeatTrackConfig,
 ) -> Result<Vec<BeatTrackResult>> {
     if audio_paths.is_empty() {
         return Err(anyhow!("No audio files provided for beat tracking"));
@@ -67,53 +56,18 @@ pub fn run_beat_this_multi(
         }
     }
 
-    let python_exe = if cfg!(windows) {
-        "python/src/.venv/Scripts/python.exe"
-    } else {
-        "python/src/.venv/bin/python"
-    };
-    let runner_script = "python/src/beat_this_runner.py";
+    let mut tracker = crate::beat_this::create_tracker()
+        .context("Failed to initialize beat-this tracker")?;
 
-    let mut cmd = Command::new(python_exe);
-    cmd.arg(runner_script);
+    let mut results = Vec::with_capacity(audio_paths.len());
     for &p in audio_paths {
-        cmd.arg(p);
+        let analysis = tracker.analyze_file(p)
+            .map_err(|e| anyhow!("beat-this failed on {}: {}", p.display(), e))?;
+        results.push(BeatTrackResult {
+            beats: analysis.beats,
+            downbeats: analysis.downbeats,
+        });
     }
-    cmd.arg("--model")
-        .arg(&config.model)
-        .arg("--device")
-        .arg(config.device.as_str());
-
-    if config.dbn {
-        cmd.arg("--dbn");
-    }
-
-    #[cfg(windows)]
-    {
-        use std::os::windows::process::CommandExt;
-        const CREATE_NO_WINDOW: u32 = 0x08000000;
-        cmd.creation_flags(CREATE_NO_WINDOW);
-    }
-
-    let output = cmd.output().context("BeatThis process failed to start")?;
-    
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let stderr = String::from_utf8_lossy(&output.stderr);
-
-    let temp_dir = std::env::temp_dir();
-    let _ = std::fs::write(temp_dir.join("beat_this_debug.json"), stdout.as_ref());
-    let _ = std::fs::write(temp_dir.join("beat_this_debug.err"), stderr.as_ref());
-
-    if !output.status.success() {
-        return Err(anyhow!(
-            "BeatThis process failed with status {:?}: {}",
-            output.status.code(),
-            stderr.trim()
-        ));
-    }
-
-    let mut results: Vec<BeatTrackResult> =
-        serde_json::from_str(stdout.trim()).context("Failed to parse BeatThis JSON array")?;
 
     for r in &mut results {
         correct_beat_metric_level(r);
@@ -122,65 +76,26 @@ pub fn run_beat_this_multi(
     Ok(results)
 }
 
-fn temp_wav_path() -> PathBuf {
-    let mut path = std::env::temp_dir();
-    let ts = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_nanos();
-    path.push(format!("keyscribe_beat_this_{:020}.wav", ts));
-    path
-}
 
-fn write_samples_to_wav(path: &Path, samples: &[f32], sample_rate: u32) -> Result<()> {
-    let channels: u16 = 1;
-    let bits_per_sample: u16 = 16;
-    let bytes_per_sample = bits_per_sample / 8;
-    let block_align = channels * bytes_per_sample;
-    let byte_rate = sample_rate * block_align as u32;
-    let data_size = samples.len() as u32 * bytes_per_sample as u32;
-    let file_size = 36 + data_size;
-
-    let mut buf = Vec::with_capacity(44 + data_size as usize);
-    buf.extend_from_slice(b"RIFF");
-    buf.extend_from_slice(&file_size.to_le_bytes());
-    buf.extend_from_slice(b"WAVE");
-    buf.extend_from_slice(b"fmt ");
-    buf.extend_from_slice(&16u32.to_le_bytes());
-    buf.extend_from_slice(&1u16.to_le_bytes());
-    buf.extend_from_slice(&channels.to_le_bytes());
-    buf.extend_from_slice(&sample_rate.to_le_bytes());
-    buf.extend_from_slice(&byte_rate.to_le_bytes());
-    buf.extend_from_slice(&block_align.to_le_bytes());
-    buf.extend_from_slice(&bits_per_sample.to_le_bytes());
-    buf.extend_from_slice(b"data");
-    buf.extend_from_slice(&data_size.to_le_bytes());
-
-    for &sample in samples {
-        let clamped = sample.clamp(-1.0, 1.0);
-        let i16_sample = (clamped * i16::MAX as f32) as i16;
-        buf.extend_from_slice(&i16_sample.to_le_bytes());
-    }
-
-    std::fs::write(path, buf)?;
-    Ok(())
-}
 
 /// Run beat_this on combined drum+bass stems (or fall back to full mix).
-/// Writes the combined audio to a temporary WAV file for the Python model.
 pub fn run_beat_this_combined(
     bass_samples: Option<&[f32]>,
     drum_samples: Option<&[f32]>,
     full_mix_samples: Option<&[f32]>,
     sample_rate: u32,
-    config: &BeatTrackConfig,
+    _config: &BeatTrackConfig,
 ) -> Result<BeatTrackResult> {
     let combined = combined_audio(bass_samples, drum_samples, full_mix_samples)?;
-    let temp_path = temp_wav_path();
-    write_samples_to_wav(&temp_path, &combined, sample_rate)?;
-    let result = run_beat_this(&temp_path, config);
-    let _ = std::fs::remove_file(&temp_path);
-    result
+    let mut tracker = crate::beat_this::create_tracker()
+        .context("Failed to initialize beat-this tracker")?;
+    let analysis = tracker.analyze_audio(&combined, sample_rate)?;
+    let mut result = BeatTrackResult {
+        beats: analysis.beats,
+        downbeats: analysis.downbeats,
+    };
+    correct_beat_metric_level(&mut result);
+    Ok(result)
 }
 
 fn infer_beats_per_bar(downbeats: &[f32], beats: &[f32]) -> u32 {
@@ -272,7 +187,7 @@ pub fn cross_validate_beat_sources(
     drum_samples: Option<&[f32]>,
     full_mix_samples: Option<&[f32]>,
     sample_rate: u32,
-    config: &BeatTrackConfig,
+    _config: &BeatTrackConfig,
 ) -> Result<CrossValidatedBeats> {
     // ---- collect audio sources to analyse ----
     let mut source_labels: Vec<String> = Vec::new();
@@ -295,29 +210,19 @@ pub fn cross_validate_beat_sources(
         source_audios.push(b.to_vec());
     }
 
-    // ---- write temp WAV files ----
-    let mut temp_paths: Vec<PathBuf> = Vec::with_capacity(source_audios.len());
-    for samples in source_audios.iter() {
-        let p = temp_wav_path();
-        write_samples_to_wav(&p, samples, sample_rate)?;
-        temp_paths.push(p);
-    }
-
-    // ---- run beat-this on all sources in one call ----
-    let ref_paths: Vec<&Path> = temp_paths.iter().map(|p| p.as_path()).collect();
-    let results = match run_beat_this_multi(&ref_paths, config) {
-        Ok(r) => r,
-        Err(e) => {
-            for p in &temp_paths {
-                let _ = std::fs::remove_file(p);
-            }
-            return Err(e);
-        }
-    };
-
-    // clean up temp files
-    for p in &temp_paths {
-        let _ = std::fs::remove_file(p);
+    // ---- run beat-this on all sources ----
+    let mut tracker = crate::beat_this::create_tracker()
+        .context("Failed to initialize beat-this tracker")?;
+    let mut results: Vec<BeatTrackResult> = Vec::with_capacity(source_audios.len());
+    for (label, samples) in source_labels.iter().zip(source_audios.iter()) {
+        let analysis = tracker.analyze_audio(samples, sample_rate)
+            .map_err(|e| anyhow!("beat-this failed on {label}: {e}"))?;
+        let mut r = BeatTrackResult {
+            beats: analysis.beats,
+            downbeats: analysis.downbeats,
+        };
+        correct_beat_metric_level(&mut r);
+        results.push(r);
     }
 
     // ---- cross-validate ----

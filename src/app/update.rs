@@ -104,8 +104,10 @@ impl eframe::App for KeyScribeApp {
         self.poll_audio_loading(ctx);
 
         // Auto-run separation once audio is fully loaded (not during streaming).
-        if self.auto_separate
-            && !self.is_audio_loading
+        // When auto_separate is disabled we still load an existing cache so
+        // previously-separated stems are available on reopen; we only skip
+        // running a fresh separation.
+        if !self.is_audio_loading
             && self.audio_raw.is_some()
             && self.loaded_audio_hash.is_some()
             && self.separated_stems.is_none()
@@ -113,12 +115,24 @@ impl eframe::App for KeyScribeApp {
             && !self.separation_attempted
         {
             let duration = self.source_duration() as f64;
-            if duration > super::AUTO_SEPARATE_MAX_DURATION_SEC {
-                self.separation_attempted = true;
-                self.cache_status_message = Some("Stem separation is manual for this source since it is longer than 10 minutes.".to_string());
-                self.cache_status_message_at = Some(std::time::Instant::now());
-            } else {
+            let cache_exists = self.stem_cache_exists_for_current_song();
+
+            if cache_exists {
+                // Cached stems exist — load them instantly regardless of the
+                // auto_separate setting.
                 self.run_instrument_separation();
+            } else if self.auto_separate {
+                if duration > super::AUTO_SEPARATE_MAX_DURATION_SEC {
+                    self.separation_attempted = true;
+                    self.cache_status_message = Some("Stem separation is manual for this source since it is longer than 10 minutes.".to_string());
+                    self.cache_status_message_at = Some(std::time::Instant::now());
+                } else {
+                    self.run_instrument_separation();
+                }
+            } else {
+                // No cache and auto-separate is off — skip fresh separation.
+                // The user can still run it manually via the toolbar button.
+                self.separation_attempted = true;
             }
         }
 
@@ -1000,6 +1014,7 @@ impl eframe::App for KeyScribeApp {
                                         } else {
                                             let start = a.min(b);
                                             let end = a.max(b);
+                                            self.loop_selection = Some((start, end));
                                             self.selected_time_sec = start;
                                             self.loop_enabled = true;
                                             self.loop_playback_enabled = true;
@@ -1099,7 +1114,8 @@ impl eframe::App for KeyScribeApp {
                                         if let Some(markers) = self.file_markers.get(hash) {
                                             if idx < markers.len() {
                                                 let end = self.loop_selection.map(|(_, e)| e).unwrap_or(interaction_duration);
-                                                self.loop_selection = Some((markers[idx].time(), end));
+                                                let (start, end) = (markers[idx].time().min(end), markers[idx].time().max(end));
+                                                self.loop_selection = Some((start, end));
                                                 self.loop_enabled = true;
                                                 self.loop_playback_enabled = true;
                                                 ui.close_menu();
@@ -1110,7 +1126,8 @@ impl eframe::App for KeyScribeApp {
                                         if let Some(markers) = self.file_markers.get(hash) {
                                             if idx < markers.len() {
                                                 let start = self.loop_selection.map(|(s, _)| s).unwrap_or(0.0);
-                                                self.loop_selection = Some((start, markers[idx].time()));
+                                                let (start, end) = (start.min(markers[idx].time()), start.max(markers[idx].time()));
+                                                self.loop_selection = Some((start, end));
                                                 self.loop_enabled = true;
                                                 self.loop_playback_enabled = true;
                                                 ui.close_menu();

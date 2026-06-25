@@ -1,6 +1,74 @@
 use super::*;
 use crate::leadsheet::StemType;
 
+/// Compute the RMS level of interleaved audio samples.
+fn rms_interleaved(samples: &[f32]) -> f32 {
+    if samples.is_empty() {
+        return 0.0;
+    }
+    let sum_sq: f64 = samples.iter().map(|&s| (s as f64) * (s as f64)).sum();
+    (sum_sq / samples.len() as f64).sqrt() as f32
+}
+
+/// Soft-limit a single sample above `threshold` toward 1.0.
+///
+/// Below the threshold the sample is returned unchanged (no distortion of
+/// the signal body). Above it, a tanh-style knee gently compresses peaks so
+/// we can apply large loudness-matching gains without harsh clipping —
+/// unlike a linear normalize-down, which would attenuate the whole signal
+/// and undo the loudness boost.
+#[inline]
+fn soft_limit(x: f32, threshold: f32) -> f32 {
+    let a = x.abs();
+    if a <= threshold {
+        return x;
+    }
+    let sign = if x >= 0.0 { 1.0 } else { -1.0 };
+    let headroom = 1.0 - threshold;
+    let excess = (a - threshold) / headroom;
+    sign * (threshold + headroom * excess.tanh())
+}
+
+/// Scale a stem mix to match the source audio's RMS loudness.
+///
+/// Individual stems and small stem subsets are naturally quieter than the
+/// full mix because the full mix is approximately the sum of all stems.
+/// This applies a gain to bring the stem mix's RMS up to the source's RMS,
+/// with clamping to avoid amplifying noise on near-silent stems. Peaks that
+/// would clip are handled with a soft limiter (not a linear attenuator) so
+/// the perceived loudness gain is preserved.
+pub(super) fn loudness_match_to_source(
+    stem_mix: Arc<Vec<f32>>,
+    source: Option<&[f32]>,
+) -> Arc<Vec<f32>> {
+    let Some(source) = source else {
+        return stem_mix;
+    };
+    if stem_mix.is_empty() || source.is_empty() {
+        return stem_mix;
+    }
+    let src_rms = rms_interleaved(source);
+    let mix_rms = rms_interleaved(&stem_mix);
+    if src_rms < 1e-6 || mix_rms < 1e-6 {
+        return stem_mix;
+    }
+    let gain = (src_rms / mix_rms).clamp(0.25, 32.0);
+    if (gain - 1.0).abs() < 0.02 {
+        return stem_mix;
+    }
+    let scaled: Vec<f32> = stem_mix.iter().map(|&s| s * gain).collect();
+    let max_val = scaled.iter().copied().fold(0.0f32, |a, b| a.max(b.abs()));
+    if max_val <= 1.0 {
+        return Arc::new(scaled);
+    }
+    // Soft-limit peaks above 0.9 instead of attenuating the whole signal.
+    // This keeps the body of the signal (and thus the RMS/loudness) intact
+    // while preventing harsh digital clipping.
+    let threshold = 0.9;
+    let limited: Vec<f32> = scaled.iter().map(|&s| soft_limit(s, threshold)).collect();
+    Arc::new(limited)
+}
+
 impl KeyScribeApp {
     fn loading_preview_chunk_start(start_sec: f32) -> f32 {
         let stride = LOADING_PREVIEW_CACHE_STRIDE_SEC.max(0.25);
@@ -220,6 +288,15 @@ impl KeyScribeApp {
                 let sr = enabled_stems.first().map(|s| s.sample_rate).unwrap_or(sample_rate);
                 let (b, c) = crate::leadsheet::blend_interleaved_stems(enabled_stems.as_slice());
                 (b, c, sr)
+            };
+
+            let blended = if !current_key.is_empty() {
+                loudness_match_to_source(
+                    blended,
+                    self.audio_raw.as_ref().map(|a| a.samples_interleaved.as_slice()),
+                )
+            } else {
+                blended
             };
 
             self.stem_playback_cache = Some(StemPlaybackCache {
@@ -534,59 +611,6 @@ impl KeyScribeApp {
         }
     }
 
-    pub(super) fn handle_toggle_play_pause(&mut self) {
-        if self.audio_raw.is_none() {
-            return;
-        }
-
-        if self.is_playing() {
-            if let Some(engine) = &mut self.engine {
-                engine.pause();
-            }
-            return;
-        }
-
-        let can_resume_existing = self
-            .engine
-            .as_ref()
-            .map(|engine| engine.has_active_sink())
-            .unwrap_or(false);
-
-        if self.loop_enabled {
-            if let Some((a, b)) = self.loop_selection {
-                let start = a.min(b);
-                let end = a.max(b);
-                if end - start > LOOP_MIN_DURATION_SEC {
-                    self.loop_playback_enabled = true;
-
-                    if can_resume_existing {
-                        if let Some(engine) = &mut self.engine {
-                            engine.resume();
-                        }
-                    } else {
-                        let current_pos = self.current_position_sec();
-                        let restart_from = if current_pos < start || current_pos >= end - 0.01 {
-                            start
-                        } else {
-                            current_pos.clamp(start, end)
-                        };
-                        self.selected_time_sec = restart_from;
-                        self.play_range(restart_from, Some(end));
-                    }
-                    return;
-                }
-            }
-        }
-
-        if can_resume_existing {
-            if let Some(engine) = &mut self.engine {
-                engine.resume();
-            }
-        } else {
-            self.play_from_selected();
-        }
-    }
-
     pub(super) fn handle_k_play_pause(&mut self) {
         if self.audio_raw.is_none() {
             return;
@@ -833,6 +857,15 @@ impl KeyScribeApp {
                 let sr = enabled_stems.first().map(|s| s.sample_rate).unwrap_or(sample_rate);
                 let (b, c) = crate::leadsheet::blend_interleaved_stems(enabled_stems.as_slice());
                 (b, c, sr)
+            };
+
+            let blended = if !current_key.is_empty() {
+                loudness_match_to_source(
+                    blended,
+                    self.audio_raw.as_ref().map(|a| a.samples_interleaved.as_slice()),
+                )
+            } else {
+                blended
             };
 
             self.stem_playback_cache = Some(StemPlaybackCache {

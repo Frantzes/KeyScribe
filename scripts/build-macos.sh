@@ -206,19 +206,7 @@ EOF
     ARCHIVE_PATH="$REPO_ROOT/$OUTPUT_ROOT/$BUNDLE_NAME.zip"
     rm -f "$ARCHIVE_PATH"
 
-    python3 - "$BUNDLE_DIR" "$ARCHIVE_PATH" <<'PY'
-import pathlib
-import sys
-import zipfile
-
-bundle_dir = pathlib.Path(sys.argv[1])
-archive_path = pathlib.Path(sys.argv[2])
-
-with zipfile.ZipFile(archive_path, mode="w", compression=zipfile.ZIP_DEFLATED) as archive:
-    for item in bundle_dir.rglob("*"):
-        if item.is_file():
-            archive.write(item, item.relative_to(bundle_dir))
-PY
+    cd "$BUNDLE_DIR" && zip -r "$ARCHIVE_PATH" .
 
     echo "Portable bundle directory: $BUNDLE_DIR"
     echo "Portable bundle archive:   $ARCHIVE_PATH"

@@ -17,10 +17,22 @@ target
 **/mutants.out*/
 
 # RustRover
-#  JetBrains specific template is maintained in a separate JetBrains.gitignore that can
-#  be found at https://github.com/github/gitignore/blob/main/Global/JetBrains.gitignore
-#  and can be added to the global gitignore or merged into this file.  For a more nuclear
-#  option (not recommended) you can uncomment the following to ignore the entire idea folder.
+#  JetBrains specific template is maintained in a separate JetBrains gitignore that can
+#  be found at https://github.com/github/gitignore/blob/main/Github/JetBrains.gitignore
+#  and can be added to the global gitignore or merged into this file.
+#  For a more nuclear (not recommended) option, uncomment the following to ignore the entire idea folder.
 #.idea/
 .transcriber_state.json
 .transcriber_cache/
+
+# ONNX model files - downloaded by scripts/setup.ps1, not committed
+models/*.onnx
+
+# CUDA/cuDNN/ORT DLLs are downloaded by scripts/build-windows.ps1, not committed
+vendor/cudnn/*.dll
+vendor/cudnn/*.zip
+vendor/ort-gpu/*.dll
+vendor/ort-gpu/*.whl
+
+# ONNX Runtime DLLs - downloaded by scripts/setup.ps1, not committed
+vendor/onnxruntime/*.dll

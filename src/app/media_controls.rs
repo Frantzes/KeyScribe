@@ -685,7 +685,11 @@ fn draw_loop_inputs(ui: &mut egui::Ui, app: &mut KeyScribeApp) {
         app.loop_selection = Some((new_start, new_end));
         app.loop_playback_enabled = true;
         if app.is_playing() {
-            app.play_from_selected();
+            let pos = app.current_position_sec();
+            if pos < new_start || pos >= new_end {
+                app.selected_time_sec = new_start;
+                app.play_range(new_start, Some(new_end));
+            }
         }
     }
 }

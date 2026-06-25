@@ -11,7 +11,7 @@ KeyScribe is a desktop application for polyphonic note detection, sheet music ge
 
 - **Audio & Video Import:** Drag-and-drop or open via file dialog. Supports wav, mp3, flac, ogg, m4a, aac, mp4, mkv, avi, mov, webm.
 - **Waveform & Piano Roll:** Real-time interactive waveform display with an 88-key piano roll that highlights detected notes as the playhead moves.
-- **AI Stem Separation:** Separate audio into Vocals, Bass, Drums, and Other stems using Demucs. Visualize or listen to individual stems.
+- **AI Stem Separation:** Separate audio into Vocals, Bass, Drums, Piano, Guitar, and Other stems using Demucs. Visualize or listen to individual stems. GPU-accelerated on NVIDIA GPUs (CUDA + cuDNN); falls back to CPU on other hardware.
 - **Per-Stem Piano Roll:** Toggle individual stems on the piano roll to see which instrument is playing what.
 - **Video Playback:** Synchronized video with audio-master clock (VLC-style sync engine). Frame-accurate seeking, no accumulating drift.
 - **Sheet Music Generation (Experimental):** Generate MusicXML from detected notes. In-app engraved preview via Verovio. Supports lead sheet, piano grand staff, and single staff modes. Export to MusicXML or PDF via MuseScore.
@@ -24,7 +24,7 @@ KeyScribe is a desktop application for polyphonic note detection, sheet music ge
 
 ## How It Works: The Pipeline
 
-KeyScribe uses a hybrid architecture combining a high-performance Rust core with specialized Python subprocesses for state-of-the-art AI analysis.
+KeyScribe is a pure Rust application — all AI inference runs locally via ONNX Runtime (Demucs, Basic Pitch) and the `beat-this` Rust crate, with no Python dependency. Stem separation GPU acceleration requires an NVIDIA GPU with CUDA 12 and cuDNN 9 (bundled in the Windows release); on other GPUs or CPUs it falls back to multi-threaded CPU inference.
 
 ### 1. Importing an Audio or Video File
 
@@ -33,11 +33,11 @@ When you drag and drop or import a file, KeyScribe initiates a high-concurrency 
 - **Audio Decoding (Rust):** The audio track is decoded into a raw sample stream using `Symphonia`. A waveform visualization is generated and rendered instantly.
 - **Video Decoding (FFmpeg):** For video files, FFmpeg is spawned as a subprocess to pipe raw RGBA frames for synchronized playback.
 - **Hashing & Cache Check (Rust):** A unique hash of the audio is calculated. KeyScribe checks the local analysis cache. If a cache hit occurs, transcription data loads instantly.
-- **Parallel Subprocesses (Python):** If no cache is found, Python subprocesses run in parallel for transcription and stem separation.
+- **Parallel Analysis (Rust):** If no cache is found, stem separation (Demucs), transcription (Basic Pitch), and beat tracking (beat-this) run concurrently.
 
 ### 2. Stem Separation & Per-Stem Analysis
 
-- **Stem Separation (Demucs):** The `demucs_runner.py` subprocess separates the audio into Vocals, Bass, Drums, and Other stems.
+- **Stem Separation (Demucs):** The ONNX-exported Demucs model separates the audio into Vocals, Bass, Drums, Piano, Guitar, and Other stems. GPU acceleration via NVIDIA CUDA + cuDNN (verified at startup with automatic CPU fallback if unavailable).
 - **Background Stem Analysis:** Each stem is independently analyzed for note probabilities. The UI lets you toggle which stems appear on the piano roll ("Visualize") or in the playback mix ("Listen").
 
 ### 3. Sheet Music Generation
@@ -45,7 +45,7 @@ When you drag and drop or import a file, KeyScribe initiates a high-concurrency 
 Once the initial analysis is complete, you can generate sheet music from the **Sheet Music** tab:
 
 1. **Stem Selection:** Choose which stems feed the melody and chord detection (or use the full mix).
-2. **Tempo & Beat Tracking:** The `beat_this_runner.py` subprocess establishes a precise tempo map.
+2. **Tempo & Beat Tracking:** The `beat-this` Rust crate establishes a precise tempo map.
 3. **Quantization:** Detected notes are snapped to a musical grid (supports quarter, eighth, 16th, dotted, and triplet subdivisions).
 4. **Melody Extraction:** Monophonic (skyline or heuristic with outlier suppression) or polyphonic mode.
 5. **Chord Analysis:** Automatic chord symbol detection and per-bar chord changes.
@@ -67,8 +67,7 @@ KeyScribe uses a VLC-style audio-master clock for drift-free playback:
 ### Prerequisites
 
 - **Rust 1.70+**
-- **Python 3.10+** (with `torch` and `demucs` installed in the project environment)
-- **FFmpeg (Also bundled)** (for video playback)
+- **FFmpeg (bundled)** (for video playback)
 
 ### Build & Run
 
