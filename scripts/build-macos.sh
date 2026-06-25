@@ -167,7 +167,27 @@ if [[ -z "$BINARY_PATH" ]]; then
     exit 1
 fi
 
+# --- Download ONNX models if missing ---
 MODEL_SOURCE_DIR="$REPO_ROOT/models"
+mkdir -p "$MODEL_SOURCE_DIR"
+
+ASSET_BASE="https://github.com/Frantzes/KeyScribe/releases/download/assets-v1"
+REQUIRED_MODELS=("htdemucs_6s.onnx" "beat_this_small.onnx" "mel_spectrogram.onnx")
+
+for MODEL_NAME in "${REQUIRED_MODELS[@]}"; do
+    if [[ ! -f "$MODEL_SOURCE_DIR/$MODEL_NAME" ]]; then
+        echo "Downloading $MODEL_NAME from GitHub Releases..."
+        if command -v curl >/dev/null 2>&1; then
+            curl -fL "$ASSET_BASE/$MODEL_NAME" -o "$MODEL_SOURCE_DIR/$MODEL_NAME"
+        elif command -v wget >/dev/null 2>&1; then
+            wget -qO "$MODEL_SOURCE_DIR/$MODEL_NAME" "$ASSET_BASE/$MODEL_NAME"
+        else
+            echo "Error: curl or wget required to download models." >&2
+            exit 1
+        fi
+    fi
+done
+
 MODEL_FILES=()
 while IFS= read -r; do MODEL_FILES+=("$REPLY"); done < <(find "$MODEL_SOURCE_DIR" -maxdepth 1 -type f -name '*.onnx' | sort)
 if [[ ${#MODEL_FILES[@]} -eq 0 ]]; then
@@ -206,19 +226,7 @@ EOF
     ARCHIVE_PATH="$REPO_ROOT/$OUTPUT_ROOT/$BUNDLE_NAME.zip"
     rm -f "$ARCHIVE_PATH"
 
-    python3 - "$BUNDLE_DIR" "$ARCHIVE_PATH" <<'PY'
-import pathlib
-import sys
-import zipfile
-
-bundle_dir = pathlib.Path(sys.argv[1])
-archive_path = pathlib.Path(sys.argv[2])
-
-with zipfile.ZipFile(archive_path, mode="w", compression=zipfile.ZIP_DEFLATED) as archive:
-    for item in bundle_dir.rglob("*"):
-        if item.is_file():
-            archive.write(item, item.relative_to(bundle_dir))
-PY
+    cd "$BUNDLE_DIR" && zip -r "$ARCHIVE_PATH" .
 
     echo "Portable bundle directory: $BUNDLE_DIR"
     echo "Portable bundle archive:   $ARCHIVE_PATH"

@@ -50,6 +50,15 @@ struct SeparationModelOption {
     path: std::path::PathBuf,
 }
 
+impl SeparationModelOption {
+    fn stem_name(&self) -> Option<String> {
+        self.path
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .map(|s| s.to_string())
+    }
+}
+
 impl KeyScribeApp {
     fn draw_toolbar_separator(ui: &mut egui::Ui) {
         Self::draw_toolbar_separator_with_bleed(ui, 0.0);
@@ -66,15 +75,7 @@ impl KeyScribeApp {
 
     fn available_separation_models() -> Vec<SeparationModelOption> {
         let mut options = Vec::new();
-
-        // HTDemucs 6s is our primary model, now handled via Python
-        options.push(SeparationModelOption {
-            label: "HTDemucs (6 Stems)".to_string(),
-            path: std::path::PathBuf::from("htdemucs_6s"),
-        });
-
         let mut seen_names = std::collections::BTreeSet::<String>::new();
-        seen_names.insert("htdemucs_6s".to_string());
 
         for directory in Self::separation_model_search_dirs() {
             let Ok(entries) = std::fs::read_dir(&directory) else {
@@ -82,7 +83,9 @@ impl KeyScribeApp {
             };
 
             for entry in entries.flatten() {
-                let path = entry.path();
+                // Canonicalize paths so comparison between frames is consistent
+                // regardless of relative vs absolute or path separator differences.
+                let path = entry.path().canonicalize().unwrap_or_else(|_| entry.path());
                 let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or("");
                 if stem.is_empty() || seen_names.contains(stem) {
                     continue;
@@ -115,13 +118,13 @@ impl KeyScribeApp {
             .unwrap_or("")
             .to_ascii_lowercase();
 
-        // Skip basic-pitch which is a transcription model
+        // Skip transcription models
         if stem.contains("basic-pitch") || stem.contains("basic pitch") || stem.contains("pitch") {
             return false;
         }
 
-        // Skip models that we are now handling via Python/builtin
-        if stem == "htdemucs_6s" || stem == "kim_inst" {
+        // Skip beat tracking models
+        if stem.contains("beat_this") || stem.contains("mel_spectrogram") {
             return false;
         }
 
@@ -164,12 +167,27 @@ impl KeyScribeApp {
             return None;
         }
 
-        if let Some(selected) = &self.selected_separation_model_path {
-            if options.iter().any(|option| option.path == *selected) {
-                return Some(selected.clone());
+        // Match by stem name (more robust than full path comparison)
+        if let Some(ref name) = self.selected_separation_model_name {
+            if let Some(opt) = options.iter().find(|o| o.stem_name().as_deref() == Some(name)) {
+                return Some(opt.path.clone());
             }
         }
 
+        // Prefer the base htdemucs_6s model (fp32, works on both CUDA GPU
+        // and CPU), then fall back to fp16 variants (CPU-only due to NaN on
+        // CUDA), then any other demucs model.
+        if let Some(preferred) = options.iter().find(|option| {
+            option.stem_name().as_deref() == Some("htdemucs_6s")
+        }) {
+            return Some(preferred.path.clone());
+        }
+        for option in &options {
+            let lower = option.label.to_ascii_lowercase();
+            if lower.contains("fp16") || lower.contains("half") || lower.contains("16") {
+                return Some(option.path.clone());
+            }
+        }
         if let Some(preferred) = options.iter().find(|option| {
             let lower = option.label.to_ascii_lowercase();
             lower.contains("htdemucs") || lower.contains("demucs")
@@ -280,42 +298,22 @@ impl KeyScribeApp {
 
         ui.label("Separation Model");
         let models = Self::available_separation_models();
-        let selected_model_label = self
-            .selected_separation_model_path()
-            .and_then(|selected_path| {
-                models
-                    .iter()
-                    .find(|option| option.path == selected_path)
-                    .map(|option| option.label.clone())
-            })
-            .unwrap_or_else(|| "No models found".to_string());
-
-        egui::ComboBox::from_id_source("separation_model_selector")
-            .selected_text(selected_model_label)
-            .show_ui(ui, |ui| {
-                if models.is_empty() {
-                    ui.label(egui::RichText::new("Add one or more .onnx files in models/").weak());
+        for option in &models {
+            let is_sel = self
+                .selected_separation_model_name
+                .as_ref()
+                .map(|name| option.stem_name().as_deref() == Some(name.as_str()))
+                .unwrap_or(false);
+            if ui.selectable_label(is_sel, option.label.as_str()).clicked() {
+                if let Some(stem) = option.stem_name() {
+                    self.selected_separation_model_name = Some(stem);
                 }
-
-                for option in &models {
-                    let selected = self
-                        .selected_separation_model_path
-                        .as_ref()
-                        .map(|path| path == &option.path)
-                        .unwrap_or(false);
-
-                    if ui
-                        .selectable_label(selected, option.label.as_str())
-                        .clicked()
-                    {
-                        self.selected_separation_model_path = Some(option.path.clone());
-                        self.separated_stems = None;
-                        self.enabled_listening_indices.clear();
-                        self.enabled_stem_indices.clear();
-                        self.refresh_note_timeline_from_selected_stems();
-                    }
-                }
-            });
+                self.separated_stems = None;
+                self.enabled_listening_indices.clear();
+                self.enabled_stem_indices.clear();
+                self.refresh_note_timeline_from_selected_stems();
+            }
+        }
 
         Self::draw_toolbar_separator(ui);
 
@@ -326,6 +324,31 @@ impl KeyScribeApp {
                 self.run_instrument_separation();
             }
         });
+    }
+
+    /// Check whether a valid stem separation cache exists for the currently
+    /// loaded song and selected model. Mirrors the cache validation logic in
+    /// `InstrumentSeparator::separate` (version + path).
+    pub(super) fn stem_cache_exists_for_current_song(&self) -> bool {
+        let Some(song_hash) = &self.loaded_audio_hash else {
+            return false;
+        };
+        let model_name = self
+            .selected_separation_model_path()
+            .and_then(|p| p.file_stem().map(|s| s.to_string_lossy().to_string()))
+            .unwrap_or_else(|| "htdemucs_6s".to_string());
+
+        const STEM_CACHE_VERSION: u32 = 3;
+        let stem_cache_root = app_cache_base_dir()
+            .join("stems")
+            .join(song_hash)
+            .join(&model_name);
+        let version_path = stem_cache_root.join(".cache_version");
+        stem_cache_root.exists()
+            && std::fs::read_to_string(&version_path)
+                .ok()
+                .and_then(|s| s.trim().parse::<u32>().ok())
+                .map_or(false, |v| v == STEM_CACHE_VERSION)
     }
 
     pub(super) fn run_instrument_separation(&mut self) {
@@ -638,6 +661,8 @@ impl KeyScribeApp {
                 }
             });
 
+            // Separation model selector — placed directly in the menu bar
+            // (not inside Settings) to avoid egui's nested-popup click issue.
             ui.menu_button("Settings", |ui| {
                 ui.set_min_width(Self::responsive_menu_min_width(ui));
                 self.draw_audio_settings_menu(ui);

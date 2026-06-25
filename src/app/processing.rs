@@ -148,6 +148,7 @@ impl KeyScribeApp {
                     Arc::new(vec![0.0f32; total_mono_len])
                 };
 
+                let source_interleaved_ref = Arc::clone(&raw_samples_interleaved);
                 let (interleaved, channels) = if is_original_mix {
                     (raw_samples_interleaved, raw_channels)
                 } else if !listening_indices.is_empty() {
@@ -168,6 +169,15 @@ impl KeyScribeApp {
                 } else {
                     // "Blend / All" -> use all stems for playback
                     crate::leadsheet::blend_interleaved_stems(stems.as_slice())
+                };
+
+                let interleaved = if !is_original_mix {
+                    super::playback::loudness_match_to_source(
+                        interleaved,
+                        Some(source_interleaved_ref.as_slice()),
+                    )
+                } else {
+                    interleaved
                 };
 
                 let mono_render = if is_original_mix {
