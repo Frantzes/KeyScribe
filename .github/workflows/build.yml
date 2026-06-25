@@ -2,7 +2,7 @@ name: Build
 
 on:
   push:
-    branches: [main, feat/**]
+    branches: [main]
   pull_request:
     branches: [main]
 
@@ -11,7 +11,17 @@ env:
   ASSETS_URL: https://github.com/Frantzes/KeyScribe/releases/download/assets-v1
 
 jobs:
+  version:
+    runs-on: ubuntu-latest
+    outputs:
+      tag: v${{ steps.cargo-version.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: cargo-version
+        run: echo "version=$(awk -F'\"' '/^version[[:space:]]*=/{print $2; exit}' Cargo.toml)" >> "$GITHUB_OUTPUT"
+
   build-windows:
+    needs: [version]
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
@@ -47,7 +57,6 @@ jobs:
         if: steps.cache-vendor.outputs.cache-hit != 'true'
         shell: pwsh
         run: |
-          # ONNX Runtime CPU DLLs
           New-Item -ItemType Directory -Path vendor/onnxruntime -Force | Out-Null
           foreach ($dll in @("onnxruntime.dll", "DirectML.dll")) {
             Invoke-WebRequest -Uri "$env:ASSETS_URL/$dll" -OutFile "vendor/onnxruntime/$dll" -UseBasicParsing
@@ -66,6 +75,7 @@ jobs:
           path: build/windows/keyscribe-windows-x64/
 
   build-linux:
+    needs: [version]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -98,6 +108,7 @@ jobs:
           path: build/linux/
 
   build-macos:
+    needs: [version]
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@v4
@@ -128,3 +139,37 @@ jobs:
         with:
           name: keyscribe-macos
           path: build/macos/
+
+  release:
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    needs: [version, build-windows, build-linux, build-macos]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+
+      - name: Zip each platform bundle
+        run: |
+          cd keyscribe-windows && zip -r ../keyscribe-windows-x64.zip . && cd ..
+          cd keyscribe-linux && zip -r ../keyscribe-linux-x64.zip . && cd ..
+          cd keyscribe-macos && zip -r ../keyscribe-macos-arm64.zip . && cd ..
+
+      - name: Create Release
+        run: |
+          TAG="${{ needs.version.outputs.tag }}"
+          if gh release view "$TAG" --json tagName 2>/dev/null; then
+            echo "Release $TAG already exists — skipping."
+          else
+            gh release create "$TAG" \
+              keyscribe-windows-x64.zip \
+              keyscribe-linux-x64.zip \
+              keyscribe-macos-arm64.zip \
+              --title "$TAG" \
+              --generate-notes
+          fi
+        env:
+          GH_TOKEN: ${{ github.token }}
