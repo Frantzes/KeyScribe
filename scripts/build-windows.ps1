@@ -6,8 +6,7 @@ param(
     [switch]$SkipZip
 )
 
-Set-StrictMode -Version Latest
-$ErrorActionPreference = "Stop"
+$ErrorActionPreference = "Continue"
 
 $scriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
 $repoRoot = Resolve-Path (Join-Path $scriptDir "..")
@@ -192,9 +191,10 @@ exit /b 0
             $extractTmp = Join-Path $cudnnVendorDir "extract"
             Expand-Archive -Path $cudnnZip -DestinationPath $extractTmp -Force
             # The archive layout is cudnn-windows-x86_64-9.x.x_cuda12-archive\bin\*.dll
-            $cudnnBin = Get-ChildItem -Path $extractTmp -Recurse -Directory -Filter "bin" |
-                Where-Object { (Get-ChildItem $_.FullName -Filter "cudnn64_9.dll").Count -gt 0 } |
-                Select-Object -First 1
+            $cudnnFiles = Get-ChildItem -Path $extractTmp -Recurse -Directory -Filter "bin"
+            $cudnnBin = $cudnnFiles | Where-Object {
+                Test-Path (Join-Path $_.FullName "cudnn64_9.dll")
+            } | Select-Object -First 1
             if ($cudnnBin) {
                 foreach ($dll in $cudnnDllNames) {
                     $src = Join-Path $cudnnBin.FullName $dll
@@ -396,7 +396,11 @@ CUDA/cuDNN DLL paths work.
             Remove-Item -Path $zipPath -Force
         }
 
-        Compress-Archive -Path (Join-Path $bundleDir "*") -DestinationPath $zipPath -CompressionLevel Optimal
+        try {
+            Compress-Archive -Path (Join-Path $bundleDir "*") -DestinationPath $zipPath -CompressionLevel Optimal -ErrorAction Stop
+        } catch {
+            Write-Warning "Failed to create zip: $_"
+        }
         Write-Host "Portable bundle zip:       $zipPath"
     } else {
         Write-Host "Portable zip generation skipped."

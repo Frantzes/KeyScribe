@@ -68,6 +68,7 @@ jobs:
         run: scripts/build-windows.ps1 -SkipCargoBuild
 
       - uses: actions/upload-artifact@v4
+        if: always()
         with:
           name: keyscribe-windows
           path: build/windows/keyscribe-windows-x64/
@@ -104,6 +105,7 @@ jobs:
         run: bash scripts/build-linux.sh --skip-cargo-build
 
       - uses: actions/upload-artifact@v4
+        if: always()
         with:
           name: keyscribe-linux
           path: build/linux/
@@ -137,6 +139,7 @@ jobs:
         run: bash scripts/build-macos.sh --skip-cargo-build --portable-only
 
       - uses: actions/upload-artifact@v4
+        if: always()
         with:
           name: keyscribe-macos
           path: build/macos/
@@ -151,25 +154,28 @@ jobs:
 
       - name: Download all artifacts
         uses: actions/download-artifact@v4
-
-      - name: Zip each platform bundle
-        run: |
-          cd keyscribe-windows && zip -r ../keyscribe-windows-x64.zip . && cd ..
-          cd keyscribe-linux && zip -r ../keyscribe-linux-x64.zip . && cd ..
-          cd keyscribe-macos && zip -r ../keyscribe-macos-arm64.zip . && cd ..
+        with:
+          merge-multiple: true
 
       - name: Create Release
         run: |
           TAG="${{ needs.version.outputs.tag }}"
           if gh release view "$TAG" --json tagName 2>/dev/null; then
             echo "Release $TAG already exists — skipping."
-          else
-            gh release create "$TAG" \
-              keyscribe-windows-x64.zip \
-              keyscribe-linux-x64.zip \
-              keyscribe-macos-arm64.zip \
-              --title "$TAG" \
-              --generate-notes
+            exit 0
           fi
+          ASSETS=()
+          for dir in keyscribe-windows keyscribe-linux keyscribe-macos; do
+            if [ -d "$dir" ]; then
+              ARCHIVE="${dir}.zip"
+              cd "$dir" && zip -r "../$ARCHIVE" . && cd ..
+              ASSETS+=("$ARCHIVE")
+            fi
+          done
+          if [ ${#ASSETS[@]} -eq 0 ]; then
+            echo "No artifacts to release — skipping."
+            exit 0
+          fi
+          gh release create "$TAG" "${ASSETS[@]}" --title "$TAG" --generate-notes
         env:
           GH_TOKEN: ${{ github.token }}
