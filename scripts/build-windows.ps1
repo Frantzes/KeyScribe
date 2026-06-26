@@ -411,3 +411,5 @@ CUDA/cuDNN DLL paths work.
 finally {
     Pop-Location
 }
+
+exit 0
