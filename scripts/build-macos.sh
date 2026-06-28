@@ -315,6 +315,8 @@ EOF
     #     --install-location "/Applications" \
     #     "$PKG_PATH"
 
+    mkdir -p "$REPO_ROOT/$OUTPUT_ROOT"
+
     DMG_STAGE_DIR="$APP_STAGE_DIR/dmg-root"
     rm -rf "$DMG_STAGE_DIR"
     mkdir -p "$DMG_STAGE_DIR"
