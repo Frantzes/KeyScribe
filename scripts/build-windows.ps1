@@ -85,7 +85,7 @@ exit /b 0
     New-Item -ItemType Directory -Path $modelSourceDir -Force | Out-Null
 
     $assetBase = "https://github.com/Frantzes/KeyScribe/releases/download/assets-v1"
-    $requiredModels = @("htdemucs_6s.onnx", "beat_this_small.onnx", "mel_spectrogram.onnx")
+    $requiredModels = @("htdemucs_6s.onnx", "beat_this_small.onnx", "mel_spectrogram.onnx", "basic-pitch.onnx")
 
     foreach ($modelName in $requiredModels) {
         $modelPath = Join-Path $modelSourceDir $modelName

@@ -122,7 +122,7 @@ MODEL_SOURCE_DIR="$REPO_ROOT/models"
 mkdir -p "$MODEL_SOURCE_DIR"
 
 ASSET_BASE="https://github.com/Frantzes/KeyScribe/releases/download/assets-v1"
-REQUIRED_MODELS=("htdemucs_6s.onnx" "beat_this_small.onnx" "mel_spectrogram.onnx")
+REQUIRED_MODELS=("htdemucs_6s.onnx" "beat_this_small.onnx" "mel_spectrogram.onnx" "basic-pitch.onnx")
 
 for MODEL_NAME in "${REQUIRED_MODELS[@]}"; do
     if [ ! -f "$MODEL_SOURCE_DIR/$MODEL_NAME" ]; then
