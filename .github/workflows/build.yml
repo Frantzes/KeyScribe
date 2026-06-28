@@ -135,8 +135,10 @@ jobs:
       - name: Build
         run: cargo build --release
 
-      - name: Package portable zip
-        run: bash scripts/build-macos.sh --skip-cargo-build --portable-only
+      - name: Package macOS DMG
+        env:
+          DMG_ONLY: "1"
+        run: bash scripts/build-macos.sh --skip-cargo-build
 
       - uses: actions/upload-artifact@v4
         if: always()
