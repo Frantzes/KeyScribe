@@ -34,3 +34,9 @@ vendor/cudnn/*.zip
 vendor/ort-gpu/*.dll
 vendor/ort-gpu/*.whl
 vendor/onnxruntime/*.dll
+
+# Flatpak build cache (downloaded sources, build trees, ccache) — generated
+# by flatpak-builder in the repo root, not committed
+.flatpak-builder/
+# Flatpak bundle outputs
+*.flatpak

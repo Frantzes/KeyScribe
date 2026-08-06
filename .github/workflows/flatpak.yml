@@ -1,0 +1,97 @@
+name: Flatpak
+
+# Builds the Linux Flatpak on GitHub's free runners and smoke-tests that the
+# resulting bundle actually launches. The .flatpak bundle is uploaded as a
+# build artifact so it can be sideloaded and tested.
+#
+# Requirements are installed automatically by the flatpak-github-actions
+# container: flatpak-builder installs the org.freedesktop 24.08 runtime, SDK
+# and the rust-stable SDK extension from Flathub at build time.
+
+on:
+  push:
+    branches: [main, "feat/flatpak-support"]
+    paths:
+      - "flatpak/**"
+      - ".github/workflows/flatpak.yml"
+      - "src/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - ".gitignore"
+  pull_request:
+    branches: [main]
+    paths:
+      - "flatpak/**"
+      - ".github/workflows/flatpak.yml"
+      - "src/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - ".gitignore"
+  workflow_dispatch:
+
+jobs:
+  flatpak:
+    name: Build & smoke-test Flatpak
+    runs-on: ubuntu-latest
+    container:
+      image: ghcr.io/flathub-infra/flatpak-github-actions:gnome-48
+      options: --privileged
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Build Flatpak and create bundle
+        uses: flatpak/flatpak-github-actions/flatpak-builder@v6
+        with:
+          bundle: keyscribe.flatpak
+          manifest-path: flatpak/com.frantzes.keyscribe.yml
+          build-dir: flatpak-build
+          repo-dir: repo
+          state-dir: .flatpak-builder
+          cache-key: flatpak-builder
+          upload-artifact: true
+          run-tests: false
+
+      - name: Verify installed layout
+        run: |
+          flatpak-builder --run flatpak-build sh -c '
+            set -e
+            test -x /app/bin/keyscribe && echo "ok: /app/bin/keyscribe"
+            test -L /app/bin/libonnxruntime.so && echo "ok: /app/bin/libonnxruntime.so symlink"
+            test -x /app/bin/ffmpeg && test -x /app/bin/ffprobe && echo "ok: ffmpeg/ffprobe"
+            test -f /app/bin/models/htdemucs_6s.onnx && echo "ok: htdemucs model"
+            test -f /app/bin/models/beat_this_small.onnx && echo "ok: beat model"
+            test -f /app/bin/models/mel_spectrogram.onnx && echo "ok: mel model"
+            test -f /app/bin/cuda/libonnxruntime.so && echo "ok: cuda/ort libs"
+            test -f /app/share/applications/com.frantzes.keyscribe.desktop && echo "ok: desktop file"
+            test -f /app/share/metainfo/com.frantzes.keyscribe.metainfo.xml && echo "ok: metainfo"
+            test -f /app/share/icons/hicolor/256x256/apps/com.frantzes.keyscribe.png && echo "ok: icon"
+          '
+
+      - name: Smoke test — app launches and stays running under Xvfb
+        run: |
+          set +e
+          xvfb-run -a -e xvfb-error.log bash -c '
+            flatpak-builder --run flatpak-build > app.log 2>&1 &
+            pid=$!
+            for i in $(seq 1 45); do
+              if ! kill -0 "$pid" 2>/dev/null; then
+                wait "$pid"
+                code=$?
+                echo "::error::App exited early (code $code). Output:"
+                cat app.log
+                if [ -s xvfb-error.log ]; then
+                  echo "--- xvfb errors ---"
+                  cat xvfb-error.log
+                fi
+                exit 1
+              fi
+              sleep 1
+            done
+            echo "App stayed alive for 45s under Xvfb — PASS"
+            kill "$pid" 2>/dev/null
+            wait "$pid" 2>/dev/null
+          '
+          code=$?
+          exit $code

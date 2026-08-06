@@ -1,0 +1,163 @@
+---
+id: com.frantzes.keyscribe
+runtime: org.freedesktop.Platform//24.08
+sdk: org.freedesktop.Sdk//24.08
+sdk-extensions:
+  - org.freedesktop.Sdk.Extension.rust-stable
+
+# ONNX Runtime GPU only publishes CUDA-enabled wheels for x86_64, so the
+# Flatpak is x86_64-only (the app still runs on CPU without any CUDA libs).
+architectures:
+  - x86_64
+
+command: keyscribe
+
+finish-args:
+  - --share=ipc
+  - --socket=x11
+  - --socket=wayland
+  - --device=dri
+  - --socket=pulseaudio
+  - --socket=session-bus
+  - --talk-name=org.freedesktop.portal.FileChooser
+  - --talk-name=org.freedesktop.portal.OpenURI
+  - --filesystem=host
+  - --env=LD_LIBRARY_PATH=/app/bin/cuda
+  - --env=XDG_CURRENT_DESKTOP=Unity
+
+modules:
+  # ──────────────────────────────────────────────
+  # FFmpeg — static build from BtbN GitHub
+  # ──────────────────────────────────────────────
+  - name: ffmpeg
+    buildsystem: simple
+    build-commands:
+      - install -Dm755 bin/ffmpeg /app/bin/ffmpeg
+      - install -Dm755 bin/ffprobe /app/bin/ffprobe
+    sources:
+      - type: archive
+        url: https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-master-latest-linux64-gpl.tar.xz
+        sha256: 063b269c95944d5e7dcb9a123bd30c43e57ed141df287690a8aacb0b9d3be7b1
+        strip-components: 1
+
+  # ──────────────────────────────────────────────
+  # ONNX models — from GitHub Releases
+  # ──────────────────────────────────────────────
+  - name: onnx-models
+    buildsystem: simple
+    build-commands:
+      - install -Dm644 htdemucs_6s.onnx /app/bin/models/htdemucs_6s.onnx
+      - install -Dm644 beat_this_small.onnx /app/bin/models/beat_this_small.onnx
+      - install -Dm644 mel_spectrogram.onnx /app/bin/models/mel_spectrogram.onnx
+    sources:
+      - type: file
+        url: https://github.com/Frantzes/KeyScribe/releases/download/assets-v1/htdemucs_6s.onnx
+        sha256: b268327119b709141d43ba4103e7bb5f54bbf33311d6f1af5054ef663bf83322
+        dest-filename: htdemucs_6s.onnx
+      - type: file
+        url: https://github.com/Frantzes/KeyScribe/releases/download/assets-v1/beat_this_small.onnx
+        sha256: a5f8d39d989f31859454ba27afe61c5317ca95e4d9373e6853e5361b8937172f
+        dest-filename: beat_this_small.onnx
+      - type: file
+        url: https://github.com/Frantzes/KeyScribe/releases/download/assets-v1/mel_spectrogram.onnx
+        sha256: fdd59e65c515331308e4c8841edf99972deca646bdf6197744c2a5b7755e3de9
+        dest-filename: mel_spectrogram.onnx
+
+  # ──────────────────────────────────────────────
+  # cuDNN 9 — from NVIDIA redistributable
+  # ──────────────────────────────────────────────
+  - name: cudnn
+    buildsystem: simple
+    build-commands:
+      - mkdir -p /app/bin/cuda
+      - |
+        cd cudnn-extract
+        for lib in libcudnn.so.9 libcudnn_graph.so.9 libcudnn_ops.so.9 \
+                   libcudnn_heuristic.so.9 libcudnn_adv.so.9 \
+                   libcudnn_cnn.so.9 libcudnn_engines_precompiled.so.9 \
+                   libcudnn_engines_runtime_compiled.so.9; do
+          find . -name "$lib" -exec install -m755 {} /app/bin/cuda/ \;
+        done
+    sources:
+      - type: archive
+        url: https://developer.download.nvidia.com/compute/cudnn/redist/cudnn/linux-x86_64/cudnn-linux-x86_64-9.3.0.75_cuda12-archive.tar.xz
+        sha256: 3d6ef10aa06dc9339a477e2b057e085ff8500bbdee79e42c7e13655c9eff2c26
+        dest: cudnn-extract
+
+  # ──────────────────────────────────────────────
+  # ONNX Runtime GPU — from PyPI pip wheel
+  # ──────────────────────────────────────────────
+  - name: onnxruntime-gpu
+    buildsystem: simple
+    build-commands:
+      - mkdir -p wheel-extract
+      - unzip -q onnxruntime_gpu*.whl -d wheel-extract
+      - |
+        cd wheel-extract/onnxruntime/capi
+        for f in libonnxruntime.so* libonnxruntime_providers_cuda.so* \
+                 libonnxruntime_providers_shared.so*; do
+          if [ -f "$f" ] || [ -L "$f" ]; then
+            cp -aP "$f" /app/bin/cuda/
+          fi
+        done
+      - ln -sf /app/bin/cuda/libonnxruntime.so /app/bin/libonnxruntime.so
+      - cp -aP /app/bin/cuda/libonnxruntime_providers_cuda.so /app/bin/
+    sources:
+      - type: file
+        url: https://files.pythonhosted.org/packages/92/1d/2eb4443d9e85c5e219b61cd4995ef1d30bc5981c4bbb5dd624c9445edb8d/onnxruntime_gpu-1.24.2-cp312-cp312-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl
+        sha256: e4a3f793b291fb678583db0e78836319ab662f10a8485f7de858631b4ea5361c
+        dest-filename: onnxruntime_gpu-1.24.2-cp312-cp312-manylinux.whl
+
+  # ──────────────────────────────────────────────
+  # KeyScribe — Rust binary + desktop integration
+  # ──────────────────────────────────────────────
+  - name: keyscribe
+    buildsystem: simple
+    build-options:
+      append-path: /usr/lib/sdk/rust-stable/bin
+      env:
+        CARGO_HOME: /run/build/keyscribe/cargo
+    build-commands:
+      # Copy CUDA 12 runtime .so files from the build host if available.
+      # This is optional — without CUDA the app falls back to CPU inference.
+      - |
+        for dir in /usr/local/cuda-12.6/lib64 /usr/local/cuda-12.5/lib64 \
+                   /usr/local/cuda-12.4/lib64 /usr/local/cuda/lib64; do
+          if [ -f "$dir/libcudart.so.12" ]; then
+            echo "Bundling CUDA 12 runtime from: $dir"
+            for lib in libcudart.so.12 libcublas.so.12 libcublasLt.so.12 \
+                       libcufft.so.11 libcurand.so.10 libnvrtc.so.12; do
+              if [ -f "$dir/$lib" ]; then
+                cp -aL "$dir/$lib" /app/bin/cuda/
+              fi
+            done
+            break
+          fi
+        done
+      # Build Rust binary
+      - cargo build --release --manifest-path Cargo.toml
+      # Install binary
+      - install -Dm755 target/release/keyscribe /app/bin/keyscribe
+      # Desktop integration
+      - install -Dm644 flatpak/com.frantzes.keyscribe.desktop /app/share/applications/com.frantzes.keyscribe.desktop
+      - install -Dm644 flatpak/com.frantzes.keyscribe.metainfo.xml /app/share/metainfo/com.frantzes.keyscribe.metainfo.xml
+      - install -Dm644 icon.png /app/share/icons/hicolor/256x256/apps/com.frantzes.keyscribe.png
+    sources:
+      # Copy the repo root, skipping heavy/dev-only dirs so they don't get
+      # staged into the sandbox (target/, .venv/, vendor/, models/, ...).
+      - type: dir
+        path: ..
+        dest: .
+        skip:
+          - .git
+          - .gitignore
+          - .venv
+          - .flatpak-builder
+          - .vscode
+          - .agents
+          - target
+          - build
+          - vendor
+          - models
+          - demucs_output
+          - assets
