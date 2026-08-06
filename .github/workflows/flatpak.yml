@@ -29,6 +29,11 @@ on:
       - ".gitignore"
   workflow_dispatch:
 
+# Only one flatpak build per branch at a time; a newer push cancels older runs.
+concurrency:
+  group: flatpak-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   flatpak:
     name: Build & smoke-test Flatpak
