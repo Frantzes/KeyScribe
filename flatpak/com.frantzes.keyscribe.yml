@@ -36,8 +36,8 @@ modules:
       - install -Dm755 bin/ffprobe /app/bin/ffprobe
     sources:
       - type: archive
-        url: https://github.com/BtbN/FFmpeg-Builds/releases/download/autobuild-2026-08-06-13-39/ffmpeg-master-latest-linux64-gpl.tar.xz
-        sha256: f3e3c7a9605f3cb9554b552e1c3e3f12a1b17791e1c694737f668f874b230dfe
+        url: https://github.com/BtbN/FFmpeg-Builds/releases/download/autobuild-2026-08-06-13-39/ffmpeg-N-125978-g95c43d7df7-linux64-gpl.tar.xz
+        sha256: 6fd6364a237569dc12940079acc636be9ff2b2f444552c0bad699186e3552c3d
         strip-components: 1
 
   # ──────────────────────────────────────────────
