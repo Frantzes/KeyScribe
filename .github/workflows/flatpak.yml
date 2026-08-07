@@ -60,7 +60,7 @@ jobs:
 
       - name: Verify installed layout
         run: |
-          flatpak-builder --run flatpak-build sh -c '
+          flatpak-builder --run flatpak-build flatpak/com.frantzes.keyscribe.yml sh -c '
             set -e
             test -x /app/bin/keyscribe && echo "ok: /app/bin/keyscribe"
             test -L /app/bin/libonnxruntime.so && echo "ok: /app/bin/libonnxruntime.so symlink"
@@ -78,7 +78,7 @@ jobs:
         run: |
           set +e
           xvfb-run -a -e xvfb-error.log bash -c '
-            flatpak-builder --run flatpak-build > app.log 2>&1 &
+            flatpak-builder --run flatpak-build flatpak/com.frantzes.keyscribe.yml > app.log 2>&1 &
             pid=$!
             for i in $(seq 1 45); do
               if ! kill -0 "$pid" 2>/dev/null; then
