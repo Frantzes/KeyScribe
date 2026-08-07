@@ -4,6 +4,7 @@ runtime: org.freedesktop.Platform//24.08
 sdk: org.freedesktop.Sdk//24.08
 sdk-extensions:
   - org.freedesktop.Sdk.Extension.rust-stable
+  - org.freedesktop.Sdk.Extension.llvm18
 
 # ONNX Runtime GPU only publishes CUDA-enabled wheels for x86_64, so the
 # Flatpak is x86_64-only (the app still runs on CPU without any CUDA libs).
@@ -119,6 +120,7 @@ modules:
         CARGO_HOME: /run/build/keyscribe/cargo
         CARGO_NET_OFFLINE: "true"
         VEROVIO_SOURCE_DIR: /run/build/keyscribe/verovio-source
+        LIBCLANG_PATH: /usr/lib/sdk/llvm18/lib
     build-commands:
       # Copy CUDA 12 runtime .so files from the build host if available.
       # This is optional — without CUDA the app falls back to CPU inference.
