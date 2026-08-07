@@ -98,7 +98,7 @@ jobs:
         run: |
           set +e
           dbus-run-session -- xvfb-run -a -e xvfb-error.log bash -c '
-            flatpak-builder --run flatpak-build flatpak/com.frantzes.keyscribe.yml > app.log 2>&1 &
+            flatpak-builder --run flatpak-build flatpak/com.frantzes.keyscribe.yml /app/bin/keyscribe > app.log 2>&1 &
             pid=$!
             for i in $(seq 1 45); do
               if ! kill -0 "$pid" 2>/dev/null; then

@@ -1,6 +1,5 @@
 [Desktop Entry]
 Name=KeyScribe
-Summary=Polyphonic music transcription and stem separation
 Comment=Polyphonic music note detection, stem separation, sheet music generation, and video transcription from recorded audio
 Exec=keyscribe
 Icon=com.frantzes.keyscribe
