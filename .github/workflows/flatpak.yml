@@ -58,6 +58,26 @@ jobs:
           upload-artifact: true
           run-tests: false
 
+      - name: Prepare sandbox for flatpak run (machine-id, mask rofiles-fuse)
+        run: |
+          # dbus needs a machine-id, and flatpak-builder --run cannot spawn
+          # rofiles-fuse inside this container (no /dev/fuse), so hide the
+          # binary from PATH to make flatpak-builder fall back to a plain
+          # sandbox ("rofiles-fuse not available, doing without").
+          if [ ! -s /etc/machine-id ]; then
+            dbus-uuidgen --ensure=/etc/machine-id 2>/dev/null \
+              || sudo dbus-uuidgen --ensure=/etc/machine-id 2>/dev/null \
+              || sudo sh -c 'cat /proc/sys/kernel/random/uuid > /etc/machine-id'
+          fi
+          echo "machine-id: $(cat /etc/machine-id 2>/dev/null || echo MISSING)"
+          rofiles="$(command -v rofiles-fuse || true)"
+          if [ -n "$rofiles" ]; then
+            sudo rm -f "$rofiles" || rm -f "$rofiles"
+            echo "masked rofiles-fuse: $rofiles"
+          else
+            echo "rofiles-fuse not found in PATH"
+          fi
+
       - name: Verify installed layout
         run: |
           flatpak-builder --run flatpak-build flatpak/com.frantzes.keyscribe.yml sh -c '
@@ -77,7 +97,7 @@ jobs:
       - name: Smoke test — app launches and stays running under Xvfb
         run: |
           set +e
-          xvfb-run -a -e xvfb-error.log bash -c '
+          dbus-run-session -- xvfb-run -a -e xvfb-error.log bash -c '
             flatpak-builder --run flatpak-build flatpak/com.frantzes.keyscribe.yml > app.log 2>&1 &
             pid=$!
             for i in $(seq 1 45); do
