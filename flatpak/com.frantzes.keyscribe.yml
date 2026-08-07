@@ -138,9 +138,13 @@ modules:
             break
           fi
         done
-      # Build Rust binary from vendored crates (no network needed)
+      # Build Rust binary from vendored crates (no network needed). bindgen
+      # crates need the SDK's gcc/glibc headers; clang from the llvm18
+      # extension doesn't find them on its own.
       - cargo --offline fetch --manifest-path Cargo.toml
-      - cargo build --offline --release --manifest-path Cargo.toml
+      - |
+        export BINDGEN_EXTRA_CLANG_ARGS="-I$(gcc -print-file-name=include) -I$(gcc -print-file-name=include-fixed) -I/usr/include"
+        cargo build --offline --release --manifest-path Cargo.toml
       # Install binary
       - install -Dm755 target/release/keyscribe /app/bin/keyscribe
       # Desktop integration
