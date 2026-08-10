@@ -10,6 +10,19 @@ pub struct ChordAnalysisConfig {
     pub skip: bool,
     pub max_chords_per_bar: usize,
     pub chord_min_simultaneous: usize,
+    /// Beat offset within the bar (0.0 = downbeat) at which to sample notes for
+    /// the primary chord. Negative means "scan the first half and pick the
+    /// position with the most simultaneous pitch classes" (the legacy behavior,
+    /// which is biased toward the noisiest transcription moment).
+    pub chord_sample_beat: f32,
+    /// When true and `chord_sample_beat < 0`, scan the first half but pick the
+    /// position with the FEWEST pitch classes (still >= `chord_min_simultaneous`):
+    /// the moment where the chord tones are cleanest rather than noisiest.
+    pub chord_sample_cleanest: bool,
+    /// When true and `chord_sample_beat < 0`, scan the first half but pick the
+    /// position where the most notes ONSET together (the strike moment), instead
+    /// of the most simultaneous sounding pitch classes.
+    pub chord_sample_strike: bool,
 }
 
 impl Default for ChordAnalysisConfig {
@@ -20,6 +33,9 @@ impl Default for ChordAnalysisConfig {
             skip: false,
             max_chords_per_bar: 2,
             chord_min_simultaneous: 3,
+            chord_sample_beat: -1.0,
+            chord_sample_cleanest: false,
+            chord_sample_strike: false,
         }
     }
 }
@@ -160,16 +176,40 @@ pub fn detect_chord_changes_per_bar(
             (pcs_set, bass_pitch, total_duration, active_count)
         }
 
-        // Scan first half of bar at fine resolution
+        // Number of notes whose onset falls within a small window before `pos`.
+        fn strike_count(notes: &[&QuantizedNote], pos: f32) -> usize {
+            notes
+                .iter()
+                .filter(|n| pos - n.beat_start >= -0.05 && pos - n.beat_start <= 0.3)
+                .count()
+        }
+
+        // Primary chord: either sample at a fixed beat offset (downbeat bias)
+        // or scan the first half at fine resolution.
         let mut best_first: Option<Candidate> = None;
-        let mut pos = bar_start;
-        while pos < half_bar - 1e-5 {
+        if config.chord_sample_beat >= 0.0 {
+            let pos = (bar_start + config.chord_sample_beat).max(bar_start);
             let (pcs_set, bass_pitch, total_dur, active) = collect_at(&bar_notes, pos);
-            let num_pcs = pcs_set.len();
-            if num_pcs >= 1 {
-                let score = num_pcs as f32 * 5.0 + total_dur * 2.0 + active as f32;
+            if pcs_set.len() >= 1 {
+                best_first = Some(Candidate {
+                    pos,
+                    pcs: pcs_set.iter().copied().collect(),
+                    bass_pitch,
+                    num_pcs: pcs_set.len(),
+                    score: pcs_set.len() as f32 * 5.0 + total_dur * 2.0 + active as f32,
+                });
+            }
+        } else if config.chord_sample_strike {
+            // Pick the position in the first half with the most simultaneous
+            // note onsets (the strike moment), then use its sounding pcs.
+            let mut pos = bar_start;
+            while pos < half_bar - 1e-5 {
+                let (pcs_set, bass_pitch, _total_dur, _active) = collect_at(&bar_notes, pos);
+                let num_pcs = pcs_set.len();
+                let strikes = strike_count(&bar_notes, pos);
                 let is_better = match &best_first {
-                    Some(b) => num_pcs > b.num_pcs || (num_pcs == b.num_pcs && score > b.score),
+                    Some(b) => strikes > b.score as usize
+                        || (strikes == b.score as usize && num_pcs > b.num_pcs),
                     None => true,
                 };
                 if is_better {
@@ -178,16 +218,65 @@ pub fn detect_chord_changes_per_bar(
                         pcs: pcs_set.iter().copied().collect(),
                         bass_pitch,
                         num_pcs,
-                        score,
+                        score: strikes as f32,
                     });
                 }
+                pos += scan_step;
             }
-            pos += scan_step;
+        } else if config.chord_sample_cleanest {
+            // Pick the position in the first half with the fewest pitch classes
+            // (still >= the simultaneous threshold): the moment where the
+            // transcribed chord tones are cleanest.
+            let mut pos = bar_start;
+            while pos < half_bar - 1e-5 {
+                let (pcs_set, bass_pitch, total_dur, active) = collect_at(&bar_notes, pos);
+                let num_pcs = pcs_set.len();
+                if num_pcs >= 1 {
+                    let score = num_pcs as f32 * 5.0 + total_dur * 2.0 + active as f32;
+                    let is_better = match &best_first {
+                        Some(b) => num_pcs < b.num_pcs || (num_pcs == b.num_pcs && score > b.score),
+                        None => true,
+                    };
+                    if is_better {
+                        best_first = Some(Candidate {
+                            pos,
+                            pcs: pcs_set.iter().copied().collect(),
+                            bass_pitch,
+                            num_pcs,
+                            score,
+                        });
+                    }
+                }
+                pos += scan_step;
+            }
+        } else {
+            let mut pos = bar_start;
+            while pos < half_bar - 1e-5 {
+                let (pcs_set, bass_pitch, total_dur, active) = collect_at(&bar_notes, pos);
+                let num_pcs = pcs_set.len();
+                if num_pcs >= 1 {
+                    let score = num_pcs as f32 * 5.0 + total_dur * 2.0 + active as f32;
+                    let is_better = match &best_first {
+                        Some(b) => num_pcs > b.num_pcs || (num_pcs == b.num_pcs && score > b.score),
+                        None => true,
+                    };
+                    if is_better {
+                        best_first = Some(Candidate {
+                            pos,
+                            pcs: pcs_set.iter().copied().collect(),
+                            bass_pitch,
+                            num_pcs,
+                            score,
+                        });
+                    }
+                }
+                pos += scan_step;
+            }
         }
 
         // Scan second half of bar at fine resolution
         let mut best_second: Option<Candidate> = None;
-        pos = half_bar;
+        let mut pos = half_bar;
         while pos < bar_end - 1e-5 {
             let (pcs_set, bass_pitch, total_dur, active) = collect_at(&bar_notes, pos);
             let num_pcs = pcs_set.len();
@@ -213,8 +302,7 @@ pub fn detect_chord_changes_per_bar(
         // Helper: emit a chord if symbol changed, return true if emitted
         let mut chords_added = 0;
 
-        // Decide where to place the chord: snap to downbeat unless clearly off-beat
-        let mut try_emit = |cand: &Candidate, default_placement: f32, min_pcs: usize| -> bool {
+        let mut try_emit = |cand: &Candidate, min_pcs: usize| -> bool {
             if cand.num_pcs < min_pcs {
                 return false;
             }
@@ -222,15 +310,12 @@ pub fn detect_chord_changes_per_bar(
                 if symbol == last_symbol {
                     return false;
                 }
-                // Snap to nearest beat unless the chord is clearly off-beat
-                // (off-beat defined as > 0.3 beats from any beat boundary)
-                let min_dist = (cand.pos - bar_start).abs().min((cand.pos - half_bar).abs());
-                let placement = if min_dist > 0.3 && cand.num_pcs >= min_simultaneous {
-                    // Very clear off-beat: place at actual position
-                    cand.pos
-                } else {
-                    default_placement
-                };
+                // Snap to the nearest beat. Lead sheets put chord changes on
+                // beat boundaries (usually the downbeat, sometimes beat 2 or
+                // 4); a chord detected a few ticks off a beat still belongs to
+                // that beat, so rounding keeps onsets comparable to a written
+                // reference instead of scattering them across off-beat ticks.
+                let placement = cand.pos.round();
                 out.push(ChordSymbolChange {
                     beat_start: placement,
                     symbol: symbol.clone(),
@@ -244,7 +329,7 @@ pub fn detect_chord_changes_per_bar(
 
         // Try primary chord from first half, placed at downbeat
         if let Some(ref best) = best_first {
-            if try_emit(best, bar_start, min_simultaneous) {
+            if try_emit(best, min_simultaneous) {
                 chords_added += 1;
             }
         }
@@ -252,7 +337,7 @@ pub fn detect_chord_changes_per_bar(
         // Try secondary chord from second half, placed at half-bar
         if chords_added < max_chords {
             if let Some(ref best) = best_second {
-                if try_emit(best, half_bar, min_simultaneous) {
+                if try_emit(best, min_simultaneous) {
                     chords_added += 1;
                 }
             }
@@ -298,6 +383,11 @@ fn score_template(pcs: &[u8], root: u8, intervals: &[u8]) -> Option<(i32, i32)> 
         if intervals.contains(&rel) {
             score += 3;
             covered += 1;
+        } else if intervals.contains(&((rel + 11) % 12)) || intervals.contains(&((rel + 1) % 12)) {
+            // Within a semitone of a chord tone: transcription often lands a
+            // tone a semitone flat or sharp (e.g. hearing F for F#, or B for
+            // Bb). Give partial credit instead of treating it as an error.
+            score += 1;
         } else {
             score -= 1;
         }
@@ -315,7 +405,7 @@ fn score_template(pcs: &[u8], root: u8, intervals: &[u8]) -> Option<(i32, i32)> 
     }
 }
 
-fn best_template_for_root<'a>(
+pub(crate) fn best_template_for_root<'a>(
     pcs: &[u8],
     root: u8,
     templates: &'a [(&str, &[u8])],
@@ -377,41 +467,16 @@ pub(crate) fn choose_chord_symbol(pcs: &[u8], bass_pitch: Option<u8>) -> Option<
         }
     }
 
-    const TEMPLATES: [(&str, &[u8]); 25] = [
-        ("", &[0, 4, 7]),
-        ("-", &[0, 3, 7]),
-        ("dim", &[0, 3, 6]),
-        ("aug", &[0, 4, 8]),
-        ("sus2", &[0, 2, 7]),
-        ("sus4", &[0, 5, 7]),
-        ("7", &[0, 4, 7, 10]),
-        ("\u{0394}7", &[0, 4, 7, 11]),
-        ("-7", &[0, 3, 7, 10]),
-        ("-\u{0394}7", &[0, 3, 7, 11]),
-        ("dim7", &[0, 3, 6, 9]),
-        ("-7b5", &[0, 3, 6, 10]),
-        ("7#5", &[0, 4, 8, 10]),
-        ("9", &[0, 4, 7, 10, 2]),
-        ("\u{0394}9", &[0, 4, 7, 11, 2]),
-        ("-9", &[0, 3, 7, 10, 2]),
-        ("7b9", &[0, 4, 7, 10, 1]),
-        ("7#9", &[0, 4, 7, 10, 3]),
-        ("7#11", &[0, 4, 7, 10, 6]),
-        ("\u{0394}7#11", &[0, 4, 7, 11, 6]),
-        ("-11", &[0, 3, 7, 10, 2, 5]),
-        ("13", &[0, 4, 7, 10, 2, 9]),
-        ("\u{0394}13", &[0, 4, 7, 11, 2, 9]),
-        ("-13", &[0, 3, 7, 10, 2, 9]),
-        ("\u{0394}9#11", &[0, 4, 7, 11, 2, 6]),
-    ];
-
     let mut best_root = 0u8;
     let mut best_suffix = "";
     let mut best_score = i32::MIN;
     for root in 0u8..12u8 {
-        if let Some((suffix, score, _)) = best_template_for_root(pcs, root, &TEMPLATES) {
+        if let Some((suffix, score, _)) = best_template_for_root(pcs, root, &CHORD_TEMPLATES) {
+            // Bass note is a weak hint: a passing or non-chord bass line can
+            // point at the wrong root, so it only breaks exact ties rather
+            // than overriding a clearly better template match.
             let bass_bonus = match bass_pitch {
-                Some(bass) if bass % 12 == root => 2,
+                Some(bass) if bass % 12 == root && score == best_score => 1,
                 _ => 0,
             };
             if score + bass_bonus > best_score {
@@ -425,18 +490,54 @@ pub(crate) fn choose_chord_symbol(pcs: &[u8], bass_pitch: Option<u8>) -> Option<
         return None;
     }
 
-    let bass_pc = bass_pitch.map(|b| b % 12);
+    Some(chord_symbol_from_root(
+        best_root,
+        best_suffix,
+        bass_pitch.map(|b| b % 12),
+    ))
+}
 
-    let mut chord = format!("{}{}", pitch_class_name_flat(best_root), best_suffix);
+/// Chord templates: quality suffix + interval set relative to the root.
+/// Shared by the legacy scanner and the timeline-based harmonic detector.
+pub(crate) const CHORD_TEMPLATES: [(&str, &[u8]); 25] = [
+    ("", &[0, 4, 7]),
+    ("-", &[0, 3, 7]),
+    ("dim", &[0, 3, 6]),
+    ("aug", &[0, 4, 8]),
+    ("sus2", &[0, 2, 7]),
+    ("sus4", &[0, 5, 7]),
+    ("7", &[0, 4, 7, 10]),
+    ("\u{0394}7", &[0, 4, 7, 11]),
+    ("-7", &[0, 3, 7, 10]),
+    ("-\u{0394}7", &[0, 3, 7, 11]),
+    ("dim7", &[0, 3, 6, 9]),
+    ("-7b5", &[0, 3, 6, 10]),
+    ("7#5", &[0, 4, 8, 10]),
+    ("9", &[0, 4, 7, 10, 2]),
+    ("\u{0394}9", &[0, 4, 7, 11, 2]),
+    ("-9", &[0, 3, 7, 10, 2]),
+    ("7b9", &[0, 4, 7, 10, 1]),
+    ("7#9", &[0, 4, 7, 10, 3]),
+    ("7#11", &[0, 4, 7, 10, 6]),
+    ("\u{0394}7#11", &[0, 4, 7, 11, 6]),
+    ("-11", &[0, 3, 7, 10, 2, 5]),
+    ("13", &[0, 4, 7, 10, 2, 9]),
+    ("\u{0394}13", &[0, 4, 7, 11, 2, 9]),
+    ("-13", &[0, 3, 7, 10, 2, 9]),
+    ("\u{0394}9#11", &[0, 4, 7, 11, 2, 6]),
+];
 
+/// Build a chord symbol from a root pitch class, quality suffix, and optional
+/// bass pitch class (produces a slash chord when the bass is not the root).
+pub(crate) fn chord_symbol_from_root(root_pc: u8, suffix: &str, bass_pc: Option<u8>) -> String {
+    let mut chord = format!("{}{}", pitch_class_name_flat(root_pc), suffix);
     if let Some(bass) = bass_pc {
-        if bass != best_root {
+        if bass != root_pc {
             chord.push('/');
-            chord.push_str(pitch_class_name_bass(bass, best_root));
+            chord.push_str(pitch_class_name_bass(bass, root_pc));
         }
     }
-
-    Some(chord)
+    chord
 }
 
 fn pitch_class_name_flat(pc: u8) -> &'static str {

@@ -1218,6 +1218,8 @@ struct SheetPreviewJob {
     manual_bpm: Option<f32>,
     chord_skip: bool,
     chord_notes: Option<Vec<crate::leadsheet::NoteEvent>>,
+    /// Probability timelines for harmonic (timeline-based) chord detection.
+    chord_timeline: Option<crate::leadsheet::TimelineChordInput>,
     source_duration: f32,
 }
 
@@ -1461,6 +1463,33 @@ impl KeyScribeApp {
             marker_edit_str: String::new(),
             streaming_stretch: None,
         };
+
+        // Apply tuned pipeline parameters (written by `keyscribe-cli tune`) by
+        // default, so the GUI matches the tuned CLI behavior for lead sheets
+        // and melody extraction. Explicit persisted user settings win because
+        // this only runs before the first user interaction.
+        if let Ok(Some(tuned)) = crate::headless::TunedConfig::load_default() {
+            app.key_color_sensitivity = tuned.key_sensitivity.clamp(0.0, 2.0);
+            app.manual_bpm = tuned.bpm;
+            match tuned.melody.as_str() {
+                "poly" | "polyphonic" => {
+                    app.melody_mode = MelodyMode::Polyphonic;
+                }
+                "skyline" => {
+                    app.melody_mode = MelodyMode::Monophonic;
+                    app.melody_heuristic = false;
+                }
+                "heuristic" => {
+                    app.melody_mode = MelodyMode::Monophonic;
+                    app.melody_heuristic = true;
+                }
+                _ => {}
+            }
+            app.chord_skip = false;
+            eprintln!(
+                "[keyscribe] applied tuned pipeline parameters from keyscribe.tuned.json"
+            );
+        }
 
         app.refresh_audio_output_devices();
         if let Some(selected) = app.audio_output_device_id.clone() {

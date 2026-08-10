@@ -773,7 +773,10 @@ fn preload_cuda_dylibs() {
 }
 
 /// Resolve a model filename next to the executable, then the working directory.
-fn resolve_model_path(filename: &str) -> Option<PathBuf> {
+/// `pub(crate)` so the headless sheet path can check for the Demucs model before
+/// deciding whether the stem-first melody default is available (falling back to
+/// full-mix melody when it isn't).
+pub(crate) fn resolve_model_path(filename: &str) -> Option<PathBuf> {
     if let Ok(exe) = std::env::current_exe() {
         if let Some(parent) = exe.parent() {
             let p = parent.join("models").join(filename);

@@ -25,6 +25,12 @@ target
 .transcriber_state.json
 .transcriber_cache/
 
+# Headless CLI test-loop artifacts
+out/
+out2/
+out3/
+tests/data/
+
 # ONNX model files - downloaded by build scripts from GitHub Releases, not committed
 models/*.onnx
 

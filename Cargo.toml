@@ -7,6 +7,10 @@ edition = "2021"
 name = "keyscribe_lib"
 crate-type = ["cdylib", "rlib"]
 
+[[bin]]
+name = "keyscribe-cli"
+path = "src/bin/keyscribe_cli.rs"
+
 [features]
 default = ["desktop-ui"]
 native-ui = [
@@ -62,6 +66,8 @@ beat-this = "1.0.0"
 roxmltree = "0.20"
 midly = "0.5.3"
 hound = "3.5.1"
+mp3lame-encoder = "0.2"
+clap = { version = "4", features = ["derive"] }
 
 [build-dependencies]
 winresource = "0.1"

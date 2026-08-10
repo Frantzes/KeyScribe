@@ -3,6 +3,7 @@ use std::path::Path;
 use anyhow::{anyhow, Context, Result};
 use serde::{Deserialize, Serialize};
 
+use crate::leadsheet::beat_association::associate_note_events;
 use crate::leadsheet::bpm::{detect_bpm, detect_bpm_from_audio, BpmDetectionConfig, TempoEstimate};
 use crate::leadsheet::NoteEvent;
 
@@ -170,6 +171,177 @@ pub struct CrossValidatedBeats {
     pub confidence: f32,
     /// Number of audio sources that contributed (1–3).
     pub source_count: u32,
+}
+
+const RHYTHM_PHASE_TARGETS: [f32; 6] = [0.0, 1.0 / 6.0, 1.0 / 3.0, 0.5, 2.0 / 3.0, 5.0 / 6.0];
+
+/// Refine a tracker grid's metric and phase using detected melody onsets.
+/// BeatThis can return a musically plausible half-time grid, or place its first
+/// beat a fraction late/early. Testing the base and doubled metric at a small
+/// phase neighborhood prevents either error from reaching quantization.
+pub fn refine_beat_phase(notes: &[NoteEvent], base: &CrossValidatedBeats) -> CrossValidatedBeats {
+    if notes.is_empty() || base.beats.len() < 2 {
+        return base.clone();
+    }
+    let mut intervals: Vec<f32> = base
+        .beats
+        .windows(2)
+        .map(|w| w[1] - w[0])
+        .filter(|d| d.is_finite() && *d > 0.001)
+        .collect();
+    if intervals.is_empty() {
+        return base.clone();
+    }
+    intervals.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let period = intervals[intervals.len() / 2];
+
+    let score = |beats: &[f32], downbeats: &[f32]| -> f32 {
+        let aligned = associate_note_events(notes, &beats, &downbeats);
+        if aligned.is_empty() {
+            return f32::INFINITY;
+        }
+        let total: f32 = aligned
+            .iter()
+            .map(|n| {
+                RHYTHM_PHASE_TARGETS
+                    .iter()
+                    .map(|target| (n.intra_beat_pos - target).abs())
+                    .fold(f32::INFINITY, f32::min)
+            })
+            .sum();
+        total / aligned.len() as f32
+    };
+
+    let doubled_beats = || {
+        let mut out = Vec::with_capacity(base.beats.len() * 2);
+        for pair in base.beats.windows(2) {
+            out.push(pair[0]);
+            out.push((pair[0] + pair[1]) * 0.5);
+        }
+        if let Some(last) = base.beats.last().copied() {
+            out.push(last);
+        }
+        out
+    };
+
+    let estimate_bpb = |downbeats: &[f32], candidate_period: f32| -> u32 {
+        let mut values: Vec<u32> = downbeats
+            .windows(2)
+            .map(|w| ((w[1] - w[0]) / candidate_period).round() as u32)
+            .filter(|&n| (2..=8).contains(&n))
+            .collect();
+        values.sort_unstable();
+        values
+            .get(values.len() / 2)
+            .copied()
+            .unwrap_or(base.beats_per_bar.max(2))
+    };
+
+    struct GridSource {
+        doubled: bool,
+        beats: Vec<f32>,
+        downbeats: Vec<f32>,
+        period: f32,
+        bpm: f32,
+        beats_per_bar: u32,
+    }
+
+    let mut sources = vec![GridSource {
+        doubled: false,
+        beats: base.beats.clone(),
+        downbeats: base.downbeats.clone(),
+        period,
+        bpm: base.bpm,
+        beats_per_bar: base.beats_per_bar,
+    }];
+    sources.push(GridSource {
+        doubled: true,
+        beats: doubled_beats(),
+        downbeats: base.downbeats.clone(),
+        period: period * 0.5,
+        bpm: base.bpm * 2.0,
+        beats_per_bar: estimate_bpb(&base.downbeats, period * 0.5),
+    });
+
+    // The existing onset autocorrelation is a useful independent period
+    // proposal. Keep it only when it differs meaningfully from the tracker so
+    // this remains a cheap candidate search rather than a second full tracker.
+    if let Some(note_tempo) = detect_bpm(
+        notes,
+        BpmDetectionConfig {
+            max_bpm: 400.0,
+            ..BpmDetectionConfig::default()
+        },
+    ) {
+        let note_period = note_tempo.beat_duration_sec;
+        if note_period.is_finite() && note_period > 0.001
+            && ((note_period - period) / period).abs() > 0.02
+            && ((note_period - period * 0.5) / period).abs() > 0.02
+        {
+            let anchor = base.beats[0];
+            let scale = note_period / period;
+            sources.push(GridSource {
+                doubled: false,
+                beats: base
+                    .beats
+                    .iter()
+                    .map(|t| anchor + (*t - anchor) * scale)
+                    .collect(),
+                downbeats: base
+                    .downbeats
+                    .iter()
+                    .map(|t| anchor + (*t - anchor) * scale)
+                    .collect(),
+                period: note_period,
+                bpm: note_tempo.bpm,
+                beats_per_bar: estimate_bpb(&base.downbeats, note_period),
+            });
+        }
+    }
+
+    let mut best_score = score(&base.beats, &base.downbeats);
+    let mut best_beats = base.beats.clone();
+    let mut best_downbeats = base.downbeats.clone();
+    let mut best_bpb = base.beats_per_bar;
+    let mut best_bpm = base.bpm;
+    let mut best_shift = 0.0f32;
+    let mut best_doubled = false;
+    let mut changed = false;
+
+    for source in sources {
+        let candidate_period = source.period;
+        for shift in [-0.25 * candidate_period, 0.0, 0.25 * candidate_period] {
+            let beats: Vec<f32> = source.beats.iter().map(|t| *t + shift).collect();
+            let downbeats: Vec<f32> = source.downbeats.iter().map(|t| *t + shift).collect();
+            let candidate_score = score(&beats, &downbeats);
+            if candidate_score + 0.01 < best_score {
+                best_score = candidate_score;
+                best_beats = beats;
+                best_downbeats = downbeats;
+                best_bpb = source.beats_per_bar;
+                best_bpm = source.bpm;
+                best_shift = shift;
+                best_doubled = source.doubled;
+                changed = true;
+            }
+        }
+    }
+
+    if !changed {
+        return base.clone();
+    }
+
+    let mut refined = base.clone();
+    refined.beats = best_beats;
+    refined.downbeats = best_downbeats;
+    refined.beats_per_bar = best_bpb;
+    refined.bpm = best_bpm;
+    if std::env::var_os("KEYSCRIBE_BEAT_PHASE_DEBUG").is_some() {
+        eprintln!(
+            "[beats] grid refinement doubled={best_doubled} shift={best_shift:.4}s period={period:.4}s score={best_score:.4} bpb={best_bpb}"
+        );
+    }
+    refined
 }
 
 /// Run beat-this on up to three audio sources (combined, drums-only, bass-only)
@@ -634,5 +806,69 @@ fn correct_beat_metric_level(result: &mut BeatTrackResult) {
             // Likely double-time: halve the beat count
             result.beats = result.beats.iter().step_by(2).copied().collect();
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn note(start: f32) -> NoteEvent {
+        NoteEvent {
+            id: 0,
+            pitch: 60,
+            start_time: start,
+            end_time: start + 0.2,
+            velocity: 100,
+            channel: None,
+        }
+    }
+
+    #[test]
+    fn phase_refinement_corrects_quarter_beat_offset() {
+        let base = CrossValidatedBeats {
+            beats: vec![0.125, 0.625, 1.125, 1.625, 2.125],
+            downbeats: vec![0.125, 2.125],
+            beats_per_bar: 4,
+            bpm: 120.0,
+            confidence: 1.0,
+            source_count: 1,
+        };
+        let notes = vec![note(0.0), note(0.5), note(1.0), note(1.5)];
+        let refined = refine_beat_phase(&notes, &base);
+        assert!((refined.beats[0] - 0.0).abs() < 1e-4);
+        assert!((refined.beats[1] - 0.5).abs() < 1e-4);
+    }
+
+    #[test]
+    fn phase_refinement_keeps_already_aligned_grid() {
+        let base = CrossValidatedBeats {
+            beats: vec![0.0, 0.5, 1.0, 1.5, 2.0],
+            downbeats: vec![0.0, 2.0],
+            beats_per_bar: 4,
+            bpm: 120.0,
+            confidence: 1.0,
+            source_count: 1,
+        };
+        let notes = vec![note(0.0), note(0.5), note(1.0), note(1.5)];
+        let refined = refine_beat_phase(&notes, &base);
+        assert_eq!(refined.beats, base.beats);
+        assert_eq!(refined.downbeats, base.downbeats);
+    }
+
+    #[test]
+    fn phase_refinement_corrects_half_time_grid() {
+        let base = CrossValidatedBeats {
+            beats: vec![0.0, 1.0, 2.0, 3.0, 4.0],
+            downbeats: vec![0.0, 2.0, 4.0],
+            beats_per_bar: 2,
+            bpm: 60.0,
+            confidence: 1.0,
+            source_count: 1,
+        };
+        let notes = vec![note(0.25), note(0.5), note(0.75), note(1.0), note(1.25)];
+        let refined = refine_beat_phase(&notes, &base);
+        assert_eq!(refined.beats_per_bar, 4);
+        assert!((refined.beats[1] - 0.5).abs() < 1e-4);
     }
 }

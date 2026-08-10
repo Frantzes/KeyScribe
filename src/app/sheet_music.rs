@@ -1,26 +1,24 @@
-use std::collections::{BTreeMap, HashMap};
-use std::fmt::Write;
-use std::path::{Path, PathBuf};
+﻿use std::collections::HashMap;
+use std::path::PathBuf;
 use std::process::Command;
 use std::sync::mpsc::TryRecvError;
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use super::*;
 use crate::leadsheet::{
-    cross_validate_beat_sources, debug_chord_notes_to_json, detect_chord_changes_per_bar, generate_lead_sheet_enhanced,
-    generate_lead_sheet_foundation, generate_lead_sheet_with_tempo_map, quantize_notes_with_rhythm_map,
-    tempo_map_from_beats, Articulation, BeatTrackConfig, ChordSymbolChange,
-    CrossValidatedBeats, LeadSheetFoundation, LeadSheetPresetConfig, NoteEvent, QuantizedNote,
-    SwingStyle, TimeSignatureSegment,
+    cross_validate_beat_sources, debug_chord_notes_to_json, detect_chord_changes_per_bar,
+    generate_lead_sheet_enhanced, generate_lead_sheet_enhanced_with_timeline,
+    generate_lead_sheet_foundation, generate_lead_sheet_with_tempo_map,
+    quantize_notes_with_rhythm_map, tempo_map_from_beats, BeatTrackConfig, CrossValidatedBeats,
+    LeadSheetFoundation, LeadSheetPresetConfig, NoteEvent,
+};
+use crate::musicxml::{
+    build_musicxml_document, export_engraved_pdf_with_musescore, extract_melody_heuristic,
+    extract_melody_skyline, merge_adjacent_notes, merge_adjacent_notes_with_gap,
+    sanitize_filename_component, write_temp_musicxml, MUSICXML_DIVISIONS, SHEET_SWING_BIAS,
+    SheetEngravingConfig,
 };
 
-#[cfg(test)]
-use crate::leadsheet::TempoSegment;
-
-const MUSICXML_DIVISIONS: i32 = 480;
-const GRAND_STAFF_SPLIT_MIDI: u8 = 60;
 const MIN_SHEET_NOTE_FRAMES: usize = 2;
-const SHEET_SWING_BIAS: bool = true;
 
 impl KeyScribeApp {
     fn estimate_sheet_cursor_offset_sec(
@@ -178,7 +176,7 @@ impl KeyScribeApp {
                                                 let cb = ui.checkbox(&mut enabled, cb_label.as_str());
                                                 if conf < 0.08 {
                                                     cb.clone().on_hover_text(
-                                                        "Low stem energy — may not contain meaningful audio for visualization",
+                                                        "Low stem energy â€” may not contain meaningful audio for visualization",
                                                     );
                                                 }
                                                 if cb.changed() {
@@ -291,7 +289,7 @@ impl KeyScribeApp {
                                                 let cb = ui.checkbox(&mut enabled, cb_label.as_str());
                                                 if conf < 0.08 {
                                                     cb.clone().on_hover_text(
-                                                        "Low stem energy — may not contain meaningful audio",
+                                                        "Low stem energy â€” may not contain meaningful audio",
                                                     );
                                                 }
                                                 if cb.changed() {
@@ -614,13 +612,13 @@ impl KeyScribeApp {
                                 ui.label(egui::RichText::new("invalid").color(egui::Color32::RED).weak());
                             }
                             if self.manual_bpm.is_some() {
-                                if ui.button("×2").clicked() {
+                                if ui.button("Ã—2").clicked() {
                                     let base = self.manual_bpm.unwrap_or(120.0);
                                     let clamped = (base * 2.0).clamp(30.0, 400.0);
                                     self.manual_bpm = Some(clamped);
                                     self.bpm_input_str = format!("{:.0}", clamped);
                                 }
-                                if ui.button("÷2").clicked() {
+                                if ui.button("Ã·2").clicked() {
                                     let base = self.manual_bpm.unwrap_or(120.0);
                                     let clamped = (base / 2.0).clamp(30.0, 400.0);
                                     self.manual_bpm = Some(clamped);
@@ -670,7 +668,7 @@ impl KeyScribeApp {
                                 if self.melody_heuristic {
                                     ui.add(
                                         egui::Slider::new(&mut self.melody_outlier_semitones, 3u8..=24u8)
-                                            .text("σ"),
+                                            .text("Ïƒ"),
                                     ).on_hover_text("Outlier threshold: melody jumps larger than this many semitones from the rolling median are suppressed. Lower = smoother line, higher = allows more leaps");
                                 }
                             }
@@ -837,6 +835,18 @@ impl KeyScribeApp {
             None
         };
 
+        let chord_timeline = {
+            let tls = self.chord_timelines();
+            if tls.is_empty() {
+                None
+            } else {
+                Some(crate::leadsheet::TimelineChordInput {
+                    timelines: tls,
+                    onset_timelines: Vec::new(),
+                })
+            }
+        };
+
         let job = SheetPreviewJob {
             key,
             threshold,
@@ -851,6 +861,7 @@ impl KeyScribeApp {
             manual_bpm: self.manual_bpm,
             chord_skip: self.chord_skip,
             chord_notes,
+            chord_timeline,
             source_duration: self.source_duration(),
         };
 
@@ -958,13 +969,23 @@ impl KeyScribeApp {
         let mut foundation = None;
 
         if let Some(bt) = beat_track.as_ref() {
-            foundation = generate_lead_sheet_enhanced(
-                &note_events,
-                bt.beats.as_slice(),
-                bt.downbeats.as_slice(),
-                bt.beats_per_bar,
-                &config,
-            );
+            foundation = match job.chord_timeline.as_ref() {
+                Some(tl) => generate_lead_sheet_enhanced_with_timeline(
+                    &note_events,
+                    bt.beats.as_slice(),
+                    bt.downbeats.as_slice(),
+                    bt.beats_per_bar,
+                    &config,
+                    Some(tl),
+                ),
+                None => generate_lead_sheet_enhanced(
+                    &note_events,
+                    bt.beats.as_slice(),
+                    bt.downbeats.as_slice(),
+                    bt.beats_per_bar,
+                    &config,
+                ),
+            };
         }
 
         let fallback_bt = beat_track.as_ref().map(|bt| bt.clone().into());
@@ -1162,7 +1183,7 @@ impl KeyScribeApp {
         }
     }
 
-    /// Runs in a background thread: MusicXML → verovioxide → raw RGBA pages + note positions
+    /// Runs in a background thread: MusicXML â†’ verovioxide â†’ raw RGBA pages + note positions
     fn run_render_background(
         job: &SheetRenderJob,
         dpi_scale: f32,
@@ -1234,6 +1255,39 @@ impl KeyScribeApp {
         }
     }
 
+    /// Gather the probability timelines to use for harmonic chord detection:
+    /// the selected chord stems when chosen, else the combined visualization
+    /// timeline, else all enabled stem analyses.
+    fn chord_timelines(&self) -> Vec<(Vec<Vec<f32>>, f32)> {
+        if !self.chord_stem_indices.is_empty() {
+            let mut tls = Vec::new();
+            for &idx in &self.chord_stem_indices {
+                if let Some(a) = self.stem_analyses.iter().find(|a| a.stem_index == idx) {
+                    if !a.timeline.is_empty() && a.step_sec > 0.0 {
+                        tls.push((a.timeline.to_vec(), a.step_sec));
+                    }
+                }
+            }
+            if !tls.is_empty() {
+                return tls;
+            }
+        }
+        if !self.note_timeline.is_empty() && self.note_timeline_step_sec > 0.0 {
+            return vec![(self.note_timeline.to_vec(), self.note_timeline_step_sec)];
+        }
+        let mut tls = Vec::new();
+        for a in &self.stem_analyses {
+            if !self.enabled_stem_indices.contains(&a.stem_index) {
+                continue;
+            }
+            if a.timeline.is_empty() || a.step_sec <= 0.0 {
+                continue;
+            }
+            tls.push((a.timeline.to_vec(), a.step_sec));
+        }
+        tls
+    }
+
     /// Extract note events from selected stem timelines, or from the combined
     /// visualization timeline if no stems are selected.
     fn extract_notes_for_stems(
@@ -1266,7 +1320,7 @@ impl KeyScribeApp {
                 });
                 return all_events;
             }
-            // Analysis not ready yet — return empty instead of using wrong data
+            // Analysis not ready yet â€” return empty instead of using wrong data
             return Vec::new();
         }
         // "Full Mix" mode: use combined timeline if available, else all enabled stems
@@ -1298,7 +1352,9 @@ impl KeyScribeApp {
         self.extract_note_events_from_timeline(threshold)
     }
 
-    /// Static helper to extract note events from any timeline data.
+    /// Static helper to extract note events from any timeline data. Notes are
+    /// split at re-articulations (staccato repeats) via an adaptive release
+    /// threshold, and onsets are attack-adjusted so timing is accurate.
     pub(crate) fn extract_events_from_timeline_data(
         timeline: &[Vec<f32>],
         step_sec: f32,
@@ -1312,41 +1368,80 @@ impl KeyScribeApp {
         let note_count = (PIANO_HIGH_MIDI - PIANO_LOW_MIDI + 1) as usize;
         let mut out = Vec::new();
         let min_duration_sec = (step_sec * MIN_SHEET_NOTE_FRAMES as f32).max(0.05);
+        // Adaptive release: a note ends when its probability falls below this
+        // fraction of its own peak (or the absolute floor). A fixed threshold
+        // keeps staccato re-articulations merged into one long note.
+        let release_ratio = 0.55f32;
+        let release_floor = 0.05f32;
+        // Attack look-back: search back up to this many frames for the low
+        // point where the probability began its rise, and start the note there
+        // instead of at the threshold crossing (which lags the true onset).
+        let attack_lookback = 5usize;
+
+        let prob_at = |note_idx: usize, frame_idx: usize| -> f32 {
+            timeline
+                .get(frame_idx)
+                .and_then(|f| f.get(note_idx))
+                .copied()
+                .unwrap_or(0.0)
+                .clamp(0.0, 1.0)
+        };
 
         for note_idx in 0..note_count {
-            let mut active_start: Option<usize> = None;
+            let mut run_start: Option<usize> = None;
             let mut max_prob: f32 = 0.0;
 
-            for (frame_idx, frame) in timeline.iter().enumerate() {
-                let prob = frame.get(note_idx).copied().unwrap_or(0.0).clamp(0.0, 1.0);
+            for frame_idx in 0..timeline.len() {
+                let prob = prob_at(note_idx, frame_idx);
                 let active = prob >= threshold;
 
                 if active {
-                    max_prob = max_prob.max(prob);
-                    if active_start.is_none() {
-                        active_start = Some(frame_idx);
+                    if run_start.is_none() {
+                        let mut onset = frame_idx;
+                        let mut k = frame_idx;
+                        let mut p_k = prob;
+                        while k > 0 && frame_idx - k < attack_lookback {
+                            let p_prev = prob_at(note_idx, k - 1);
+                            if p_prev < release_floor && p_k > p_prev {
+                                onset = k - 1;
+                                break;
+                            }
+                            if p_prev >= p_k {
+                                break;
+                            }
+                            k -= 1;
+                            p_k = p_prev;
+                        }
+                        run_start = Some(onset);
+                        max_prob = prob;
+                    } else {
+                        max_prob = max_prob.max(prob);
                     }
-                } else if let Some(start_idx) = active_start.take() {
-                    let start_time = start_idx as f32 * step_sec;
-                    let mut end_time = frame_idx as f32 * step_sec;
-                    if end_time <= start_time {
-                        end_time = start_time + step_sec;
+                } else if let Some(start_idx) = run_start {
+                    let release_thr = (max_prob * release_ratio).max(release_floor);
+                    if prob < release_thr {
+                        let start_time = start_idx as f32 * step_sec;
+                        let mut end_time = frame_idx as f32 * step_sec;
+                        if end_time <= start_time {
+                            end_time = start_time + step_sec;
+                        }
+                        let velocity = (max_prob * 127.0).round().clamp(1.0, 127.0) as u8;
+                        out.push(NoteEvent {
+                            id: *next_id,
+                            pitch: (PIANO_LOW_MIDI as usize + note_idx) as u8,
+                            start_time,
+                            end_time,
+                            velocity,
+                            channel: None,
+                        });
+                        *next_id = next_id.saturating_add(1);
+                        run_start = None;
+                        max_prob = 0.0;
                     }
-                    let velocity = (max_prob * 127.0).round().clamp(1.0, 127.0) as u8;
-                    out.push(NoteEvent {
-                        id: *next_id,
-                        pitch: (PIANO_LOW_MIDI as usize + note_idx) as u8,
-                        start_time,
-                        end_time,
-                        velocity,
-                        channel: None,
-                    });
-                    *next_id = next_id.saturating_add(1);
-                    max_prob = 0.0;
                 }
             }
 
-            if let Some(start_idx) = active_start {
+            if let Some(start_idx) = run_start {
                 let start_time = start_idx as f32 * step_sec;
                 let end_time = timeline.len() as f32 * step_sec;
                 let end_time = end_time.max(start_time + step_sec);
@@ -1363,7 +1458,8 @@ impl KeyScribeApp {
             }
         }
 
-        merge_adjacent_notes(&mut out, step_sec);
+        // Merge only single-frame jitter so genuine re-articulations survive.
+        merge_adjacent_notes_with_gap(&mut out, step_sec);
         out.retain(|n| n.end_time - n.start_time >= min_duration_sec);
         out
     }
@@ -1377,7 +1473,7 @@ impl KeyScribeApp {
         // (per-stem and full-mix) produce identical results. The previous
         // method version filtered short notes during extraction (before
         // merge), which dropped notes that could have been merged into
-        // longer ones — producing different results from the static version.
+        // longer ones â€” producing different results from the static version.
         let mut next_id: u32 = 1;
         Self::extract_events_from_timeline_data(
             &self.note_timeline,
@@ -1979,1894 +2075,4 @@ fn draw_scrollable_engraved_preview(
                 }
             }
         });
-}
-
-#[derive(Clone)]
-struct NoteSpan {
-    id: u32,
-    start_tick: i32,
-    end_tick: i32,
-    pitch: u8,
-    velocity: u8,
-    staff: u8,
-    articulation: Articulation,
-}
-
-#[derive(Clone)]
-struct NoteChunk {
-    id: u32,
-    start_tick_in_measure: i32,
-    duration_ticks: i32,
-    absolute_tick: i32,
-    pitch: u8,
-    velocity: u8,
-    tie_start: bool,
-    tie_stop: bool,
-    staff: u8,
-    articulation: Articulation,
-}
-
-#[derive(Clone, Copy)]
-struct DurationToken {
-    ticks: i32,
-    note_type: &'static str,
-    dots: u8,
-    time_mod: Option<(u8, u8)>,
-}
-
-#[derive(Clone, Copy)]
-struct SheetEngravingConfig {
-    _allow_triplets: bool,
-    is_lead_sheet: bool,
-    single_staff: bool,
-}
-
-impl Default for SheetEngravingConfig {
-    fn default() -> Self {
-        Self {
-            _allow_triplets: !SHEET_SWING_BIAS,
-            is_lead_sheet: true,
-            single_staff: false,
-        }
-    }
-}
-
-fn build_measure_boundaries(
-    time_sigs: &[TimeSignatureSegment],
-    default_beats_per_bar: u32,
-    max_tick: i32,
-) -> Vec<i32> {
-    let mut boundaries: Vec<i32> = vec![0];
-    let mut last_mw = (default_beats_per_bar.max(1) as i32) * MUSICXML_DIVISIONS;
-
-    if time_sigs.is_empty() {
-        let mw = (default_beats_per_bar.max(1) as i32) * MUSICXML_DIVISIONS;
-        let mut t = mw;
-        while t < max_tick {
-            boundaries.push(t);
-            t += mw;
-        }
-        if boundaries.last().copied().unwrap_or(0) < max_tick {
-            boundaries.push(max_tick);
-        }
-        return boundaries;
-    }
-
-    for (i, seg) in time_sigs.iter().enumerate() {
-        let seg_start_tick = (seg.start_beat * MUSICXML_DIVISIONS as f32).round() as i32;
-        let seg_end_tick = if i + 1 < time_sigs.len() {
-            (time_sigs[i + 1].start_beat * MUSICXML_DIVISIONS as f32).round() as i32
-        } else {
-            (seg.end_beat * MUSICXML_DIVISIONS as f32).round() as i32
-        };
-        let mw = (seg.numerator.max(1) as i32) * MUSICXML_DIVISIONS;
-        if mw > 0 {
-            last_mw = mw;
-        }
-
-        let seg_limit = seg_end_tick.min(max_tick);
-        let mut cursor = boundaries.last().copied().unwrap_or(0).max(seg_start_tick);
-        while cursor < seg_limit {
-            let next = (cursor + mw).min(seg_limit);
-            boundaries.push(next);
-            cursor = next;
-        }
-    }
-
-    let mut last = boundaries.last().copied().unwrap_or(0);
-    if last_mw <= 0 {
-        last_mw = (default_beats_per_bar.max(1) as i32) * MUSICXML_DIVISIONS;
-    }
-    while last + last_mw < max_tick {
-        last += last_mw;
-        boundaries.push(last);
-    }
-    if boundaries.last().copied().unwrap_or(0) < max_tick {
-        boundaries.push(max_tick);
-    }
-
-    // Fill any large gaps in case time-signature segments ended early.
-    if last_mw > 0 && boundaries.len() >= 2 {
-        let mut filled: Vec<i32> = Vec::with_capacity(boundaries.len());
-        filled.push(boundaries[0]);
-        for pair in boundaries.windows(2) {
-            let mut current = pair[0];
-            let next = pair[1];
-            if next <= current {
-                continue;
-            }
-            while current + last_mw < next {
-                current += last_mw;
-                filled.push(current);
-            }
-            filled.push(next);
-        }
-        filled.dedup();
-        boundaries = filled;
-    }
-    boundaries
-}
-
-fn split_span_into_measures(
-    span: NoteSpan,
-    boundaries: &[i32],
-    target: &mut BTreeMap<i32, Vec<NoteChunk>>,
-) {
-    let mut cursor = span.start_tick;
-    let mut first = true;
-
-    while cursor < span.end_tick {
-        let mi = match boundaries.binary_search(&cursor) {
-            Ok(i) => i.min(boundaries.len().saturating_sub(2)),
-            Err(i) => i.saturating_sub(1).min(boundaries.len().saturating_sub(2)),
-        };
-        let ms = boundaries[mi];
-        let me = boundaries[mi + 1];
-        let chunk_end = span.end_tick.min(me);
-        let dur = (chunk_end - cursor).max(1);
-
-        target.entry(mi as i32).or_default().push(NoteChunk {
-            id: span.id,
-            start_tick_in_measure: cursor - ms,
-            duration_ticks: dur,
-            absolute_tick: cursor,
-            pitch: span.pitch,
-            velocity: span.velocity,
-            tie_start: chunk_end < span.end_tick,
-            tie_stop: !first,
-            staff: span.staff,
-            articulation: span.articulation,
-        });
-
-        first = false;
-        cursor = chunk_end;
-    }
-}
-
-fn build_musicxml_document(
-    title: &str,
-    foundation: &LeadSheetFoundation,
-    config: SheetEngravingConfig,
-) -> String {
-    let note_spans = notes_to_spans(foundation.quantized_notes.as_slice(), config);
-
-    let mut max_tick = 0i32;
-    for span in &note_spans {
-        max_tick = max_tick.max(span.end_tick);
-    }
-
-    let boundaries = build_measure_boundaries(
-        &foundation.time_signature_segments,
-        foundation.beats_per_bar,
-        max_tick,
-    );
-
-    let mut chunks_by_measure: BTreeMap<i32, Vec<NoteChunk>> = BTreeMap::new();
-    for span in note_spans {
-        split_span_into_measures(span, &boundaries, &mut chunks_by_measure);
-    }
-
-    // Single average tempo for whole sheet
-    let avg_bpm = if foundation.tempo_map.is_empty() {
-        foundation.tempo.bpm
-    } else {
-        let total_weight: f32 = foundation
-            .tempo_map
-            .iter()
-            .map(|s| (s.end_time_sec - s.start_time_sec).max(0.0))
-            .sum();
-        if total_weight > 0.0 {
-            foundation
-                .tempo_map
-                .iter()
-                .map(|s| s.bpm * (s.end_time_sec - s.start_time_sec).max(0.0))
-                .sum::<f32>()
-                / total_weight
-        } else {
-            foundation.tempo.bpm
-        }
-    };
-
-    // Single tempo mark at the beginning
-    let mut tempo_marks_by_measure: BTreeMap<i32, Vec<(i32, f32)>> = BTreeMap::new();
-    tempo_marks_by_measure.entry(0).or_default().push((0, avg_bpm));
-
-    let mut chord_by_measure: BTreeMap<i32, Vec<(i32, ChordSymbolChange)>> = BTreeMap::new();
-    for chord in &foundation.chord_changes {
-        let abs_tick = (chord.beat_start * MUSICXML_DIVISIONS as f32).round() as i32;
-        let mi = match boundaries.binary_search(&abs_tick) {
-            Ok(i) => i.min(boundaries.len().saturating_sub(2)),
-            Err(i) => i.saturating_sub(1).min(boundaries.len().saturating_sub(2)),
-        };
-        let offset = abs_tick - boundaries[mi];
-        chord_by_measure
-            .entry(mi as i32)
-            .or_default()
-            .push((offset, chord.clone()));
-        max_tick = max_tick.max(abs_tick);
-    }
-
-    let total_measures = boundaries.len().saturating_sub(1).max(1);
-
-    let mut time_signature_change_by_measure: BTreeMap<i32, (u8, u8)> = BTreeMap::new();
-    for seg in &foundation.time_signature_segments {
-        let abs_tick = (seg.start_beat * MUSICXML_DIVISIONS as f32).round() as i32;
-        let mi = match boundaries.binary_search(&abs_tick) {
-            Ok(i) => i.min(boundaries.len().saturating_sub(2)),
-            Err(i) => i.saturating_sub(1).min(boundaries.len().saturating_sub(2)),
-        };
-        time_signature_change_by_measure
-            .entry(mi.max(0) as i32)
-            .or_insert((seg.numerator, seg.denominator));
-    }
-
-    if !time_signature_change_by_measure.contains_key(&0) {
-        let default_num = foundation.beats_per_bar as u8;
-        let default_ts = foundation
-            .time_signature_segments
-            .first()
-            .map(|s| (s.numerator, s.denominator))
-            .unwrap_or((default_num.max(1), 4));
-        time_signature_change_by_measure.insert(0, default_ts);
-    }
-
-    let mut swing_by_measure: BTreeMap<i32, SwingStyle> = BTreeMap::new();
-    for section in &foundation.swing_sections {
-        if section.style != SwingStyle::Straight {
-            let start_measure = section.bar_start as i32;
-            let end_measure = (section.bar_end as i32).min(total_measures as i32);
-            for m in start_measure..end_measure {
-                swing_by_measure.entry(m).or_insert(section.style);
-            }
-        }
-    }
-
-    // Trim trailing empty measures
-    let mut last_content = -1i32;
-    for mi in 0..total_measures as i32 {
-        let has_content = chunks_by_measure.contains_key(&mi)
-            || chord_by_measure.contains_key(&mi)
-            || tempo_marks_by_measure.contains_key(&mi)
-            || swing_by_measure.contains_key(&mi);
-        if has_content {
-            last_content = mi;
-        }
-    }
-    let total_measures = (last_content + 1).max(1).min(total_measures as i32) as usize;
-
-    let mut xml = String::new();
-    let _ = write!(
-        xml,
-        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<score-partwise version=\"3.1\">\n"
-    );
-    let _ = write!(
-        xml,
-        "  <work><work-title>{}</work-title></work>\n",
-        xml_escape(title)
-    );
-    let _ = write!(xml, "  <part-list>\n");
-    let _ = write!(
-        xml,
-        "    <score-part id=\"P1\"><part-name>Lead Sheet</part-name></score-part>\n"
-    );
-    let _ = write!(xml, "  </part-list>\n");
-    let _ = write!(xml, "  <part id=\"P1\">\n");
-
-    let mut current_time_sig = time_signature_change_by_measure
-        .get(&0)
-        .copied()
-        .unwrap_or((4, 4));
-    let mut prev_swing_style: Option<SwingStyle> = None;
-
-    // Determine per-measure clef for single-staff modes based on average pitch
-    let measure_clefs: Vec<&'static str> = if config.is_lead_sheet || config.single_staff {
-        let mut clefs = Vec::with_capacity(total_measures);
-        for measure_idx in 0..total_measures {
-            if let Some(chunks) = chunks_by_measure.get(&(measure_idx as i32)) {
-                let avg_pitch = chunks
-                    .iter()
-                    .map(|c| c.pitch as f32)
-                    .sum::<f32>()
-                    / chunks.len().max(1) as f32;
-                clefs.push(if avg_pitch < 46.0 { "F" } else { "G" });
-            } else {
-                clefs.push(clefs.last().copied().unwrap_or("G"));
-            }
-        }
-        clefs
-    } else {
-        Vec::new()
-    };
-    let mut current_clef: &'static str = if config.is_lead_sheet || config.single_staff {
-        measure_clefs.first().copied().unwrap_or("G")
-    } else {
-        "G"
-    };
-
-    for measure_idx in 0..total_measures {
-        let measure_ticks = boundaries[measure_idx + 1] - boundaries[measure_idx];
-        let _ = write!(xml, "    <measure number=\"{}\">\n", measure_idx + 1);
-        if let Some(&(num, den)) = time_signature_change_by_measure.get(&(measure_idx as i32)) {
-            current_time_sig = (num, den);
-        }
-
-        let mut clef_to_write = None;
-        if config.is_lead_sheet || config.single_staff {
-            if let Some(&clef) = measure_clefs.get(measure_idx) {
-                if clef != current_clef && measure_idx > 0 {
-                    clef_to_write = Some(clef);
-                }
-            }
-        }
-
-        let has_time_sig_change = time_signature_change_by_measure.contains_key(&(measure_idx as i32));
-        if measure_idx == 0 || has_time_sig_change || clef_to_write.is_some() {
-            let _ = write!(xml, "      <attributes>\n");
-            if measure_idx == 0 {
-                let _ = write!(xml, "        <divisions>{}</divisions>\n", MUSICXML_DIVISIONS);
-                let _ = write!(xml, "        <key><fifths>0</fifths></key>\n");
-                if config.is_lead_sheet {
-                    // Use dynamic clef based on the first measure's average
-                    // pitch, just like single-staff mode. The old code always
-                    // hardcoded G clef, putting low melodies far below the
-                    // staff.
-                    let first_clef = measure_clefs.first().copied().unwrap_or("G");
-                    let (sign, line) = if first_clef == "F" { ("F", 4) } else { ("G", 2) };
-                    let _ = write!(xml, "        <clef><sign>{}</sign><line>{}</line></clef>\n", sign, line);
-                } else if config.single_staff {
-                    let first_clef = measure_clefs.first().copied().unwrap_or("G");
-                    let (sign, line) = if first_clef == "F" { ("F", 4) } else { ("G", 2) };
-                    let _ = write!(xml, "        <clef><sign>{}</sign><line>{}</line></clef>\n", sign, line);
-                } else {
-                    let _ = write!(xml, "        <staves>2</staves>\n");
-                    let _ = write!(xml, "        <clef number=\"1\"><sign>G</sign><line>2</line></clef>\n");
-                    let _ = write!(xml, "        <clef number=\"2\"><sign>F</sign><line>4</line></clef>\n");
-                }
-            }
-            if measure_idx == 0 || has_time_sig_change {
-                let _ = write!(
-                    xml,
-                    "        <time><beats>{}</beats><beat-type>{}</beat-type></time>\n",
-                    current_time_sig.0,
-                    current_time_sig.1
-                );
-            }
-
-            // Dynamic clef for single-staff modes: switch per-measure based on avg pitch
-            if let Some(clef) = clef_to_write {
-                current_clef = clef;
-                let (sign, line) = if clef == "F" { ("F", 4) } else { ("G", 2) };
-                let _ = write!(
-                    xml,
-                    "        <clef><sign>{}</sign><line>{}</line></clef>\n",
-                    sign, line
-                );
-            }
-
-            let _ = write!(xml, "      </attributes>\n");
-        }
-
-        // Swing direction element
-        let current_swing = swing_by_measure.get(&(measure_idx as i32)).copied();
-        if current_swing != prev_swing_style {
-            if let Some(style) = current_swing {
-                let _ = write!(xml, "      <direction placement=\"above\">\n");
-                let _ = write!(xml, "        <direction-type>\n");
-                match style {
-                    SwingStyle::Swing => {
-                        let _ = write!(xml, "          <words>Swing</words>\n");
-                    }
-                    SwingStyle::Triplet => {
-                        let _ = write!(xml, "          <words>Triplet feel</words>\n");
-                    }
-                    _ => {}
-                }
-                let _ = write!(xml, "        </direction-type>\n");
-                // MusicXML <sound> uses a "swing" attribute, not a "type"
-                // attribute. The old code produced invalid MusicXML that
-                // renderers would ignore or reject.
-                match style {
-                    SwingStyle::Swing => {
-                        let _ = write!(xml, "        <sound swing=\"straight\"/>\n");
-                    }
-                    SwingStyle::Triplet => {
-                        let _ = write!(xml, "        <sound swing=\"triplet\"/>\n");
-                    }
-                    _ => {}
-                }
-                let _ = write!(xml, "      </direction>\n");
-            } else if prev_swing_style == Some(SwingStyle::Swing)
-                || prev_swing_style == Some(SwingStyle::Triplet)
-            {
-                let _ = write!(xml, "      <direction placement=\"above\">\n");
-                let _ = write!(xml, "        <direction-type>\n");
-                let _ = write!(xml, "          <words>Straight</words>\n");
-                let _ = write!(xml, "        </direction-type>\n");
-                let _ = write!(xml, "      </direction>\n");
-            }
-            prev_swing_style = current_swing;
-        }
-
-        if let Some(tempo_marks) = tempo_marks_by_measure.get(&(measure_idx as i32)) {
-            let mut sorted = tempo_marks.clone();
-            sorted.sort_by_key(|(offset, _)| *offset);
-            for (offset, bpm) in sorted {
-                let _ = write!(xml, "      <direction placement=\"above\">\n");
-                if offset > 0 {
-                    let _ = write!(xml, "        <offset>{offset}</offset>\n");
-                }
-                let _ = write!(xml, "        <direction-type>\n");
-                let _ = write!(xml, "          <metronome>\n");
-                let _ = write!(xml, "            <beat-unit>quarter</beat-unit>\n");
-                let _ = write!(xml, "            <per-minute>{:.2}</per-minute>\n", bpm);
-                let _ = write!(xml, "          </metronome>\n");
-                let _ = write!(xml, "        </direction-type>\n");
-                let _ = write!(xml, "        <sound tempo=\"{:.2}\"/>\n", bpm);
-                let _ = write!(xml, "      </direction>\n");
-            }
-        }
-
-        if let Some(chords) = chord_by_measure.get(&(measure_idx as i32)) {
-            let mut sorted = chords.clone();
-            sorted.sort_by_key(|(offset, _)| *offset);
-            for (offset, chord) in sorted {
-                write_harmony(&mut xml, offset, &chord.symbol);
-            }
-        }
-
-        let mut chunks = chunks_by_measure.remove(&(measure_idx as i32)).unwrap_or_default();
-        chunks.sort_by_key(|chunk| chunk.start_tick_in_measure);
-
-        // If the measure has no notes, chords, or directions, fill it with a rest
-        let has_content = !chunks.is_empty()
-            || chord_by_measure.contains_key(&(measure_idx as i32))
-            || tempo_marks_by_measure.contains_key(&(measure_idx as i32))
-            || swing_by_measure.contains_key(&(measure_idx as i32));
-        if !has_content {
-            write_rest_ticks(
-                &mut xml,
-                boundaries[measure_idx],
-                measure_ticks,
-                MUSICXML_DIVISIONS,
-                1,
-                1,
-                config,
-            );
-            let _ = write!(xml, "    </measure>\n");
-            continue;
-        }
-
-        if config.is_lead_sheet {
-            let voice_map = build_voice_chunks(chunks.as_slice(), 1);
-            let voice_count = voice_map.len().max(1);
-            let mut rendered = 0usize;
-            for (voice, mut voice_chunks) in voice_map {
-                voice_chunks.sort_by_key(|chunk| chunk.start_tick_in_measure);
-                write_voice_sequence(
-                    &mut xml,
-                    voice_chunks.as_slice(),
-                    boundaries[measure_idx],
-                    measure_ticks,
-                    MUSICXML_DIVISIONS,
-                    1,
-                    voice,
-                    config,
-                );
-                rendered += 1;
-                if rendered < voice_count {
-                    let _ = write!(xml, "      <backup>\n");
-                    let _ = write!(xml, "        <duration>{}</duration>\n", measure_ticks.max(1));
-                    let _ = write!(xml, "      </backup>\n");
-                }
-            }
-        } else {
-            for staff in [1u8, 2u8] {
-                let voice_map = build_voice_chunks(chunks.as_slice(), staff);
-                let voice_count = voice_map.len().max(1);
-                let mut rendered = 0usize;
-                let mut staff_has_content = false;
-
-                for (voice, mut voice_chunks) in voice_map {
-                    voice_chunks.sort_by_key(|chunk| chunk.start_tick_in_measure);
-                    if !voice_chunks.is_empty() {
-                        staff_has_content = true;
-                    }
-                    write_voice_sequence(
-                        &mut xml,
-                        voice_chunks.as_slice(),
-                        boundaries[measure_idx],
-                        measure_ticks,
-                        MUSICXML_DIVISIONS,
-                        staff,
-                        voice,
-                        config,
-                    );
-
-                    rendered += 1;
-                    if rendered < voice_count {
-                        let _ = write!(xml, "      <backup>\n");
-                        let _ = write!(xml, "        <duration>{}</duration>\n", measure_ticks.max(1));
-                        let _ = write!(xml, "      </backup>\n");
-                    }
-                }
-
-                // Only emit the inter-staff backup if staff 1 actually
-                // wrote notes. Emitting a backup after an empty staff 1
-                // moves the cursor backwards and corrupts the measure
-                // layout in renderers.
-                if staff == 1 && staff_has_content {
-                    let _ = write!(xml, "      <backup>\n");
-                    let _ = write!(xml, "        <duration>{}</duration>\n", measure_ticks.max(1));
-                    let _ = write!(xml, "      </backup>\n");
-                }
-            }
-        }
-
-        let _ = write!(xml, "    </measure>\n");
-    }
-
-    let _ = write!(xml, "  </part>\n");
-    let _ = write!(xml, "</score-partwise>\n");
-
-    xml
-}
-
-/// Combined heuristic: skyline (highest pitch) + near-note continuity bias + outlier filter.
-/// At each event point the highest active pitch is the base candidate, but when multiple
-/// notes are active at the same pitch range, prefers the one closest to the previous melody
-/// pitch (near-note continuity). Outliers more than `outlier_semitones` from the rolling
-/// median are suppressed.
-fn extract_melody_heuristic(notes: &[NoteEvent], outlier_semitones: u8) -> Vec<NoteEvent> {
-    if notes.is_empty() {
-        return Vec::new();
-    }
-
-    let mut events: Vec<(f32, u8, u8, bool)> = Vec::with_capacity(notes.len() * 2);
-    for n in notes {
-        if !n.start_time.is_finite() || !n.end_time.is_finite() || n.end_time <= n.start_time {
-            continue;
-        }
-        events.push((n.start_time, n.pitch, n.velocity, true));
-        events.push((n.end_time, n.pitch, n.velocity, false));
-    }
-    events.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal)
-        .then_with(|| b.3.cmp(&a.3)));
-
-    // Pre-deduplicate: for any group of note-ons at the same time, keep only the
-    // first note-on per pitch.  Multiple stems can produce identical note-ons,
-    // but different pitches must be preserved so the skyline algorithm can
-    // choose among them.
-    let time_tolerance = 0.12;
-    let mut deduped: Vec<(f32, u8, u8, bool)> = Vec::with_capacity(events.len());
-    {
-        let mut i = 0;
-        while i < events.len() {
-            let batch_time = events[i].0;
-            let mut j = i;
-            while j < events.len() && (events[j].0 - batch_time).abs() <= time_tolerance {
-                j += 1;
-            }
-            let mut seen: std::collections::HashSet<u8> = std::collections::HashSet::new();
-            for k in i..j {
-                let (time, pitch, vel, is_start) = events[k];
-                if is_start {
-                    if seen.insert(pitch) {
-                        deduped.push((time, pitch, vel, true));
-                    }
-                } else {
-                    deduped.push((time, pitch, vel, false));
-                }
-            }
-            i = j;
-        }
-    }
-
-    let events = deduped;
-    let mut active: Vec<(u8, u8)> = Vec::new();
-    let mut melody_segments: Vec<NoteEvent> = Vec::new();
-    let mut segment_start = 0.0f32;
-    let mut last_melody_pitch: Option<u8> = None;
-    let mut last_melody_vel: u8 = 90;
-    let mut pitch_history: Vec<u8> = Vec::new();
-
-    let mut i = 0;
-    while i < events.len() {
-        let batch_time = events[i].0;
-
-        let mut batch_end = i;
-        while batch_end < events.len() && (events[batch_end].0 - batch_time).abs() <= time_tolerance {
-            batch_end += 1;
-        }
-
-        // Note-offs first
-        for j in i..batch_end {
-            let (_, pitch, _, is_start) = events[j];
-            if !is_start {
-                active.retain(|a| a.0 != pitch);
-            }
-        }
-
-        // Note-ons second
-        for j in i..batch_end {
-            let (_, pitch, vel, is_start) = events[j];
-            if is_start {
-                active.push((pitch, vel));
-            }
-        }
-
-        // One melody decision per batch
-        if !active.is_empty() {
-            let max_pitch = active.iter().map(|a| a.0).max().unwrap_or(0);
-            let candidates: Vec<(u8, u8)> = active.iter().filter(|a| a.0 == max_pitch).copied().collect();
-            let best = if candidates.len() == 1 {
-                candidates[0]
-            } else {
-                let prev = last_melody_pitch.unwrap_or(max_pitch);
-                candidates.into_iter().min_by_key(|c| (c.0 as i16 - prev as i16).abs()).unwrap()
-            };
-
-            if Some(best.0) != last_melody_pitch {
-                let mut skip = false;
-                if pitch_history.len() >= 3 {
-                    let mut sorted = pitch_history.clone();
-                    sorted.sort();
-                    let median = sorted[sorted.len() / 2];
-                    let diff = (best.0 as i16 - median as i16).abs();
-                    if diff > outlier_semitones as i16 {
-                        skip = true;
-                    }
-                }
-
-                if !skip {
-                    if let Some(prev_pitch) = last_melody_pitch {
-                        if batch_time > segment_start {
-                            melody_segments.push(NoteEvent {
-                                id: (melody_segments.len() + 1) as u32,
-                                pitch: prev_pitch,
-                                start_time: segment_start,
-                                end_time: batch_time,
-                                velocity: last_melody_vel,
-                                channel: None,
-                            });
-                        }
-                    }
-
-                    segment_start = batch_time;
-                    last_melody_pitch = Some(best.0);
-                    last_melody_vel = best.1;
-                    pitch_history.push(best.0);
-                    if pitch_history.len() > 8 {
-                        pitch_history.remove(0);
-                    }
-                }
-            }
-        }
-
-        i = batch_end;
-    }
-
-    if let Some(pitch) = last_melody_pitch {
-        let end_t = events.last().map(|e| e.0).unwrap_or(segment_start + 1.0);
-        if end_t > segment_start {
-            melody_segments.push(NoteEvent {
-                id: (melody_segments.len() + 1) as u32,
-                pitch,
-                start_time: segment_start,
-                end_time: end_t,
-                velocity: last_melody_vel,
-                channel: None,
-            });
-        }
-    }
-
-    melody_segments
-}
-
-/// Pure skyline (no continuity bias) — highest pitch at each point, with outlier filter.
-fn extract_melody_skyline(notes: &[NoteEvent], outlier_semitones: u8) -> Vec<NoteEvent> {
-    if notes.is_empty() {
-        return Vec::new();
-    }
-
-    // Build event list: note-on and note-off
-    let mut events: Vec<(f32, u8, u8, bool)> = Vec::with_capacity(notes.len() * 2);
-    for n in notes {
-        if !n.start_time.is_finite() || !n.end_time.is_finite() || n.end_time <= n.start_time {
-            continue;
-        }
-        events.push((n.start_time, n.pitch, n.velocity, true));
-        events.push((n.end_time, n.pitch, n.velocity, false));
-    }
-    events.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal)
-        .then_with(|| b.3.cmp(&a.3)));
-
-    // Sweep: batch-process events within a small time tolerance so that
-    // near-simultaneous notes from different stems are treated as one group.
-    let time_tolerance = 0.15; // covers ~0.42 beats at 170 BPM (safe for 0.5-beat snap bucket)
-    let mut active: Vec<(u8, u8)> = Vec::new();
-    let mut melody_segments: Vec<NoteEvent> = Vec::new();
-    let mut segment_start = 0.0f32;
-    let mut last_melody_pitch: Option<u8> = None;
-    let mut last_melody_vel: u8 = 90;
-    let mut pitch_history: Vec<u8> = Vec::new();
-
-    let mut i = 0;
-    while i < events.len() {
-        let batch_time = events[i].0;
-
-        // Gather all events within tolerance of batch_time
-        let mut batch_end = i;
-        while batch_end < events.len() && (events[batch_end].0 - batch_time).abs() <= time_tolerance {
-            batch_end += 1;
-        }
-
-        // Process note-offs first for this batch
-        for j in i..batch_end {
-            let (_, pitch, _, is_start) = events[j];
-            if !is_start {
-                active.retain(|a| a.0 != pitch);
-            }
-        }
-
-        // Process note-ons for this batch
-        for j in i..batch_end {
-            let (_, pitch, vel, is_start) = events[j];
-            if is_start {
-                active.push((pitch, vel));
-            }
-        }
-
-        // Make one melody decision for this batch
-        if !active.is_empty() {
-            let max_pitch = active.iter().map(|a| a.0).max().unwrap_or(0);
-            let candidates: Vec<(u8, u8)> = active.iter().filter(|a| a.0 == max_pitch).copied().collect();
-            let best = if candidates.len() == 1 {
-                candidates[0]
-            } else {
-                let prev = last_melody_pitch.unwrap_or(max_pitch);
-                candidates.into_iter().min_by_key(|c| (c.0 as i16 - prev as i16).abs()).unwrap()
-            };
-
-            if Some(best.0) != last_melody_pitch {
-                // Outlier filter
-                let mut skip = false;
-                if pitch_history.len() >= 3 {
-                    let mut sorted = pitch_history.clone();
-                    sorted.sort();
-                    let median = sorted[sorted.len() / 2];
-                    let diff = (best.0 as i16 - median as i16).abs();
-                    if diff > outlier_semitones as i16 {
-                        skip = true;
-                    }
-                }
-
-                if !skip {
-                    // Emit previous segment
-                    if let Some(prev_pitch) = last_melody_pitch {
-                        if batch_time > segment_start {
-                            melody_segments.push(NoteEvent {
-                                id: (melody_segments.len() + 1) as u32,
-                                pitch: prev_pitch,
-                                start_time: segment_start,
-                                end_time: batch_time,
-                                velocity: last_melody_vel,
-                                channel: None,
-                            });
-                        }
-                    }
-
-                    segment_start = batch_time;
-                    last_melody_pitch = Some(best.0);
-                    last_melody_vel = best.1;
-                    pitch_history.push(best.0);
-                    if pitch_history.len() > 8 {
-                        pitch_history.remove(0);
-                    }
-                }
-            }
-        }
-
-        i = batch_end;
-    }
-
-    if let Some(pitch) = last_melody_pitch {
-        let end_t = events.last().map(|e| e.0).unwrap_or(segment_start + 1.0);
-        if end_t > segment_start {
-            melody_segments.push(NoteEvent {
-                id: (melody_segments.len() + 1) as u32,
-                pitch,
-                start_time: segment_start,
-                end_time: end_t,
-                velocity: last_melody_vel,
-                channel: None,
-            });
-        }
-    }
-
-    melody_segments
-}
-
-fn merge_adjacent_notes(notes: &mut Vec<NoteEvent>, step: f32) {
-    let merge_gap = (step * 2.0).max(0.03);
-    
-    notes.sort_by(|a, b| {
-        a.pitch.cmp(&b.pitch).then_with(|| {
-            a.start_time.partial_cmp(&b.start_time).unwrap_or(std::cmp::Ordering::Equal)
-        })
-    });
-
-    let mut i = 0;
-    while i + 1 < notes.len() {
-        let a = &notes[i];
-        let b = &notes[i + 1];
-        if a.pitch == b.pitch && b.start_time - a.end_time < merge_gap {
-            let end = a.end_time.max(b.end_time);
-            let vel = a.velocity.max(b.velocity);
-            notes[i].end_time = end;
-            notes[i].velocity = vel;
-            notes.remove(i + 1);
-        } else {
-            i += 1;
-        }
-    }
-
-    notes.sort_by(|a, b| {
-        a.start_time
-            .partial_cmp(&b.start_time)
-            .unwrap_or(std::cmp::Ordering::Equal)
-            .then_with(|| a.pitch.cmp(&b.pitch))
-    });
-}
-
-fn notes_to_spans(notes: &[QuantizedNote], config: SheetEngravingConfig) -> Vec<NoteSpan> {
-    // Snap to the nearest quarter-beat (0.25) — the finest grid the
-    // quantizer produces. The previous code snapped to half-beats (0.5),
-    // which destroyed 16th notes and dotted-eighth durations.
-    fn snap_to_grid(value: f32) -> f32 {
-        if !value.is_finite() {
-            return 0.25;
-        }
-        (value / 0.25).round() * 0.25
-    }
-
-    let mut out = Vec::new();
-    for note in notes {
-        let start_tick = (note.beat_start * MUSICXML_DIVISIONS as f32).round().max(0.0) as i32;
-        // Preserve the exact quantized duration — the quantizer already
-        // snapped to a musical grid, so we should not re-snap to a coarser
-        // one. Minimum is a 16th note (0.25 beats).
-        let raw_dur = snap_to_grid(note.beat_duration).max(0.25);
-        let duration_ticks = (raw_dur * MUSICXML_DIVISIONS as f32).round().max(1.0) as i32;
-        let staff = if config.is_lead_sheet || config.single_staff {
-            1
-        } else if note.pitch >= GRAND_STAFF_SPLIT_MIDI {
-            1
-        } else {
-            2
-        };
-        out.push(NoteSpan {
-            id: note.id,
-            start_tick: start_tick.max(0),
-            end_tick: (start_tick + duration_ticks).max(start_tick + 1),
-            pitch: note.pitch,
-            velocity: note.velocity,
-            staff,
-            articulation: note.articulation,
-        });
-    }
-
-    out.sort_by_key(|n| n.start_tick);
-
-    // Deduplicate: if two NoteSpans share the same pitch and start_tick,
-    // keep only the longer one (prevents unison from monophonic reduction).
-    let mut deduped: Vec<NoteSpan> = Vec::with_capacity(out.len());
-    for span in out {
-        if let Some(last) = deduped.last_mut() {
-            if last.pitch == span.pitch && last.start_tick == span.start_tick {
-                if span.end_tick > last.end_tick {
-                    last.end_tick = span.end_tick;
-                }
-                continue;
-            }
-        }
-        deduped.push(span);
-    }
-    out = deduped;
-
-    out
-}
-
-
-fn write_harmony(xml: &mut String, offset: i32, symbol: &str) {
-    let (root_pc, suffix, bass_pc) = parse_chord_symbol(symbol);
-    let (root_step, root_alter) = pc_to_step_alter(root_pc);
-
-    let _ = write!(xml, "      <harmony>\n");
-    if offset > 0 {
-        let _ = write!(xml, "        <offset>{offset}</offset>\n");
-    }
-    let _ = write!(xml, "        <root><root-step>{root_step}</root-step>");
-    if root_alter != 0 {
-        let _ = write!(xml, "<root-alter>{}</root-alter>", root_alter);
-    }
-    let _ = write!(xml, "</root>\n");
-
-    // Split the suffix into the base kind and any alterations (b9, #9, #11, b5, #5).
-    let (base_suffix, alterations) = split_chord_alterations(suffix);
-    let kind = chord_suffix_to_musicxml_kind(base_suffix.as_str());
-    let _ = write!(
-        xml,
-        "        <kind{}>{}</kind>\n",
-        if kind != "other" {
-            ""
-        } else {
-            " text=\"other\""
-        },
-        kind
-    );
-
-    if let Some(bass_pc) = bass_pc {
-        let (bass_step, bass_alter) = pc_to_step_alter(bass_pc);
-        let _ = write!(xml, "        <bass><bass-step>{bass_step}</bass-step>");
-        if bass_alter != 0 {
-            let _ = write!(xml, "<bass-alter>{}</bass-alter>", bass_alter);
-        }
-        let _ = write!(xml, "</bass>\n");
-    }
-
-    // Emit <degree> elements for alterations so renderers display the
-    // correct chord symbol (e.g. "7b9" instead of just "9").
-    for alt in &alterations {
-        let _ = write!(xml, "        <degree>\n");
-        let _ = write!(xml, "          <degree-value>{}</degree-value>\n", alt.degree_value);
-        let _ = write!(xml, "          <degree-alter>{}</degree-alter>\n", alt.alter);
-        let _ = write!(xml, "          <degree-type>{}</degree-type>\n", alt.type_str);
-        let _ = write!(xml, "        </degree>\n");
-    }
-
-    let _ = write!(xml, "      </harmony>\n");
-}
-
-struct ChordAlteration {
-    degree_value: u8,  // e.g. 9 for the 9th
-    alter: i8,         // -1 = flat, 1 = sharp
-    type_str: &'static str, // "add" or "alter"
-}
-
-/// Split a chord suffix into the base kind and a list of alterations.
-/// For example "7b9" → ("7", [Alteration { 9, -1, "alter" }])
-/// "7#11" → ("7", [Alteration { 11, 1, "add" }])
-fn split_chord_alterations(suffix: &str) -> (String, Vec<ChordAlteration>) {
-    // Known alteration patterns to extract from the suffix.
-    let patterns: &[(&str, u8, i8, &str)] = &[
-        ("b9", 9, -1, "alter"),
-        ("#9", 9, 1, "alter"),
-        ("b5", 5, -1, "alter"),
-        ("#5", 5, 1, "alter"),
-        ("b13", 13, -1, "alter"),
-        ("#11", 11, 1, "add"),
-    ];
-
-    let mut remaining = suffix.to_string();
-    let mut alterations = Vec::new();
-
-    // Check for compound alterations first (e.g. "b9b5")
-    if remaining.contains("b9") && remaining.contains("b5") {
-        alterations.push(ChordAlteration { degree_value: 9, alter: -1, type_str: "alter" });
-        alterations.push(ChordAlteration { degree_value: 5, alter: -1, type_str: "alter" });
-        remaining = remaining.replace("b9", "").replace("b5", "");
-    }
-
-    for (pat, degree, alter, type_str) in patterns {
-        if remaining.contains(pat) {
-            alterations.push(ChordAlteration { degree_value: *degree, alter: *alter, type_str });
-            remaining = remaining.replace(pat, "");
-        }
-    }
-
-    (remaining, alterations)
-}
-
-fn parse_chord_symbol(symbol: &str) -> (u8, &str, Option<u8>) {
-    let (main, bass) = symbol.split_once('/').map(|(a, b)| (a, Some(b))).unwrap_or((symbol, None));
-
-    let (root_pc, root_len) = parse_root_pc(main).unwrap_or((0, 1));
-    let suffix = &main[root_len.min(main.len())..];
-    let bass_pc = bass.and_then(|b| parse_root_pc(b).map(|(pc, _)| pc));
-
-    (root_pc, suffix, bass_pc)
-}
-
-fn parse_root_pc(s: &str) -> Option<(u8, usize)> {
-    let mut chars = s.chars();
-    let first = chars.next()?;
-    let base = match first {
-        'C' => 0,
-        'D' => 2,
-        'E' => 4,
-        'F' => 5,
-        'G' => 7,
-        'A' => 9,
-        'B' => 11,
-        _ => return None,
-    };
-
-    let second = s.chars().nth(1);
-    match second {
-        Some('#') => Some(((base + 1) % 12, 2)),
-        Some('b') => Some(((base + 11) % 12, 2)),
-        _ => Some((base, 1)),
-    }
-}
-
-fn chord_suffix_to_musicxml_kind(suffix: &str) -> &'static str {
-    match suffix {
-        "" => "major",
-        "-" => "minor",
-        "7" => "dominant",
-        "\u{0394}7" => "major-seventh",
-        "-7" => "minor-seventh",
-        "dim" => "diminished",
-        "dim7" => "diminished-seventh",
-        "aug" => "augmented",
-        "sus2" => "suspended-second",
-        "sus4" => "suspended-fourth",
-        "-\u{0394}7" => "minor-major-seventh",
-        "-7b5" => "half-diminished",
-        "7#5" => "augmented-seventh",
-        "9" => "dominant-ninth",
-        "\u{0394}9" => "major-ninth",
-        "-9" => "minor-ninth",
-        "7b9" => "dominant-ninth",
-        "7#9" => "dominant-ninth",
-        "7#11" => "dominant-11th",
-        "\u{0394}7#11" => "major-11th",
-        "-11" => "minor-11th",
-        "13" => "dominant-13th",
-        "\u{0394}13" => "major-13th",
-        "-13" => "minor-13th",
-        "\u{0394}9#11" => "major-11th",
-        _ => "other",
-    }
-}
-
-fn pc_to_step_alter(pc: u8) -> (&'static str, i8) {
-    match pc % 12 {
-        0 => ("C", 0),
-        1 => ("D", -1),
-        2 => ("D", 0),
-        3 => ("E", -1),
-        4 => ("E", 0),
-        5 => ("F", 0),
-        6 => ("G", -1),
-        7 => ("G", 0),
-        8 => ("A", -1),
-        9 => ("A", 0),
-        10 => ("B", -1),
-        _ => ("B", 0),
-    }
-}
-
-fn write_rest_ticks(
-    xml: &mut String,
-    start_tick: i32,
-    duration_ticks: i32,
-    divisions: i32,
-    staff: u8,
-    voice: u8,
-    config: SheetEngravingConfig,
-) {
-    let tokens = duration_tokens_for_ticks(duration_ticks, divisions, config);
-    let mut cursor_tick = start_tick;
-    for token in tokens {
-        let _ = write!(
-            xml,
-            "      <note id=\"r{}_{}\">\n",
-            cursor_tick,
-            token.ticks.max(1)
-        );
-        let _ = write!(xml, "        <rest/>\n");
-        let _ = write!(xml, "        <duration>{}</duration>\n", token.ticks.max(1));
-        write_time_mod(xml, token.time_mod);
-        let _ = write!(xml, "        <type>{}</type>\n", token.note_type);
-        for _ in 0..token.dots {
-            let _ = write!(xml, "        <dot/>\n");
-        }
-        let _ = write!(xml, "        <voice>{}</voice>\n", voice.max(1));
-        let _ = write!(xml, "        <staff>{}</staff>\n", staff.max(1));
-        if token.time_mod.is_some() {
-            let _ = write!(xml, "        <notations>\n");
-            write_tuplet_notation(xml, token.time_mod, true, true);
-            let _ = write!(xml, "        </notations>\n");
-        }
-        let _ = write!(xml, "      </note>\n");
-        cursor_tick += token.ticks.max(1);
-    }
-}
-
-
-
-fn write_note_element(
-    xml: &mut String,
-    note_id: &str,
-    pitch: u8,
-    token: DurationToken,
-    staff: u8,
-    voice: u8,
-    velocity: u8,
-    is_chord: bool,
-    tie_start: bool,
-    tie_stop: bool,
-    articulation: Articulation,
-    beam: Option<&'static str>,
-    is_tuplet_start: bool,
-    is_tuplet_end: bool,
-) {
-    let (step, alter, octave) = midi_to_pitch_parts(pitch);
-    let _ = write!(xml, "      <note id=\"{}\">\n", xml_escape(note_id));
-    if is_chord {
-        let _ = write!(xml, "        <chord/>\n");
-    }
-    if articulation == Articulation::Grace || token.note_type == "grace" {
-        let _ = write!(xml, "        <grace/>\n");
-    }
-    if token.note_type != "grace" || articulation == Articulation::Grace {
-        let _ = write!(xml, "        <pitch><step>{step}</step>");
-        if alter != 0 {
-            let _ = write!(xml, "<alter>{}</alter>", alter);
-        }
-        let _ = write!(xml, "<octave>{octave}</octave></pitch>\n");
-    }
-    if token.note_type != "grace" && articulation != Articulation::Grace {
-        let _ = write!(xml, "        <duration>{}</duration>\n", token.ticks.max(1));
-    }
-    write_time_mod(xml, token.time_mod);
-    let note_type = if articulation == Articulation::Grace { "eighth" } else { token.note_type };
-    let _ = write!(xml, "        <type>{}</type>\n", note_type);
-    for _ in 0..token.dots {
-        let _ = write!(xml, "        <dot/>\n");
-    }
-    // `alter` is already computed from midi_to_pitch_parts at the top of
-    // this function — no need to call it again.
-    if alter != 0 && token.note_type != "grace" {
-        let acc = match alter { -2 => "double-flat", -1 => "flat", 1 => "sharp", 2 => "double-sharp", _ => "sharp" };
-        let _ = write!(xml, "        <accidental>{}</accidental>\n", acc);
-    }
-    if let Some(b) = beam {
-        let _ = write!(xml, "        <beam number=\"1\">{}</beam>\n", b);
-    }
-    let _ = write!(xml, "        <voice>{}</voice>\n", voice.max(1));
-    let _ = write!(xml, "        <staff>{}</staff>\n", staff.max(1));
-    let _ = write!(xml, "        <velocity>{}</velocity>\n", velocity);
-
-    if tie_stop {
-        let _ = write!(xml, "        <tie type=\"stop\"/>\n");
-    }
-    if tie_start {
-        let _ = write!(xml, "        <tie type=\"start\"/>\n");
-    }
-
-    let has_notations = tie_start || tie_stop || token.time_mod.is_some()
-        || articulation == Articulation::Staccato
-        || articulation == Articulation::Tenuto
-        || articulation == Articulation::Accent;
-
-    if has_notations {
-        let _ = write!(xml, "        <notations>\n");
-        if tie_stop {
-            let _ = write!(xml, "          <tied type=\"stop\"/>\n");
-        }
-        if tie_start {
-            let _ = write!(xml, "          <tied type=\"start\"/>\n");
-        }
-        match articulation {
-            Articulation::Staccato => {
-                let _ = write!(xml, "          <articulations>\n");
-                let _ = write!(xml, "            <staccato/>\n");
-                let _ = write!(xml, "          </articulations>\n");
-            }
-            Articulation::Tenuto => {
-                let _ = write!(xml, "          <articulations>\n");
-                let _ = write!(xml, "            <tenuto/>\n");
-                let _ = write!(xml, "          </articulations>\n");
-            }
-            Articulation::Accent => {
-                let _ = write!(xml, "          <articulations>\n");
-                let _ = write!(xml, "            <accent/>\n");
-                let _ = write!(xml, "          </articulations>\n");
-            }
-            _ => {}
-        }
-        write_tuplet_notation(xml, token.time_mod, is_tuplet_start, is_tuplet_end);
-        let _ = write!(xml, "        </notations>\n");
-    }
-
-    let _ = write!(xml, "      </note>\n");
-}
-
-fn duration_tokens_for_ticks(
-    duration_ticks: i32,
-    divisions: i32,
-    _config: SheetEngravingConfig,
-) -> Vec<DurationToken> {
-    let d = divisions.max(1);
-    let min_tick = d / 4; // smallest unit = 16th note (120 at 480 div)
-
-    // Floor to nearest 16th boundary so we never exceed the true duration.
-    let total = (duration_ticks.max(0) / min_tick) * min_tick;
-    if total < min_tick {
-        return Vec::new();
-    }
-
-    // Candidate durations from longest to shortest, including dotted notes
-    // and triplets. Each entry is (ticks, note_type, dots, time_modification).
-    // Dotted note = base * 1.5. Triplet quarter = d*2/3, triplet eighth = d/3.
-    // At 480 divisions: whole=1920, half=960, half.=1440, quarter=480,
-    // quarter.=720, eighth=240, eighth.=360, 16th=120.
-    let candidates: &[DurationToken] = &[
-        DurationToken { ticks: d * 4, note_type: "whole", dots: 0, time_mod: None },
-        DurationToken { ticks: d * 3, note_type: "half", dots: 1, time_mod: None },
-        DurationToken { ticks: d * 2, note_type: "half", dots: 0, time_mod: None },
-        DurationToken { ticks: d + d / 2, note_type: "quarter", dots: 1, time_mod: None },
-        DurationToken { ticks: d, note_type: "quarter", dots: 0, time_mod: None },
-        DurationToken { ticks: d / 2 + d / 4, note_type: "eighth", dots: 1, time_mod: None },
-        DurationToken { ticks: d / 2, note_type: "eighth", dots: 0, time_mod: None },
-        DurationToken { ticks: d / 4 + d / 8, note_type: "16th", dots: 1, time_mod: None },
-        DurationToken { ticks: d / 4, note_type: "16th", dots: 0, time_mod: None },
-        // Triplet candidates (time_mod actual/normal)
-        DurationToken { ticks: d * 2 / 3, note_type: "quarter", dots: 0, time_mod: Some((2, 3)) },
-        DurationToken { ticks: d / 3, note_type: "eighth", dots: 0, time_mod: Some((2, 3)) },
-        DurationToken { ticks: d / 6, note_type: "16th", dots: 0, time_mod: Some((2, 3)) },
-    ];
-
-    let mut remaining = total;
-    let mut out = Vec::new();
-
-    while remaining >= min_tick {
-        let mut chosen: Option<DurationToken> = None;
-        for candidate in candidates {
-            if candidate.ticks <= remaining {
-                chosen = Some(*candidate);
-                break;
-            }
-        }
-
-        match chosen {
-            Some(token) => {
-                remaining -= token.ticks;
-                out.push(token);
-            }
-            None => {
-                // Remaining is smaller than the finest candidate; emit as
-                // a 16th so the measure still adds up.
-                let fallback = DurationToken {
-                    ticks: min_tick,
-                    note_type: "16th",
-                    dots: 0,
-                    time_mod: None,
-                };
-                remaining -= fallback.ticks;
-                out.push(fallback);
-            }
-        }
-    }
-
-    out
-}
-
-fn build_voice_chunks(chunks: &[NoteChunk], staff: u8) -> BTreeMap<u8, Vec<NoteChunk>> {
-    // Greedy voice assignment: sort notes by start position, then assign
-    // each to the lowest-numbered voice whose last note ends before this
-    // one starts. This separates overlapping notes (e.g. a sustained half
-    // note and a moving quarter-note line) into distinct voices so the
-    // MusicXML renderer doesn't truncate or reorder them.
-    let mut filtered: Vec<NoteChunk> = chunks
-        .iter()
-        .filter(|c| c.staff == staff)
-        .cloned()
-        .collect();
-    filtered.sort_by_key(|c| (c.start_tick_in_measure, c.pitch));
-
-    // Track the end tick of the last note in each voice.
-    let mut voice_end_ticks: Vec<i32> = Vec::new();
-    let mut voice_assignments: Vec<u8> = vec![0u8; filtered.len()];
-
-    for (i, chunk) in filtered.iter().enumerate() {
-        let start = chunk.start_tick_in_measure;
-        let end = start + chunk.duration_ticks;
-
-        // Find the first voice that is free (its last note ended at or
-        // before this note's start).
-        let assigned_voice = voice_end_ticks
-            .iter()
-            .position(|&end_tick| end_tick <= start);
-
-        let voice = match assigned_voice {
-            Some(idx) => {
-                voice_end_ticks[idx] = end;
-                (idx + 1) as u8
-            }
-            None => {
-                voice_end_ticks.push(end);
-                voice_end_ticks.len() as u8
-            }
-        };
-        voice_assignments[i] = voice;
-    }
-
-    let mut out: BTreeMap<u8, Vec<NoteChunk>> = BTreeMap::new();
-    for (i, chunk) in filtered.into_iter().enumerate() {
-        let voice = voice_assignments[i];
-        out.entry(voice).or_default().push(chunk);
-    }
-
-    out
-}
-
-fn write_voice_sequence(
-    xml: &mut String,
-    chunks: &[NoteChunk],
-    measure_start_tick: i32,
-    measure_ticks: i32,
-    divisions: i32,
-    staff: u8,
-    voice: u8,
-    config: SheetEngravingConfig,
-) {
-    let min_rest_ticks = (divisions / 2).max(1); // no rests smaller than 8th
-
-    // Pre-compute beam groups for consecutive eighth notes
-    let mut beam_of_group: Vec<Option<&'static str>> = vec![None; chunks.len()];
-    {
-        let mut g = 0;
-        let mut group_positions: Vec<(usize, bool)> = Vec::new();
-        while g < chunks.len() {
-            let pos = chunks[g].start_tick_in_measure;
-            let mut ge = g;
-            let mut max_dur = 0;
-            while ge < chunks.len() && chunks[ge].start_tick_in_measure == pos {
-                max_dur = max_dur.max(chunks[ge].duration_ticks);
-                ge += 1;
-            }
-            let is_eighth = max_dur <= divisions / 2;
-            group_positions.push((g, is_eighth));
-            g = ge;
-        }
-        let mut gi = 0;
-        while gi < group_positions.len() {
-            if group_positions[gi].1 {
-                let start = gi;
-                while gi < group_positions.len() && group_positions[gi].1 { gi += 1; }
-                let end = gi;
-                if end - start >= 2 {
-                    beam_of_group[group_positions[start].0] = Some("begin");
-                    for k in (start + 1)..(end - 1) {
-                        beam_of_group[group_positions[k].0] = Some("continue");
-                    }
-                    beam_of_group[group_positions[end - 1].0] = Some("end");
-                }
-            } else {
-                gi += 1;
-            }
-        }
-    }
-
-    let mut cursor = 0i32;
-    let mut i = 0;
-
-    while i < chunks.len() {
-        if cursor >= measure_ticks {
-            break;
-        }
-
-        let nominal_pos = chunks[i].start_tick_in_measure;
-
-        // If this chunk's position is behind the cursor, shift it to the cursor
-        // (avo`ids going backwards in time within a single voice).
-        let write_pos = if nominal_pos < cursor { cursor } else { nominal_pos };
-
-        // Rest gap before write_pos
-        if write_pos > cursor {
-            let gap = write_pos.min(measure_ticks) - cursor;
-            if gap >= min_rest_ticks {
-                write_rest_ticks(
-                    xml,
-                    measure_start_tick + cursor,
-                    gap,
-                    divisions,
-                    staff,
-                    voice,
-                    config,
-                );
-            }
-            cursor = write_pos.min(measure_ticks);
-            if cursor >= measure_ticks {
-                break;
-            }
-        }
-
-        // Gather all chunks starting at this *nominal* position (chord group)
-        let mut group_end = i;
-        while group_end < chunks.len() && chunks[group_end].start_tick_in_measure == nominal_pos {
-            group_end += 1;
-        }
-
-        // The voice cursor advances by the longest note in the group,
-        // but each note is written with its OWN duration. MusicXML chord
-        // notes (<chord/>) must share the same <duration>, so notes with
-        // differing durations starting at the same time should be in
-        // separate voices — which build_voice_chunks now handles. Within
-        // a single voice, simultaneous notes are true chords and should
-        // already have the same duration.
-        let group_max_dur = chunks[i..group_end]
-            .iter()
-            .map(|c| c.duration_ticks)
-            .max()
-            .unwrap_or(0);
-        let clamped_max_dur = group_max_dur.min(measure_ticks - cursor);
-
-        for (j, chunk) in chunks[i..group_end].iter().enumerate() {
-            let is_chord = j > 0;
-            // Use this note's own duration, clamped to the remaining
-            // measure space. This preserves individual note lengths
-            // instead of stretching all to the group maximum.
-            let chunk_dur = chunk.duration_ticks.min(measure_ticks - cursor);
-            if chunk_dur > 0 {
-                let tokens = duration_tokens_for_ticks(chunk_dur, divisions, config);
-                let mut current_token_tick = chunk.absolute_tick;
-                
-                for (idx, token) in tokens.iter().enumerate() {
-                    let local_tie_stop = (idx > 0) || (idx == 0 && chunk.tie_stop);
-                    let local_tie_start = (idx + 1 < tokens.len()) || (idx + 1 == tokens.len() && chunk.tie_start);
-                    
-                    let beam = if j == 0 && idx == 0 { beam_of_group[i] } else { None };
-                    // Tuplet start goes on the first token of the first
-                    // chord note; tuplet stop goes on the last token.
-                    let is_tuplet_start = j == 0 && idx == 0 && token.time_mod.is_some();
-                    let is_tuplet_end = idx + 1 == tokens.len() && token.time_mod.is_some();
-                    write_note_element(
-                        xml,
-                        &format!(
-                            "n{}_{}_{}_{}",
-                            chunk.id,
-                            chunk.pitch,
-                            current_token_tick,
-                            token.ticks
-                        ),
-                        chunk.pitch,
-                        *token,
-                        staff,
-                        voice,
-                        chunk.velocity,
-                        is_chord,
-                        local_tie_start,
-                        local_tie_stop,
-                        chunk.articulation,
-                        beam,
-                        is_tuplet_start,
-                        is_tuplet_end,
-                    );
-                    current_token_tick += token.ticks;
-                }
-            }
-        }
-
-        cursor = (cursor + clamped_max_dur).min(measure_ticks);
-        i = group_end;
-    }
-
-    let remaining = measure_ticks - cursor;
-    if remaining >= min_rest_ticks {
-        write_rest_ticks(
-            xml,
-            measure_start_tick + cursor,
-            remaining,
-            divisions,
-            staff,
-            voice,
-            config,
-        );
-    }
-}
-
-
-fn write_time_mod(xml: &mut String, time_mod: Option<(u8, u8)>) {
-    if let Some((actual, normal)) = time_mod {
-        let _ = write!(xml, "        <time-modification>\n");
-        let _ = write!(xml, "          <actual-notes>{}</actual-notes>\n", actual);
-        let _ = write!(xml, "          <normal-notes>{}</normal-notes>\n", normal);
-        let _ = write!(xml, "        </time-modification>\n");
-    }
-}
-
-fn write_tuplet_notation(xml: &mut String, time_mod: Option<(u8, u8)>, is_tuplet_start: bool, is_tuplet_end: bool) {
-    if time_mod.is_some() {
-        if is_tuplet_start {
-            let _ = write!(xml, "          <tuplet type=\"start\"/>\n");
-        }
-        if is_tuplet_end {
-            let _ = write!(xml, "          <tuplet type=\"stop\"/>\n");
-        }
-    }
-}
-
-fn midi_to_pitch_parts(midi: u8) -> (&'static str, i8, i32) {
-    let octave = (midi as i32 / 12) - 1;
-    match midi % 12 {
-        0 => ("C", 0, octave),
-        1 => ("C", 1, octave),
-        2 => ("D", 0, octave),
-        3 => ("D", 1, octave),
-        4 => ("E", 0, octave),
-        5 => ("F", 0, octave),
-        6 => ("F", 1, octave),
-        7 => ("G", 0, octave),
-        8 => ("G", 1, octave),
-        9 => ("A", 0, octave),
-        10 => ("A", 1, octave),
-        _ => ("B", 0, octave),
-    }
-}
-
-fn sanitize_filename_component(input: &str) -> String {
-    let mut out = String::with_capacity(input.len());
-    for c in input.chars() {
-        let valid = c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.';
-        if valid {
-            out.push(c);
-        } else if c.is_ascii_whitespace() {
-            out.push('_');
-        }
-    }
-
-    if out.is_empty() {
-        "keyscribe-sheet".to_string()
-    } else {
-        out
-    }
-}
-
-fn xml_escape(text: &str) -> String {
-    text.replace('&', "&amp;")
-        .replace('<', "&lt;")
-        .replace('>', "&gt;")
-        .replace('"', "&quot;")
-        .replace('\'', "&apos;")
-}
-
-fn export_engraved_pdf_with_musescore(musicxml_path: &Path, pdf_path: &Path) -> Result<(), String> {
-    let mut commands = vec![
-        "musescore4".to_string(),
-        "MuseScore4".to_string(),
-        "mscore".to_string(),
-        "MuseScore3".to_string(),
-        "MuseScore".to_string(),
-    ];
-
-    if cfg!(windows) {
-        if let Ok(program_files) = std::env::var("ProgramFiles") {
-            commands.push(format!("{}\\MuseScore 4\\bin\\MuseScore4.exe", program_files));
-            commands.push(format!("{}\\MuseScore 3\\bin\\MuseScore3.exe", program_files));
-        }
-        if let Ok(program_files_x86) = std::env::var("ProgramFiles(x86)") {
-            commands.push(format!("{}\\MuseScore 4\\bin\\MuseScore4.exe", program_files_x86));
-            commands.push(format!("{}\\MuseScore 3\\bin\\MuseScore3.exe", program_files_x86));
-        }
-    }
-
-    let mut failures = Vec::<String>::new();
-    for cmd in commands {
-        let attempts = [
-            vec![
-                "-o".to_string(),
-                pdf_path.to_string_lossy().to_string(),
-                musicxml_path.to_string_lossy().to_string(),
-            ],
-            vec![
-                musicxml_path.to_string_lossy().to_string(),
-                "-o".to_string(),
-                pdf_path.to_string_lossy().to_string(),
-            ],
-        ];
-
-        for args in attempts {
-            let mut cmd_obj = Command::new(cmd.as_str());
-            cmd_obj.args(args.as_slice());
-            #[cfg(windows)]
-            {
-                use std::os::windows::process::CommandExt;
-                cmd_obj.creation_flags(0x08000000);
-            }
-            let status = cmd_obj.status();
-            match status {
-                Ok(s) if s.success() => return Ok(()),
-                Ok(s) => {
-                    failures.push(format!("{} exited with {}", cmd, s));
-                }
-                Err(_) => {
-                    // Try next command candidate.
-                }
-            }
-        }
-    }
-
-    if failures.is_empty() {
-        Err("MuseScore CLI was not found. Install MuseScore and ensure its CLI executable is on PATH.".to_string())
-    } else {
-        Err(format!(
-            "MuseScore CLI failed to engrave PDF. Attempts: {}",
-            failures.join(" | ")
-        ))
-    }
-}
-
-fn write_temp_musicxml(prefix: &str, xml: &str) -> Result<PathBuf, String> {
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_err(|e| format!("clock error: {e}"))?
-        .as_millis();
-    let path = std::env::temp_dir().join(format!("{}_{}.musicxml", prefix, now));
-    fs::write(path.as_path(), xml.as_bytes())
-        .map_err(|e| format!("failed to write temp musicxml: {e}"))?;
-    Ok(path)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn builds_readable_musicxml() {
-        let foundation = LeadSheetFoundation {
-            tempo_map: vec![TempoSegment {
-                start_time_sec: 0.0,
-                end_time_sec: 8.0,
-                bpm: 120.0,
-                beat_duration_sec: 0.5,
-                beat_offset: 0.0,
-            }],
-            time_signature_segments: vec![crate::leadsheet::TimeSignatureSegment {
-                start_beat: 0.0,
-                end_beat: 16.0,
-                numerator: 4,
-                denominator: 4,
-                confidence: 0.9,
-                meter_class: crate::leadsheet::MeterClass::SimpleQuadruple,
-            }],
-            tempo: crate::leadsheet::TempoEstimate {
-                bpm: 120.0,
-                beat_duration_sec: 0.5,
-                confidence: 1.0,
-            },
-            quantized_notes: vec![
-                QuantizedNote {
-                    id: 1,
-                    pitch: 60,
-                    beat_start: 0.0,
-                    beat_duration: 1.0,
-                    velocity: 96,
-                    channel: None,
-                    confidence: 1.0,
-                    bar_index: 0,
-                    beat_index: 0,
-                    intra_beat_pos: 0.0,
-                    articulation: Articulation::Normal,
-                    swing_style: SwingStyle::Straight,
-                    swing_feel: false,
-                },
-                QuantizedNote {
-                    id: 2,
-                    pitch: 64,
-                    beat_start: 1.0,
-                    beat_duration: 1.0,
-                    velocity: 96,
-                    channel: None,
-                    confidence: 1.0,
-                    bar_index: 0,
-                    beat_index: 0,
-                    intra_beat_pos: 0.0,
-                    articulation: Articulation::Normal,
-                    swing_style: SwingStyle::Straight,
-                    swing_feel: false,
-                },
-            ],
-            melody_notes: vec![],
-            chord_changes: vec![ChordSymbolChange {
-                beat_start: 0.0,
-                symbol: "C".to_string(),
-            }],
-            tied_notes: vec![],
-            rhythm_confidence: 0.9,
-            melodic_stem: None,
-            separation_confidence: 0.0,
-            aligned_notes: vec![],
-            swing_sections: vec![],
-            beats_per_bar: 4,
-        };
-
-        let xml = build_musicxml_document("Test", &foundation, SheetEngravingConfig {
-            is_lead_sheet: false,
-            ..SheetEngravingConfig::default()
-        });
-        assert!(xml.contains("<score-partwise"));
-        assert!(xml.contains("<harmony>"));
-        assert!(xml.contains("<measure number=\"1\">"));
-        assert!(xml.contains("<staves>2</staves>"));
-    }
-
-    #[test]
-    fn musicxml_contains_non_quarter_types_when_input_has_short_values() {
-        let foundation = LeadSheetFoundation {
-            tempo_map: vec![TempoSegment {
-                start_time_sec: 0.0,
-                end_time_sec: 8.0,
-                bpm: 120.0,
-                beat_duration_sec: 0.5,
-                beat_offset: 0.0,
-            }],
-            time_signature_segments: vec![crate::leadsheet::TimeSignatureSegment {
-                start_beat: 0.0,
-                end_beat: 16.0,
-                numerator: 4,
-                denominator: 4,
-                confidence: 0.9,
-                meter_class: crate::leadsheet::MeterClass::SimpleQuadruple,
-            }],
-            tempo: crate::leadsheet::TempoEstimate {
-                bpm: 120.0,
-                beat_duration_sec: 0.5,
-                confidence: 1.0,
-            },
-            quantized_notes: vec![
-                QuantizedNote {
-                    id: 1,
-                    pitch: 60,
-                    beat_start: 0.0,
-                    beat_duration: 0.5,
-                    velocity: 96,
-                    channel: None,
-                    confidence: 1.0,
-                    bar_index: 0,
-                    beat_index: 0,
-                    intra_beat_pos: 0.0,
-                    articulation: Articulation::Normal,
-                    swing_style: SwingStyle::Straight,
-                    swing_feel: false,
-                },
-                QuantizedNote {
-                    id: 2,
-                    pitch: 62,
-                    beat_start: 0.5,
-                    beat_duration: 0.5,
-                    velocity: 96,
-                    channel: None,
-                    confidence: 1.0,
-                    bar_index: 0,
-                    beat_index: 0,
-                    intra_beat_pos: 0.0,
-                    articulation: Articulation::Normal,
-                    swing_style: SwingStyle::Straight,
-                    swing_feel: false,
-                },
-            ],
-            melody_notes: vec![],
-            chord_changes: vec![ChordSymbolChange {
-                beat_start: 0.0,
-                symbol: "C".to_string(),
-            }],
-            tied_notes: vec![],
-            rhythm_confidence: 0.9,
-            melodic_stem: None,
-            separation_confidence: 0.0,
-            aligned_notes: vec![],
-            swing_sections: vec![],
-            beats_per_bar: 4,
-        };
-
-        let xml =
-            build_musicxml_document("DurationTest", &foundation, SheetEngravingConfig::default());
-        assert!(xml.contains("<type>eighth</type>"));
-    }
-
-    #[test]
-    fn musicxml_emits_time_signature_changes() {
-        let foundation = LeadSheetFoundation {
-            tempo_map: vec![TempoSegment {
-                start_time_sec: 0.0,
-                end_time_sec: 12.0,
-                bpm: 120.0,
-                beat_duration_sec: 0.5,
-                beat_offset: 0.0,
-            }],
-            time_signature_segments: vec![
-                crate::leadsheet::TimeSignatureSegment {
-                    start_beat: 0.0,
-                    end_beat: 8.0,
-                    numerator: 4,
-                    denominator: 4,
-                    confidence: 0.9,
-                    meter_class: crate::leadsheet::MeterClass::SimpleQuadruple,
-                },
-                crate::leadsheet::TimeSignatureSegment {
-                    start_beat: 8.0,
-                    end_beat: 24.0,
-                    numerator: 3,
-                    denominator: 4,
-                    confidence: 0.85,
-                    meter_class: crate::leadsheet::MeterClass::SimpleTriple,
-                },
-            ],
-            tempo: crate::leadsheet::TempoEstimate {
-                bpm: 120.0,
-                beat_duration_sec: 0.5,
-                confidence: 1.0,
-            },
-            quantized_notes: vec![
-                QuantizedNote {
-                    id: 1,
-                    pitch: 60,
-                    beat_start: 0.0,
-                    beat_duration: 1.0,
-                    velocity: 96,
-                    channel: None,
-                    confidence: 1.0,
-                    bar_index: 0,
-                    beat_index: 0,
-                    intra_beat_pos: 0.0,
-                    articulation: Articulation::Normal,
-                    swing_style: SwingStyle::Straight,
-                    swing_feel: false,
-                },
-                QuantizedNote {
-                    id: 2,
-                    pitch: 62,
-                    beat_start: 8.0,
-                    beat_duration: 1.0,
-                    velocity: 96,
-                    channel: None,
-                    confidence: 1.0,
-                    bar_index: 0,
-                    beat_index: 0,
-                    intra_beat_pos: 0.0,
-                    articulation: Articulation::Normal,
-                    swing_style: SwingStyle::Straight,
-                    swing_feel: false,
-                },
-            ],
-            melody_notes: vec![],
-            chord_changes: vec![],
-            tied_notes: vec![],
-            rhythm_confidence: 0.85,
-            melodic_stem: None,
-            separation_confidence: 0.0,
-            aligned_notes: vec![],
-            swing_sections: vec![],
-            beats_per_bar: 4,
-        };
-
-        let xml =
-            build_musicxml_document("MeterChange", &foundation, SheetEngravingConfig::default());
-        assert!(xml.contains("<beats>4</beats><beat-type>4</beat-type>"));
-        assert!(xml.contains("<beats>3</beats><beat-type>4</beat-type>"));
-    }
 }

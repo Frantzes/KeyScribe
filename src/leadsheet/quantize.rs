@@ -3,6 +3,7 @@ use crate::leadsheet::types::{
     Articulation, BeatAlignedNote, MeterClass, NoteEvent, QuantizedNote, SwingSection, SwingStyle,
     TempoSegment, TimeSignatureSegment,
 };
+use std::path::Path;
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct TiedNote {
@@ -625,21 +626,60 @@ fn classify_intra_beat_distribution(
 fn subdivision_grid(swing_style: SwingStyle) -> Vec<f32> {
     match swing_style {
         SwingStyle::Straight => {
-            vec![0.0, 0.5, 1.0]
+            // Straight feel still has to admit triplet 8ths and 16ths inside a
+            // beat: the omnibook line mixes straight 8ths with occasional
+            // triplet runs. `snap_intra_beat_pos` keeps coarse (8th/quarter)
+            // precedence, so a slightly-late straight 8th stays on the 8th.
+            vec![
+                0.0,
+                1.0 / 6.0,
+                1.0 / 3.0,
+                0.5,
+                2.0 / 3.0,
+                5.0 / 6.0,
+                1.0,
+            ]
         }
         SwingStyle::Swing => {
             vec![0.0, 2.0 / 3.0, 1.0]
         }
         SwingStyle::Triplet => {
-            vec![0.0, 1.0 / 3.0, 2.0 / 3.0, 1.0]
+            vec![
+                0.0,
+                1.0 / 6.0,
+                1.0 / 3.0,
+                0.5,
+                2.0 / 3.0,
+                5.0 / 6.0,
+                1.0,
+            ]
         }
     }
+}
+
+/// Subdivision vocabulary per rhythmic context. Selecting the grid from local
+/// onset spacing (P2) instead of one mixed nearest-slot grid removes the
+/// ±1/6-beat slips: straight 8ths/16ths only ever hit straight slots, while
+/// triplet runs get their own clean slots.
+fn straight_grid() -> Vec<f32> {
+    vec![0.0, 0.25, 0.5, 0.75, 1.0]
+}
+
+fn eighth_triplet_grid() -> Vec<f32> {
+    vec![0.0, 1.0 / 3.0, 2.0 / 3.0, 1.0]
+}
+
+fn sixteenth_triplet_grid() -> Vec<f32> {
+    vec![0.0, 1.0 / 6.0, 1.0 / 3.0, 0.5, 2.0 / 3.0, 5.0 / 6.0, 1.0]
 }
 
 fn snap_intra_beat_pos(pos: f32, grid: &[f32]) -> (f32, f32) {
     if grid.is_empty() {
         return (0.0, 1.0);
     }
+    // Coarse-to-fine order: straight 8ths (0.5) are preferred over the triplet
+    // position (1/3) unless the triplet is meaningfully closer. This keeps
+    // swung/behind-the-beat straight 8ths from snapping into spurious triplets.
     let mut best = grid[0];
     let mut best_err = (pos - best).abs();
     for &g in grid.iter().skip(1) {
@@ -650,44 +690,6 @@ fn snap_intra_beat_pos(pos: f32, grid: &[f32]) -> (f32, f32) {
         }
     }
     (best, best_err)
-}
-
-fn compute_next_onset_duration(
-    note: &BeatAlignedNote,
-    next_notes: &[&BeatAlignedNote],
-) -> f32 {
-    let next_onset = next_notes
-        .iter()
-        .filter(|n| n.pitch != note.pitch || n.original_start_time > note.original_start_time + 0.001)
-        .map(|n| n.original_start_time)
-        .min_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-    match next_onset {
-        Some(t) if t > note.original_start_time => {
-            let dur_sec = t - note.original_start_time;
-            dur_sec / note.beat_duration_sec.max(0.001)
-        }
-        _ => {
-            let dur_sec = (note.original_end_time - note.original_start_time).max(0.05);
-            dur_sec / note.beat_duration_sec.max(0.001)
-        }
-    }
-}
-
-fn quantize_duration(
-    raw_duration: f32,
-    subdivision: f32,
-    swing_style: SwingStyle,
-) -> f32 {
-    if !raw_duration.is_finite() {
-        return 0.5;
-    }
-
-    let grid = match swing_style {
-        SwingStyle::Triplet => 1.0 / 3.0,
-        _ => subdivision.max(0.25),
-    };
-    let snapped = (raw_duration / grid).round() * grid;
-    snapped.max(grid)
 }
 
 // ── Main Aligned Quantization Entry Point ──────────────────────────────────
@@ -701,6 +703,11 @@ pub fn quantize_aligned_notes(
         return Vec::new();
     }
 
+    // Pass 1: snap every onset position to the subdivision grid. Durations are
+    // derived afterwards from the gaps between CONSECUTIVE SNAPPED onsets,
+    // not from raw onset deltas: a triplet 8th run (0.096s spacing at 208 BPM)
+    // snaps to 1/3-beat slots, and the gap between two snapped triplet onsets
+    // is exactly 1/3 beat — no extra quantization needed.
     let mut sorted: Vec<&BeatAlignedNote> = aligned.iter().collect();
     sorted.sort_by(|a, b| {
         a.original_start_time
@@ -708,47 +715,474 @@ pub fn quantize_aligned_notes(
             .unwrap_or(std::cmp::Ordering::Equal)
     });
 
-    let mut quantized: Vec<QuantizedNote> = Vec::with_capacity(sorted.len());
+    struct Snapped<'a> {
+        note: &'a BeatAlignedNote,
+        style: SwingStyle,
+        snapped_pos: f32,
+        beat_start: f32,
+        snap_error: f32,
+    }
 
+    // P2: choose the subdivision vocabulary from LOCAL onset spacing. Using a
+    // single mixed grid makes every note nearest-snap independently, which
+    // lands inside a triplet run on the wrong straight slot (the ±1/6-beat
+    // slips). Here straight runs only see straight slots, and triplet runs get
+    // their own clean 1/3 / 1/6 slots.
+    let beat_pos: Vec<f32> = sorted
+        .iter()
+        .map(|n| n.beat_index as f32 + n.intra_beat_pos)
+        .collect();
+    let gap = |i: usize| -> f32 {
+        (beat_pos[i + 1] - beat_pos[i]).abs()
+    };
+    let grid_for = |i: usize| -> Vec<f32> {
+        let prev_gap = if i > 0 { gap(i - 1) } else { f32::INFINITY };
+        let next_gap = if i + 1 < beat_pos.len() { gap(i) } else { f32::INFINITY };
+        let near = |g: f32, target: f32, tol: f32| (g - target).abs() <= tol;
+        // Two-gap sum is far more tolerant of onset jitter than a single gap:
+        // a triplet-8th pair sums to ~2/3 (two 1/3 gaps) while two straight
+        // 16ths sum to ~0.5 and two straight 8ths to ~1.0. This is what tells
+        // a genuine triplet run from a straight one even when the detected
+        // individual gaps are noisy (e.g. 0.263 + 0.438 ≈ 0.70 ≈ 2/3).
+        if prev_gap.is_finite() && next_gap.is_finite() {
+            let two_gap = prev_gap + next_gap;
+            if near(two_gap, 1.0 / 3.0, 0.07) {
+                sixteenth_triplet_grid()
+            } else if near(two_gap, 2.0 / 3.0, 0.10) {
+                eighth_triplet_grid()
+            } else {
+                straight_grid()
+            }
+        } else if near(prev_gap, 1.0 / 6.0, 0.045) || near(next_gap, 1.0 / 6.0, 0.045) {
+            sixteenth_triplet_grid()
+        } else if near(prev_gap, 1.0 / 3.0, 0.055) || near(next_gap, 1.0 / 3.0, 0.055) {
+            eighth_triplet_grid()
+        } else {
+            straight_grid()
+        }
+    };
+
+    let mut snapped: Vec<Snapped> = Vec::with_capacity(sorted.len());
     for (i, note) in sorted.iter().enumerate() {
         let swing_section = swing_sections
             .iter()
             .find(|s| s.contains_bar(note.bar_index))
             .or_else(|| swing_sections.first());
         let style = swing_section.map(|s| s.style).unwrap_or(SwingStyle::Straight);
-        let swing_feel = style == SwingStyle::Swing;
+        let sub_grid = if style == SwingStyle::Swing {
+            subdivision_grid(style)
+        } else {
+            grid_for(i)
+        };
+        let (snapped_pos, snap_error) = snap_intra_beat_pos(note.intra_beat_pos, &sub_grid);
+        snapped.push(Snapped {
+            note,
+            style,
+            snapped_pos,
+            beat_start: note.beat_index as f32 + snapped_pos,
+            snap_error,
+        });
+    }
+    snapped.sort_by(|a, b| {
+        a.beat_start
+            .partial_cmp(&b.beat_start)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| a.note.pitch.cmp(&b.note.pitch))
+    });
 
+    if std::env::var_os("KEYSCRIBE_QUANT_DEBUG").is_some() {
+        for (i, s) in snapped.iter().take(12).enumerate() {
+            let note = s.note;
+            let sub_grid = if s.style == SwingStyle::Swing {
+                subdivision_grid(s.style)
+            } else {
+                grid_for(i)
+            };
+            eprintln!(
+                "[quant-debug] pitch={} raw={:.4}s intra={:.3} beat_idx={} style={:?} grid={:?} -> snapped={:.3} beat_start={:.3}",
+                note.pitch, note.original_start_time, note.intra_beat_pos, note.beat_index, s.style, sub_grid, s.snapped_pos, s.beat_start
+            );
+        }
+    }
+
+    // Pass 2: infer duration from the local sequence. For contiguous attacks,
+    // use the gap between snapped onsets so triplet runs remain coherent. When
+    // there is a real performed gap after the note ends, preserve its detected
+    // duration instead of stretching it to the next unrelated onset.
+    let mut quantized: Vec<QuantizedNote> = Vec::with_capacity(snapped.len());
+    for (i, s) in snapped.iter().enumerate() {
+        let raw_duration = (s.note.original_end_time - s.note.original_start_time)
+            .max(0.05)
+            / s.note.beat_duration_sec.max(0.001);
+        let duration_value = if let Some(next) = snapped.get(i + 1) {
+            let snapped_gap = (next.beat_start - s.beat_start).max(0.0);
+            let raw_gap_after_note = (next.note.original_start_time - s.note.original_end_time)
+                / s.note.beat_duration_sec.max(0.001);
+            let raw_onset_spacing = (next.note.original_start_time - s.note.original_start_time)
+                / s.note.beat_duration_sec.max(0.001);
+            // Contiguous attacks (straight 8ths, triplet runs) use the snapped
+            // onset gap so triplet runs keep exact 1/3 durations. The end-of-
+            // note test alone is unreliable because staccato/triplet note
+            // detections end early, so require a dense onset spacing (<= ~0.6
+            // beat) — a genuinely sparse gap (a rest) falls through to the
+            // note's own detected duration.
+            let contiguous = snapped_gap > 0.0
+                && raw_onset_spacing <= 0.6
+                && (raw_onset_spacing - snapped_gap).abs() <= 0.3;
+            if (raw_gap_after_note <= 0.10 || contiguous) && snapped_gap > 0.0 {
+                snapped_gap
+            } else {
+                raw_duration.min(snapped_gap.max(1.0 / 12.0))
+            }
+        } else {
+            raw_duration
+        };
+        let duration = snap_duration_with_preference(
+            duration_value,
+            &duration_grid_for(s.style),
+            0.03,
+            1.0 / 12.0,
+        )
+        .max(1.0 / 12.0);
+
+        let confidence = (1.0 - s.snap_error * 2.0).clamp(0.3, 1.0);
+
+        quantized.push(QuantizedNote {
+            id: s.note.id,
+            pitch: s.note.pitch,
+            beat_start: s.beat_start,
+            beat_duration: duration,
+            velocity: s.note.velocity,
+            channel: s.note.channel,
+            confidence,
+            bar_index: s.note.bar_index,
+            beat_index: s.note.beat_index % beats_per_bar,
+            intra_beat_pos: s.note.intra_beat_pos,
+            articulation: Articulation::Normal,
+            swing_style: s.style,
+            swing_feel: s.style == SwingStyle::Swing,
+        });
+    }
+
+    quantized.sort_by(|a, b| {
+        a.beat_start
+            .partial_cmp(&b.beat_start)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| a.pitch.cmp(&b.pitch))
+    });
+
+    // Strictly-monophonic guarantee: a lead-sheet melody has at most one note
+    // per grid slot. Two fast notes can quantize to the same slot (collisions);
+    // keep the better-aligned one (higher confidence, or longer for same
+    // pitch) so the writer produces a single voice instead of splitting into
+    // spurious parallel voices.
+    let mut mono: Vec<QuantizedNote> = Vec::with_capacity(quantized.len());
+    for note in quantized {
+        match mono.last_mut() {
+            Some(last) if (last.beat_start - note.beat_start).abs() < 1e-4 => {
+                let replace = if last.pitch == note.pitch {
+                    note.beat_duration > last.beat_duration
+                } else {
+                    note.confidence > last.confidence
+                };
+                if replace {
+                    *last = note;
+                }
+            }
+            _ => mono.push(note),
+        }
+    }
+
+    mono
+}
+
+/// Duration grid including triplet values, coarse-to-fine. The engraver can
+/// notate any of these (8th triplet = 1/3, 16th triplet = 1/6, etc.), so
+/// snapping to them yields clean triplet beams instead of a 16th + tie.
+fn duration_grid_for(style: SwingStyle) -> Vec<f32> {
+    match style {
+        SwingStyle::Swing => vec![4.0, 2.0, 1.0, 0.5, 2.0 / 3.0, 1.0 / 3.0],
+        _ => vec![
+            4.0, 3.0, 2.0, 1.5, 1.0, 0.75, 0.5, 2.0 / 3.0, 1.0 / 3.0, 0.25, 1.0 / 6.0, 1.0 / 8.0,
+        ],
+    }
+}
+
+// ── Learned Melody Quantizer ────────────────────────────────────────────────
+
+/// Which rhythm-quantization engine to use for the melody.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum QuantizerEngine {
+    /// Rule-based grid snapping (`quantize_aligned_notes`).
+    LegacyGrid,
+    /// Learned MIDI-to-score tokenizer (needs `melody_quantizer.onnx`); falls
+    /// back to `LegacyGrid` when the model file is absent or inference fails.
+    LearnedOnnx,
+}
+
+impl Default for QuantizerEngine {
+    fn default() -> Self {
+        Self::LearnedOnnx
+    }
+}
+
+impl QuantizerEngine {
+    pub fn parse(s: &str) -> Option<Self> {
+        match s.to_ascii_lowercase().as_str() {
+            "legacy" | "grid" => Some(Self::LegacyGrid),
+            "learned" | "onnx" => Some(Self::LearnedOnnx),
+            _ => None,
+        }
+    }
+
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::LegacyGrid => "legacy",
+            Self::LearnedOnnx => "learned",
+        }
+    }
+}
+
+/// Output of the learned quantizer: one rhythmic-value token per note, drawn
+/// from the same vocabulary the engraver uses (`musicxml.rs:1210`).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct QuantizerToken {
+    /// Duration in beats (quarter = 1.0).
+    pub beats: f32,
+    pub note_type: &'static str,
+    pub dots: u8,
+    pub time_mod: Option<(u8, u8)>,
+}
+
+/// Vocabulary order. Must match the training export
+/// (`tools/melody_corpus/export_quantizer_onnx.py`) and the `DurationToken`
+/// candidate order in `musicxml.rs:1210`.
+pub const LEARNED_TOKEN_TABLE: [QuantizerToken; 12] = [
+    QuantizerToken { beats: 4.0, note_type: "whole", dots: 0, time_mod: None },
+    QuantizerToken { beats: 3.0, note_type: "half", dots: 1, time_mod: None },
+    QuantizerToken { beats: 2.0, note_type: "half", dots: 0, time_mod: None },
+    QuantizerToken { beats: 1.5, note_type: "quarter", dots: 1, time_mod: None },
+    QuantizerToken { beats: 1.0, note_type: "quarter", dots: 0, time_mod: None },
+    QuantizerToken { beats: 0.75, note_type: "eighth", dots: 1, time_mod: None },
+    QuantizerToken { beats: 0.5, note_type: "eighth", dots: 0, time_mod: None },
+    QuantizerToken { beats: 0.375, note_type: "16th", dots: 1, time_mod: None },
+    QuantizerToken { beats: 0.25, note_type: "16th", dots: 0, time_mod: None },
+    QuantizerToken { beats: 2.0 / 3.0, note_type: "quarter", dots: 0, time_mod: Some((3, 2)) },
+    QuantizerToken { beats: 1.0 / 3.0, note_type: "eighth", dots: 0, time_mod: Some((3, 2)) },
+    QuantizerToken { beats: 1.0 / 6.0, note_type: "16th", dots: 0, time_mod: Some((3, 2)) },
+];
+
+/// Per-note feature vector fed to the learned quantizer. Must match the
+/// featurizer used to train (`tools/melody_corpus/build_features.py`,
+/// Phase 1.2 of `MELODY_TRANSCRIPTION_PLAN.md`): 9 floats = intra-beat pos,
+/// raw duration beats, normalized tempo, beat-within-bar, swing one-hot[3],
+/// normalized pitch, normalized velocity.
+pub fn learned_note_features(
+    note: &BeatAlignedNote,
+    swing_style: SwingStyle,
+    beats_per_bar: u32,
+    tempo_bpm: f32,
+) -> [f32; 9] {
+    let swing = match swing_style {
+        SwingStyle::Straight => [1.0, 0.0, 0.0],
+        SwingStyle::Swing => [0.0, 1.0, 0.0],
+        SwingStyle::Triplet => [0.0, 0.0, 1.0],
+    };
+    [
+        note.intra_beat_pos.clamp(0.0, 0.9999),
+        ((note.original_end_time - note.original_start_time)
+            / note.beat_duration_sec.max(0.001))
+            .max(0.0)
+            .min(32.0),
+        ((tempo_bpm.clamp(40.0, 260.0) - 40.0) / 220.0),
+        (note.beat_index % beats_per_bar.max(1)) as f32 / beats_per_bar.max(1) as f32,
+        swing[0],
+        swing[1],
+        swing[2],
+        note.pitch as f32 / 127.0,
+        note.velocity as f32 / 127.0,
+    ]
+}
+
+/// Resolve `melody_quantizer.onnx` next to the executable, then the working
+/// directory (mirrors the Demucs/Basic Pitch model resolution).
+pub fn resolve_quantizer_model_path() -> Option<std::path::PathBuf> {
+    let filename = "melody_quantizer.onnx";
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(parent) = exe.parent() {
+            for p in [parent.join("models").join(filename), parent.join(filename)] {
+                if p.exists() {
+                    return Some(p);
+                }
+            }
+        }
+    }
+    for p in [
+        std::path::PathBuf::from("models").join(filename),
+        std::path::PathBuf::from(filename),
+    ] {
+        if p.exists() {
+            return Some(p);
+        }
+    }
+    None
+}
+
+/// Learned melody quantization: per-note rhythmic-value tokens from the ONNX
+/// model. Falls back to the rule grid when the model file is absent or
+/// inference fails, so the learned engine is a strict improvement when it
+/// works and never a regression.
+pub fn quantize_aligned_notes_learned(
+    aligned: &[BeatAlignedNote],
+    swing_sections: &[SwingSection],
+    beats_per_bar: u32,
+    model_path: Option<&Path>,
+) -> Vec<QuantizedNote> {
+    let model_path = match model_path
+        .map(|p| p.to_path_buf())
+        .or_else(resolve_quantizer_model_path)
+    {
+        Some(p) if p.exists() => p,
+        _ => {
+            if std::env::var_os("KEYSCRIBE_QUANTIZER_DEBUG").is_some() {
+                eprintln!("[quantizer] melody_quantizer.onnx not found — using legacy grid");
+            }
+            return quantize_aligned_notes(aligned, swing_sections, beats_per_bar);
+        }
+    };
+
+    let mut infer = match crate::inference::MelodyQuantizerInference::new(&model_path) {
+        Ok(i) => i,
+        Err(e) => {
+            eprintln!(
+                "[quantizer] failed to load {}: {:#}; using legacy grid",
+                model_path.display(),
+                e
+            );
+            return quantize_aligned_notes(aligned, swing_sections, beats_per_bar);
+        }
+    };
+
+    let mut tempo_values: Vec<f32> = aligned
+        .iter()
+        .filter_map(|n| {
+            let d = n.next_beat_time - n.prev_beat_time;
+            if d > 1e-3 {
+                Some(60.0 / d)
+            } else {
+                None
+            }
+        })
+        .collect();
+    tempo_values.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let tempo_bpm = tempo_values
+        .get(tempo_values.len() / 2)
+        .copied()
+        .unwrap_or(120.0);
+
+    let mut sorted: Vec<&BeatAlignedNote> = aligned.iter().collect();
+    sorted.sort_by(|a, b| {
+        a.original_start_time
+            .partial_cmp(&b.original_start_time)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+
+    let section_for = |note: &BeatAlignedNote| {
+        swing_sections
+            .iter()
+            .find(|s| s.contains_bar(note.bar_index))
+            .or_else(|| swing_sections.first())
+    };
+
+    let features: Vec<Vec<f32>> = sorted
+        .iter()
+        .map(|n| {
+            let style = section_for(n).map(|s| s.style).unwrap_or(SwingStyle::Straight);
+            learned_note_features(n, style, beats_per_bar, tempo_bpm).to_vec()
+        })
+        .collect();
+
+    let tokens = match infer.infer(&features) {
+        Ok(t) => t,
+        Err(e) => {
+            eprintln!("[quantizer] inference failed: {:#}; using legacy grid", e);
+            return quantize_aligned_notes(aligned, swing_sections, beats_per_bar);
+        }
+    };
+
+    let mut quantized: Vec<QuantizedNote> = Vec::with_capacity(sorted.len());
+    for (note, idx) in sorted.iter().zip(tokens.iter()) {
+        let style = section_for(note).map(|s| s.style).unwrap_or(SwingStyle::Straight);
+        let token = LEARNED_TOKEN_TABLE
+            .get(*idx as usize)
+            .copied()
+            .unwrap_or(LEARNED_TOKEN_TABLE[4]); // quarter fallback for out-of-vocab
         let sub_grid = subdivision_grid(style);
         let (snapped_pos, snap_error) = snap_intra_beat_pos(note.intra_beat_pos, &sub_grid);
-
-        let subdivision_pos = snapped_pos;
-        let beat_start = note.beat_index as f32 + subdivision_pos;
-
-        let next_notes: Vec<&BeatAlignedNote> = sorted
-            .iter()
-            .skip(i + 1)
-            .copied()
-            .collect();
-        let raw_dur = compute_next_onset_duration(note, &next_notes);
-        let duration = quantize_duration(raw_dur, subdivision_pos, style);
-
-        let confidence = (1.0 - snap_error * 2.0).clamp(0.3, 1.0);
-
+        let beat_start = note.beat_index as f32 + snapped_pos;
         quantized.push(QuantizedNote {
             id: note.id,
             pitch: note.pitch,
             beat_start,
-            beat_duration: duration,
+            beat_duration: token.beats.max(1.0 / 6.0),
             velocity: note.velocity,
             channel: note.channel,
-            confidence,
+            confidence: (1.0 - snap_error * 2.0).clamp(0.3, 1.0),
             bar_index: note.bar_index,
             beat_index: note.beat_index % beats_per_bar,
             intra_beat_pos: note.intra_beat_pos,
             articulation: Articulation::Normal,
             swing_style: style,
-            swing_feel,
+            swing_feel: style == SwingStyle::Swing,
         });
+    }
+
+    quantized.sort_by(|a, b| {
+        a.beat_start
+            .partial_cmp(&b.beat_start)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| a.pitch.cmp(&b.pitch))
+    });
+
+    // Independent token predictions can make a note overlap the next snapped
+    // onset. Reject only the affected bars and use the sequence-aware legacy
+    // result there; this preserves learned gains without letting one bad token
+    // shift every later MusicXML cursor position.
+    let mut invalid_bars = std::collections::BTreeSet::new();
+    let by_id: std::collections::HashMap<u32, &QuantizedNote> = quantized
+        .iter()
+        .map(|note| (note.id, note))
+        .collect();
+    for pair in sorted.windows(2) {
+        let current = pair[0];
+        let next = pair[1];
+        let Some(current_q) = by_id.get(&current.id) else { continue };
+        let Some(next_q) = by_id.get(&next.id) else { continue };
+        if current.bar_index != next.bar_index {
+            continue;
+        }
+        let raw_gap_after_note =
+            (next.original_start_time - current.original_end_time) / current.beat_duration_sec.max(0.001);
+        if raw_gap_after_note <= 0.08 {
+            let snapped_gap = (next_q.beat_start - current_q.beat_start).max(0.0);
+            if snapped_gap > 0.0 && (current_q.beat_duration - snapped_gap).abs() > 0.08 {
+                invalid_bars.insert(current.bar_index);
+            }
+        }
+    }
+    if !invalid_bars.is_empty() {
+        let legacy = quantize_aligned_notes(aligned, swing_sections, beats_per_bar);
+        let legacy_by_id: std::collections::HashMap<u32, QuantizedNote> = legacy
+            .into_iter()
+            .map(|note| (note.id, note))
+            .collect();
+        for note in &mut quantized {
+            if invalid_bars.contains(&note.bar_index) {
+                if let Some(replacement) = legacy_by_id.get(&note.id) {
+                    *note = replacement.clone();
+                }
+            }
+        }
     }
 
     quantized.sort_by(|a, b| {
@@ -969,6 +1403,46 @@ mod tests {
         assert_eq!(quantized.len(), 1);
         // DEBUG: now snaps to 0.333 (1/3 beat)
         assert!((quantized[0].beat_duration - 1.0/3.0).abs() < 0.06);
+    }
+
+    #[test]
+    fn straight_grid_admits_sixteenth_triplet_positions() {
+        let grid = subdivision_grid(SwingStyle::Straight);
+        assert!(grid.iter().any(|p| (*p - 1.0 / 6.0).abs() < 1e-6));
+        assert!(grid.iter().any(|p| (*p - 5.0 / 6.0).abs() < 1e-6));
+        let (snapped, _) = snap_intra_beat_pos(0.17, &grid);
+        assert!((snapped - 1.0 / 6.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn duration_uses_snapped_gap_for_contiguous_triplets() {
+        let notes = vec![
+            aligned_note(60, 0.0, 1.0 / 6.0, 0, 0, 0.0),
+            aligned_note(61, 1.0 / 6.0, 1.0 / 3.0, 0, 0, 1.0 / 3.0),
+            aligned_note(62, 1.0 / 3.0, 0.5, 0, 0, 2.0 / 3.0),
+        ];
+        let quantized = quantize_aligned_notes(&notes, &[], 4);
+        assert_eq!(quantized.len(), 3);
+        assert!((quantized[0].beat_duration - 1.0 / 3.0).abs() < 1e-5);
+        assert!((quantized[1].beat_duration - 1.0 / 3.0).abs() < 1e-5);
+    }
+
+    #[test]
+    fn duration_does_not_fill_a_real_gap_to_next_onset() {
+        let notes = vec![
+            aligned_note(60, 0.0, 0.125, 0, 0, 0.0),
+            aligned_note(61, 0.5, 0.75, 1, 0, 0.0),
+        ];
+        let quantized = quantize_aligned_notes(&notes, &[], 4);
+        assert_eq!(quantized.len(), 2);
+        assert!((quantized[0].beat_duration - 0.25).abs() < 1e-5);
+    }
+
+    #[test]
+    fn learned_duration_feature_is_in_beats() {
+        let n = aligned_note(60, 0.0, 0.25, 0, 0, 0.0);
+        let features = learned_note_features(&n, SwingStyle::Straight, 4, 120.0);
+        assert!((features[1] - 0.5).abs() < 1e-5);
     }
 
     #[test]

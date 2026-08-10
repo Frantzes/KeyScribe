@@ -65,8 +65,13 @@ impl BasicPitchInference {
 
     /// Infer note probabilities for a single Basic Pitch window.
     ///
-    /// Returns shape (output_frames, 88 notes).
-    pub fn infer_audio_window(&mut self, audio_window: &[f32]) -> Result<Vec<Vec<f32>>> {
+    /// Returns `(note_probs, onset_probs)` both shaped (output_frames, 88).
+    /// `onset_probs` is `None` when the model export doesn't expose a
+    /// separate onset head (in that case the legacy merged behavior is used).
+    pub fn infer_audio_window(
+        &mut self,
+        audio_window: &[f32],
+    ) -> Result<(Vec<Vec<f32>>, Option<Vec<Vec<f32>>>)> {
         let prepared = Self::prepare_audio_window(audio_window, self.config.input_samples);
 
         let input_tensor = Tensor::from_array((
@@ -78,26 +83,97 @@ impl BasicPitchInference {
             .session
             .run(ort::inputs! { self.input_name.as_str() => input_tensor })?;
 
-        // Basic Pitch exports two 88-note heads (note/onset) and one 264-bin contour head.
-        // To be robust across export variants, we merge every (1, frames, 88) output via max().
-        let mut note_heads: Vec<Vec<f32>> = Vec::new();
-        for (_, output) in &outputs {
-            let arr = output.try_extract_array::<f32>()?;
-            let shape = arr.shape();
-            if shape.len() == 3
-                && shape[0] == 1
-                && shape[1] == self.config.output_frames
-                && shape[2] == self.config.num_notes
-            {
-                let mut flat = vec![0.0f32; self.config.output_frames * self.config.num_notes];
-                for t in 0..self.config.output_frames {
-                    for n in 0..self.config.num_notes {
-                        flat[t * self.config.num_notes + n] = arr[[0, t, n]];
+        if std::env::var_os("KEYSCRIBE_INFERENCE_DEBUG").is_some() {
+            eprintln!(
+                "[inference] output names: {:?}",
+                outputs.keys().collect::<Vec<_>>()
+            );
+            for (name, output) in &outputs {
+                if let Ok(arr) = output.try_extract_array::<f32>() {
+                    let shape = arr.shape();
+                    let mut sum = 0.0f64;
+                    let mut mx = 0.0f32;
+                    let mut cnt = 0usize;
+                    let mut over005 = 0usize;
+                    let mut over05 = 0usize;
+                    for v in arr.iter() {
+                        sum += *v as f64;
+                        mx = mx.max(*v);
+                        if *v > 0.05 {
+                            over005 += 1;
+                        }
+                        if *v > 0.5 {
+                            over05 += 1;
+                        }
+                        cnt += 1;
                     }
+                    eprintln!(
+                        "[inference]   {} shape={:?} mean={:.4} max={:.2} >0.05={}/{} >0.5={}/{}",
+                        name,
+                        shape,
+                        if cnt > 0 { sum / cnt as f64 } else { 0.0 },
+                        mx,
+                        over005,
+                        cnt,
+                        over05,
+                        cnt
+                    );
                 }
-                note_heads.push(flat);
             }
         }
+
+        let frames = self.config.output_frames;
+        let notes = self.config.num_notes;
+
+        // Basic Pitch exports two 88-note heads (note/onset) and one 264-bin
+        // contour head. Try to separate them by output name first; when the
+        // names are opaque, fall back to sparsity (the onset head fires
+        // sharply and is sparse at high values, the note head sustains).
+        let mut heads_88: Vec<(usize, Vec<f32>)> = Vec::new(); // (high-count, data)
+        let mut named_onset: Option<Vec<f32>> = None;
+        let mut named_note: Vec<Vec<f32>> = Vec::new();
+        let mut named = false;
+        for (name, output) in &outputs {
+            let arr = output.try_extract_array::<f32>()?;
+            let shape = arr.shape();
+            if shape.len() == 3 && shape[0] == 1 && shape[1] == frames && shape[2] == notes {
+                let mut flat = vec![0.0f32; frames * notes];
+                for t in 0..frames {
+                    for n in 0..notes {
+                        flat[t * notes + n] = arr[[0, t, n]];
+                    }
+                }
+                let high = flat.iter().filter(|&&v| v > 0.5).count();
+                heads_88.push((high, flat.clone()));
+                let lname = name.to_lowercase();
+                if lname.contains("onset") {
+                    named_onset = Some(flat);
+                    named = true;
+                } else if lname.contains("contour") || lname.contains("mel") {
+                    continue;
+                } else if lname.contains("note")
+                    || lname.contains("prob")
+                    || lname.contains("head")
+                {
+                    named_note.push(flat);
+                    named = true;
+                }
+            }
+        }
+
+        let (note_heads, onset_head) = if named {
+            (named_note, named_onset)
+        } else if heads_88.len() >= 2 {
+            // Sparsest 88-head is the onset head; the rest are note heads.
+            heads_88.sort_by_key(|(high, _)| *high);
+            let (_, onset_flat) = heads_88.remove(0);
+            (
+                heads_88.into_iter().map(|(_, f)| f).collect(),
+                Some(onset_flat),
+            )
+        } else {
+            (heads_88.into_iter().map(|(_, f)| f).collect(), None)
+        };
 
         if note_heads.is_empty() {
             let output_names: Vec<String> = outputs.keys().map(|name| name.to_string()).collect();
@@ -109,10 +185,10 @@ impl BasicPitchInference {
             ));
         }
 
-        let mut note_probs = vec![vec![0.0f32; self.config.num_notes]; self.config.output_frames];
-        for t in 0..self.config.output_frames {
-            for n in 0..self.config.num_notes {
-                let idx = t * self.config.num_notes + n;
+        let mut note_probs = vec![vec![0.0f32; notes]; frames];
+        for t in 0..frames {
+            for n in 0..notes {
+                let idx = t * notes + n;
                 let mut v = 0.0f32;
                 for head in &note_heads {
                     v = v.max(head[idx]);
@@ -121,7 +197,17 @@ impl BasicPitchInference {
             }
         }
 
-        Ok(note_probs)
+        let onset_probs = onset_head.map(|head| {
+            let mut out = vec![vec![0.0f32; notes]; frames];
+            for t in 0..frames {
+                for n in 0..notes {
+                    out[t][n] = head[t * notes + n].clamp(0.0, 1.0);
+                }
+            }
+            out
+        });
+
+        Ok((note_probs, onset_probs))
     }
 
     /// Resample with linear interpolation.
@@ -205,6 +291,119 @@ impl BasicPitchInference {
 
     pub fn config(&self) -> &InferenceConfig {
         &self.config
+    }
+}
+
+/// ONNX inference for the learned melody quantizer (a MIDI-to-score tokenizer).
+///
+/// Interface (defined by `tools/melody_corpus/export_quantizer_onnx.py`):
+/// - input: `[1, seq, feature_dim]` f32 — per-note feature vectors
+///   (see `quantize::learned_note_features`);
+/// - output: `[1, seq, vocab]` f32 logits over the 12-token `LEARNED_TOKEN_TABLE`
+///   vocabulary (or `[seq, vocab]`).
+///
+/// When `melody_quantizer.onnx` is absent, `quantize_aligned_notes_learned`
+/// never constructs this type and falls back to the rule grid, so the learned
+/// path is a strict improvement when it works and never a regression.
+pub struct MelodyQuantizerInference {
+    session: Session,
+    input_name: String,
+    feature_dim: usize,
+}
+
+impl MelodyQuantizerInference {
+    pub fn new(model_path: &Path) -> Result<Self> {
+        if !model_path.exists() {
+            return Err(anyhow!(
+                "melody quantizer ONNX model not found at {}",
+                model_path.display()
+            ));
+        }
+
+        let session = Session::builder()?.commit_from_file(model_path)?;
+        let input = session
+            .inputs()
+            .first()
+            .ok_or_else(|| anyhow!("melody quantizer model has no inputs"))?;
+        let input_name = input.name().to_string();
+        let feature_dim = input
+            .dtype()
+            .tensor_shape()
+            .and_then(|shape| shape.iter().last().copied())
+            .filter(|&d| d > 0)
+            .map(|d| d as usize)
+            .unwrap_or(9);
+
+        Ok(Self {
+            session,
+            input_name,
+            feature_dim,
+        })
+    }
+
+    pub fn feature_dim(&self) -> usize {
+        self.feature_dim
+    }
+
+    /// Run the model over a sequence of per-note feature vectors, returning one
+    /// vocabulary index per note (argmax over the 12-token vocabulary).
+    pub fn infer(&mut self, features: &[Vec<f32>]) -> Result<Vec<u32>> {
+        if features.is_empty() {
+            return Ok(Vec::new());
+        }
+        let seq = features.len();
+        let dim = self.feature_dim;
+        let mut flat = Vec::with_capacity(seq * dim);
+        for f in features {
+            if f.len() != dim {
+                return Err(anyhow!(
+                    "melody quantizer feature vector length {} != model feature_dim {}",
+                    f.len(),
+                    dim
+                ));
+            }
+            flat.extend_from_slice(f);
+        }
+
+        let input_tensor = Tensor::from_array(([1usize, seq, dim], flat.into_boxed_slice()))?;
+        let outputs = self
+            .session
+            .run(ort::inputs! { self.input_name.as_str() => input_tensor })?;
+        let (_, output) = outputs
+            .iter()
+            .next()
+            .ok_or_else(|| anyhow!("melody quantizer produced no outputs"))?;
+        let arr = output.try_extract_array::<f32>()?;
+        let shape = arr.shape();
+        let (t_seq, vocab) = if shape.len() == 3 && shape[0] == 1 {
+            (shape[1], shape[2])
+        } else if shape.len() == 2 {
+            (shape[0], shape[1])
+        } else {
+            return Err(anyhow!(
+                "unexpected melody quantizer output shape {:?} (expected [1, seq, vocab])",
+                shape
+            ));
+        };
+
+        let mut out = Vec::with_capacity(t_seq);
+        for t in 0..t_seq {
+            let mut best = 0usize;
+            let mut best_v = f32::NEG_INFINITY;
+            for v in 0..vocab {
+                let val = if shape.len() == 3 {
+                    arr[[0, t, v]]
+                } else {
+                    arr[[t, v]]
+                };
+                if val > best_v {
+                    best_v = val;
+                    best = v;
+                }
+            }
+            out.push(best as u32);
+        }
+        Ok(out)
     }
 }
 

@@ -232,7 +232,7 @@ fn detect_note_probabilities_basic_pitch(
 
     let mut guard = engine.lock().ok()?;
     let model = guard.as_mut()?;
-    let note_frames = model.infer_audio_window(&window_model).ok()?;
+    let (note_frames, _onsets) = model.infer_audio_window(&window_model).ok()?;
     if note_frames.is_empty() {
         return None;
     }

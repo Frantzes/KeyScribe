@@ -39,16 +39,20 @@ pub fn associate_notes_to_beat_grid(
         return Vec::new();
     }
 
-    let beats: Vec<f32> = beat_times
+    let mut beats: Vec<f32> = beat_times
         .iter()
         .copied()
-        .filter(|t| t.is_finite() && *t >= 0.0)
+        .filter(|t| t.is_finite())
         .collect();
-    let downbeats: Vec<f32> = downbeat_times
+    let mut downbeats: Vec<f32> = downbeat_times
         .iter()
         .copied()
-        .filter(|t| t.is_finite() && *t >= 0.0)
+        .filter(|t| t.is_finite())
         .collect();
+    beats.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    beats.dedup_by(|a, b| (*a - *b).abs() < 1e-4);
+    downbeats.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    downbeats.dedup_by(|a, b| (*a - *b).abs() < 1e-4);
 
     let beats_per_bar = beats_per_bar_from_downbeats(&downbeats, &beats);
     let has_anacrusis = beats.first().copied().unwrap_or(0.0) < downbeats.first().copied().unwrap_or(0.0) - 0.001;

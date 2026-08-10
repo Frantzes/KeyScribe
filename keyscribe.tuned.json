@@ -1,0 +1,9 @@
+{
+  "key_sensitivity": 0.2,
+  "chord_beat": -1.0,
+  "chord_cleanest": true,
+  "chord_strike": false,
+  "melody": "heuristic",
+  "stems": false,
+  "bpm": 222.0
+}

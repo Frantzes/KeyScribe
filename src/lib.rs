@@ -5,11 +5,17 @@ pub mod core;
 pub mod cqt;
 pub mod demucs;
 pub mod dsp;
+pub mod headless;
 pub mod inference;
 pub mod leadsheet;
+pub mod midi;
+pub mod musicxml;
 pub mod pipeline;
 pub mod preprocessing;
 pub mod ring_buffer;
+pub mod sheet_compare;
+pub mod synth;
+pub mod tune;
 pub mod viterbi;
 
 #[cfg(feature = "native-ui")]

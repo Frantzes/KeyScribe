@@ -1,7 +1,6 @@
 use crate::app::KeyScribeApp;
 use eframe::egui;
 use std::path::Path;
-use crate::leadsheet::NoteEvent;
 
 impl KeyScribeApp {
     pub(crate) fn draw_export_modals(&mut self, ctx: &egui::Context) {
@@ -119,7 +118,7 @@ impl KeyScribeApp {
                 &mut next_id,
             );
             let path = dest_folder.join("Original Mix.mid");
-            write_midi(&notes, &path);
+            let _ = crate::midi::write_midi(&notes, &path, 120.0);
         }
 
         // Export per-stem MIDI when stems are available and selected.
@@ -137,7 +136,7 @@ impl KeyScribeApp {
 
                         let file_name = format!("{}.mid", stem.stem_type.display_name());
                         let path = dest_folder.join(file_name);
-                        write_midi(&notes, &path);
+                        let _ = crate::midi::write_midi(&notes, &path, 120.0);
                     }
                 }
             }
@@ -145,66 +144,3 @@ impl KeyScribeApp {
     }
 }
 
-fn write_midi(notes: &[NoteEvent], path: &Path) {
-    use midly::{Header, Format, Timing, Track, TrackEvent, TrackEventKind, MetaMessage, MidiMessage, Smf};
-    
-    let mut smf = Smf::new(Header::new(Format::SingleTrack, Timing::Metrical(480.into())));
-    let mut track = Track::new();
-    
-    struct Event {
-        time_ticks: u32,
-        is_note_on: bool,
-        pitch: u8,
-        velocity: u8,
-    }
-    
-    let mut events = Vec::new();
-    for note in notes {
-        events.push(Event {
-            time_ticks: (note.start_time * 960.0) as u32,
-            is_note_on: true,
-            pitch: note.pitch,
-            velocity: note.velocity,
-        });
-        events.push(Event {
-            time_ticks: (note.end_time * 960.0) as u32,
-            is_note_on: false,
-            pitch: note.pitch,
-            velocity: 0,
-        });
-    }
-    
-    events.sort_by_key(|e| e.time_ticks);
-    
-    let mut last_tick = 0;
-    for e in events {
-        let delta = e.time_ticks.saturating_sub(last_tick);
-        last_tick = e.time_ticks;
-        
-        let message = if e.is_note_on {
-            TrackEventKind::Midi {
-                channel: 0.into(),
-                message: MidiMessage::NoteOn { key: e.pitch.into(), vel: e.velocity.into() },
-            }
-        } else {
-            TrackEventKind::Midi {
-                channel: 0.into(),
-                message: MidiMessage::NoteOff { key: e.pitch.into(), vel: e.velocity.into() },
-            }
-        };
-        
-        let delta_u28 = midly::num::u28::try_from(delta).unwrap_or(midly::num::u28::max_value());
-        track.push(TrackEvent {
-            delta: delta_u28,
-            kind: message,
-        });
-    }
-    
-    track.push(TrackEvent {
-        delta: 0.into(),
-        kind: TrackEventKind::Meta(MetaMessage::EndOfTrack),
-    });
-    
-    smf.tracks.push(track);
-    let _ = smf.save(path);
-}
