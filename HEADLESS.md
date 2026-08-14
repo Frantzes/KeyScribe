@@ -152,6 +152,38 @@ parameter combo (threshold, chord sampling, melody, bpm, stems). Load it
   accompaniment whose bass anticipates the next bar's root) need more
   training tracks.
 
+## Evaluating a corpus (`eval-corpus`)
+
+```
+keyscribe-cli eval-corpus <folder> [options]
+```
+
+Batch harness that runs the full `sheet` pipeline + `compare` over **every**
+`(audio, reference .musicxml)` pair in `<folder>` (e.g. the 50-track Omnibook
+set in `out/omnibook/`) and prints a dashboard table plus an aggregate row,
+writing the whole thing as JSON with `-o report.json`.
+
+- **Per-track BPM overrides** (`--bpm-file <path>`) make runs reproducible when
+  the ML beat tracker misfires on a track's meter (it commonly returns
+  half-time). The file is either a JSON object `{"Track_Name": 208.0, ...}` or
+  one `<track stem> <bpm>` per line. `out/omnibook/bpm_overrides.txt` has the
+  XML-read tempos for the whole corpus.
+- **Fixed knobs** for comparability: `--key-sensitivity`, `--melody`,
+  `--quantizer legacy|learned`, `--stems`, `--tolerance` (chord onset beats),
+  `--model-dir`, `--objective`. The command is the regression gate: run it
+  before/after a change and diff the aggregate row.
+- **Report schema** (`CorpusReport` in `src/eval_corpus.rs`): per-track
+  `root_match_rate` / `exact_match_rate` / `root_coverage` / `pitch_accuracy` /
+  `note_accuracy` / `recall` / `mean_onset_error_beats` / `mean_duration_error`
+  / `in_bar_rate` / `bar_count_score`, plus `error` for failed tracks and the
+  corpus means.
+
+Current corpus baselines (`--melody heuristic --quantizer learned`, fixed bpm):
+pitch **0.867**, note **0.406**, recall **0.381**, onset error **0.231 beats**,
+chord root **0.393**, chord exact **0.139**, in-bar **0.962** (50/50 tracks OK).
+(2026-08-14 rhythm fixes; pre-fix baseline was pitch 0.826 / note 0.374 /
+onset 0.256.)
+
 ## Workflow gotchas
 
 - **Grid alignment dominates everything.** The beat tracker returns half/
@@ -259,13 +291,19 @@ melody pitch accuracy 0.139 → **0.800**; note accuracy 0.08. Rhythm
 ## Note extraction rhythm (P4) — `extract_notes_from_timeline`
 The binary threshold crossing merged staccato repeats into one long note and
 started notes at the threshold crossing (late onsets). Fixed in both the CLI
-(`headless.rs`) and GUI (`extract_events_from_timeline_data`):
+(`headless.rs`) and GUI (`extract_events_from_timeline_data` — now delegates
+to the headless extractor so there is ONE implementation):
 - **Adaptive release** — a note ends when its probability falls below
   `0.55 × its own peak` (min 0.05), so re-articulations split instead of
   merging into one sustained note.
 - **Attack-adjusted onsets** — on note start, walk back up to 5 frames to the
   low point where the probability began its rise and start there, removing
   the threshold-crossing latency.
+- **Onset-head positioning (2026-08-14)** — onsets and re-articulation
+  splits are then moved to the ONSET head's local peak (±4 frames, peak
+  ≥ 0.3). The frame head ramps ±72 ms at fast tempos (one 16th at 208 BPM);
+  the onset head is sharp at attacks. This alone lifted Confirmation note
+  accuracy 0.242 → 0.286.
 - **Onset-head splitting** — Basic Pitch's separate onset head (88 notes,
   sharp at attacks) now drives re-articulation splits. The inference layer
   separates the note/onset/contour heads by output name, with a sparsity
@@ -277,13 +315,40 @@ started notes at the threshold crossing (late onsets). Fixed in both the CLI
 - **Onset-clamped melody durations** — a monophonic melody note cannot extend
   past the next onset; this turns staccato 8ths (whose extraction runs into
   the next attack) into properly short notes.
+- **Chatter absorption (2026-08-14, musicxml.rs skyline post-pass)** —
+  melody segments < 120 ms that are much quieter than both neighbors (< 75%)
+  or foreign-pitch at < 90% of the louder neighbor are absorbed into the
+  previous segment (comp-strike leakage pokes). Full-velocity short notes
+  (pickups, 16ths) survive. Confirmation: 688 → 545 segments.
+- **Complexity-penalized snapping (2026-08-14, quantize.rs
+  `snap_intra_beat_pos`)** — coarse slots (onbeat/8th) get a small margin
+  over fine slots (16ths +0.045, triplet 8ths +0.03) so ±60 ms onset jitter
+  cannot flip an 8th onto a dotted-8th/16th slot.
+- **Diagnostics** — `KEYSCRIBE_QUANT_DEBUG=1` prints the intra-beat-position
+  histogram, snap destinations, mean snap error, the learned-engine legacy-
+  fallback bar count, and skyline segment-duration stats;
+  `tools/diag/side_by_side.py <ref.musicxml> <trans.musicxml>` prints
+  matched-note onset deltas + histogram (mirrors `compare`'s parser incl.
+  backup/forward).
 Measured (sens 0.2, bpm 222, skyline): pitch accuracy 0.503 → 0.565,
 note accuracy 0.044 → 0.054, recall 0.062 → 0.078, mean onset error
 **0.188 → 0.100 beats**; dotted-eighth mis-quantization gone (clean 8ths/
-quarters, even bars).
+quarters, even bars). Corpus (2026-08-14): note acc **0.406** (was 0.374).
 - Tune bpm search no longer includes the ×0.5 (half-tempo) candidate — it
   coarsens quantization and gamed the beat-space metrics, picking degenerate
   configs (e.g. bpm=56 for a 225 bpm tune).
+
+## Rhythm coarsening pass (Tier A1) — `coarsen_rhythm` (INERT, keep disable-able)
+Per-bar post-quantization pass in `src/leadsheet/quantize.rs` that re-snaps
+"over-split" bars onto the 0.5 grid. Controlled by `RhythmCoarsenConfig`
+(default enabled) via `SheetOptions`/`TunedConfig` (`rhythm_coarsen`) and
+`--no-rhythm-coarsen`. **Verified inert on the corpus (2026-08-14):** every bar
+votes `coarse=false` on Confirmation and the 50-track aggregate is byte-identical
+to baseline — the Confirmation rhythm gap is swung-feel quantization, not 16th
+over-segmentation. Do NOT force it (lowering `coarse_vote_ratio` / the
+`≥ 2×bpb+1` note guard regresses note accuracy on genuine 16th runs). The
+extraction-constant knobs (`release_ratio`, `onset_split_threshold`) are the
+real levers.
 
 ## Chord display note
 The reference MusicXML's kinds were correct all along (Cmaj7/B-7/G-13 etc. —

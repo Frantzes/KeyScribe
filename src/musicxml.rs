@@ -894,7 +894,98 @@ pub fn extract_melody_skyline(notes: &[NoteEvent], outlier_semitones: u8) -> Vec
         }
     }
 
+    // Chatter absorption: comp-strike leakage and reverb dips cut short
+    // foreign segments into the line (measured on Confirmation: 688 segments
+    // for a ~200-note melody, ~280 of them < 120 ms). A segment is chatter
+    // when it is short AND (much quieter than both neighbors, or a foreign
+    // pitch at lower velocity than at least one neighbor). Genuine short
+    // melody notes (grace-length pickups, 16ths) play at full melody
+    // velocity and are preserved. Absorbed segments extend the previous
+    // segment; the onset-clamp above guarantees no overlap is created.
+    const CHATTER_MAX_SEC: f32 = 0.12;
+    let dbg = std::env::var_os("KEYSCRIBE_QUANT_DEBUG").is_some();
+    let segs = std::mem::take(&mut melody_segments);
+    let mut kept: Vec<NoteEvent> = Vec::with_capacity(segs.len());
+    for i in 0..segs.len() {
+        let seg = &segs[i];
+        let dur = seg.end_time - seg.start_time;
+        let prev = kept.last();
+        let next = segs.get(i + 1);
+        let is_chatter = dur < CHATTER_MAX_SEC && {
+            let prev_vel = prev.map(|n| n.velocity as f32);
+            let next_vel = next.map(|n| n.velocity as f32);
+            match (prev_vel, next_vel) {
+                (Some(p), Some(nx)) => {
+                    let foreign_pitch = prev.map(|n| n.pitch) != Some(seg.pitch)
+                        && next.map(|n| n.pitch) != Some(seg.pitch);
+                    let quiet = (seg.velocity as f32) < 0.75 * p.min(nx);
+                    let foreign_quiet =
+                        foreign_pitch && (seg.velocity as f32) < 0.9 * p.max(nx);
+                    quiet || foreign_quiet
+                }
+                (Some(p), None) => (seg.velocity as f32) < 0.75 * p,
+                _ => false,
+            }
+        };
+        if is_chatter {
+            if let Some(prev_note) = kept.last_mut() {
+                prev_note.end_time = prev_note.end_time.max(seg.end_time);
+            }
+            if dbg {
+                eprintln!(
+                    "[quant-debug] absorbed chatter: {:.3}s pitch={} vel={} dur={:.3}",
+                    seg.start_time,
+                    seg.pitch,
+                    seg.velocity,
+                    dur
+                );
+            }
+        } else {
+            if dbg && dur < CHATTER_MAX_SEC {
+                eprintln!(
+                    "[quant-debug] kept short: {:.3}s pitch={} vel={} dur={:.3}",
+                    seg.start_time,
+                    seg.pitch,
+                    seg.velocity,
+                    dur
+                );
+            }
+            kept.push(seg.clone());
+        }
+    }
+    melody_segments = kept;
+
     let _ = outlier_semitones; // reserved for a future register guard
+
+    if std::env::var_os("KEYSCRIBE_QUANT_DEBUG").is_some() {
+        let mut dur_hist: std::collections::BTreeMap<u32, usize> =
+            std::collections::BTreeMap::new();
+        let mut short = [0usize; 5];
+        for s in &melody_segments {
+            let d = s.end_time - s.start_time;
+            *dur_hist.entry((d * 20.0) as u32).or_default() += 1; // 50ms bins
+            for (k, bound) in [0.04f32, 0.06, 0.08, 0.10, 0.12].iter().enumerate() {
+                if d < *bound {
+                    short[k] += 1;
+                }
+            }
+        }
+        eprintln!(
+            "[quant-debug] skyline segments: {} | <40ms {} <60ms {} <80ms {} <100ms {} <120ms {}",
+            melody_segments.len(),
+            short[0],
+            short[1],
+            short[2],
+            short[3],
+            short[4]
+        );
+        let mut durs: Vec<String> = dur_hist
+            .iter()
+            .map(|(bin, c)| format!("{:.2}s x{}", *bin as f32 * 0.05, c))
+            .collect();
+        durs.sort();
+        eprintln!("[quant-debug] segment duration hist: {}", durs.join(" "));
+    }
     melody_segments
 }
 

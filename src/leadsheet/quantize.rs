@@ -677,19 +677,35 @@ fn snap_intra_beat_pos(pos: f32, grid: &[f32]) -> (f32, f32) {
     if grid.is_empty() {
         return (0.0, 1.0);
     }
-    // Coarse-to-fine order: straight 8ths (0.5) are preferred over the triplet
-    // position (1/3) unless the triplet is meaningfully closer. This keeps
-    // swung/behind-the-beat straight 8ths from snapping into spurious triplets.
+    // Complexity-aware snapping: coarse slots (onbeat / straight 8th) are
+    // preferred over fine slots (16th / triplet) by a small margin, so
+    // ±60 ms of onset jitter at fast tempos cannot flip a straight 8th onto
+    // the dotted-8th/16th slot (measured on Confirmation: clean melody
+    // onsets jitter ±20-75 ms while a 16th slot at 208 BPM is 72 ms). The
+    // margin is far smaller than a genuine 16th's distance from the coarse
+    // grid, so real subdivisions still win.
+    let slot_penalty = |g: f32| -> f32 {
+        let frac = (g * 12.0).round() / 12.0;
+        if frac.abs() < 1e-3 || (frac - 0.5).abs() < 1e-3 || (frac - 1.0).abs() < 1e-3 {
+            0.0 // onbeats and straight 8ths
+        } else if (frac - 0.25).abs() < 1e-3 || (frac - 0.75).abs() < 1e-3 {
+            0.045 // 16ths
+        } else if (frac - 1.0 / 3.0).abs() < 2e-2 || (frac - 2.0 / 3.0).abs() < 2e-2 {
+            0.03 // triplet 8ths
+        } else {
+            0.06 // 16th triplets
+        }
+    };
     let mut best = grid[0];
-    let mut best_err = (pos - best).abs();
+    let mut best_cost = (pos - grid[0]).abs() + slot_penalty(grid[0]);
     for &g in grid.iter().skip(1) {
-        let err = (pos - g).abs();
-        if err < best_err {
+        let cost = (pos - g).abs() + slot_penalty(g);
+        if cost < best_cost {
             best = g;
-            best_err = err;
+            best_cost = cost;
         }
     }
-    (best, best_err)
+    (best, (pos - best).abs())
 }
 
 // ── Main Aligned Quantization Entry Point ──────────────────────────────────
@@ -803,6 +819,39 @@ pub fn quantize_aligned_notes(
                 note.pitch, note.original_start_time, note.intra_beat_pos, note.beat_index, s.style, sub_grid, s.snapped_pos, s.beat_start
             );
         }
+        // Evidence summary for rhythm diagnosis: where do raw onsets actually
+        // sit inside the beat (24 bins), and where do they snap?
+        let mut hist = vec![0usize; 24];
+        let mut snap_counts: std::collections::BTreeMap<u32, usize> =
+            std::collections::BTreeMap::new();
+        let mut snap_err_sum = 0.0f32;
+        for s in &snapped {
+            let bin = (s.note.intra_beat_pos.clamp(0.0, 0.9999) * 24.0) as usize;
+            hist[bin] += 1;
+            *snap_counts.entry((s.snapped_pos * 24.0).round() as u32).or_default() += 1;
+            snap_err_sum += s.snap_error;
+        }
+        for (bin, &count) in hist.iter().enumerate() {
+            if count > 0 {
+                eprintln!(
+                    "[quant-debug] intra hist bin {:.3}-{:.3}: {}",
+                    bin as f32 / 24.0,
+                    (bin + 1) as f32 / 24.0,
+                    count
+                );
+            }
+        }
+        let mut dests: Vec<String> = snap_counts
+            .iter()
+            .map(|(slot, count)| format!("{:.3}x{}", *slot as f32 / 24.0, count))
+            .collect();
+        dests.sort();
+        eprintln!(
+            "[quant-debug] snap destinations: {} | mean snap err {:.4} over {} notes",
+            dests.join(" "),
+            snap_err_sum / snapped.len().max(1) as f32,
+            snapped.len()
+        );
     }
 
     // Pass 2: infer duration from the local sequence. For contiguous attacks,
@@ -889,11 +938,234 @@ pub fn quantize_aligned_notes(
                     *last = note;
                 }
             }
-            _ => mono.push(note),
+            _ =>         mono.push(note),
         }
     }
 
     mono
+}
+
+// ── Tier A1: rhythm merge & coarsening pass ────────────────────────────────
+
+/// Post-quantization rhythm merge & coarsening configuration.
+#[derive(Debug, Clone)]
+pub struct RhythmCoarsenConfig {
+    /// Whether the pass runs at all. `--no-rhythm-coarsen` sets this false so
+    /// the legacy (unchanged) output is produced.
+    pub enabled: bool,
+    /// Minimum fraction of inter-onset gaps that must be 16th-level (in
+    /// (0.05, 0.45) beats) for a bar to be voted COARSE and re-snapped to the
+    /// 8th-note grid. Raising this makes coarsening more conservative.
+    pub coarse_vote_ratio: f32,
+}
+
+impl Default for RhythmCoarsenConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            coarse_vote_ratio: 0.70,
+        }
+    }
+}
+
+/// Collect the distinct snapped onset offsets within one bar, collapsing
+/// offsets that are < 0.05 beats apart.
+fn distinct_bar_offsets(notes: &[QuantizedNote], beats_per_bar: u32) -> Vec<f32> {
+    let mut offsets: Vec<f32> = notes
+        .iter()
+        .map(|n| n.beat_start - (n.bar_index as f32 * beats_per_bar as f32))
+        .collect();
+    offsets.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let mut out: Vec<f32> = Vec::with_capacity(offsets.len());
+    for o in offsets {
+        if out.last().map_or(true, |last| o - last >= 0.05) {
+            out.push(o);
+        }
+    }
+    out
+}
+
+/// Grid vote: a bar is COARSE (8th-note grid) when it contains more onsets
+/// than a full 8th grid (guarding genuine swing 8ths whose swung onsets land
+/// on 16th slots), its inter-onset gaps are dominated by 8th-or-larger
+/// spacing, AND it contains at least one 16th-spaced gap (the over-split
+/// signature). Requiring `min_notes` prevents the pass from chopping genuine
+/// swing passages whose swung onsets snap to 16th slots.
+fn bar_is_coarse(offsets: &[f32], coarse_vote_ratio: f32, min_notes: usize) -> bool {
+    if offsets.len() < min_notes.max(2) {
+        return false;
+    }
+    let mut coarse = 0usize;
+    let mut fine = 0usize;
+    let mut has_16th_gap = false;
+    for w in offsets.windows(2) {
+        let gap = w[1] - w[0];
+        if gap >= 0.45 {
+            coarse += 1;
+        } else if gap > 0.05 {
+            fine += 1;
+        }
+        if (gap - 0.25).abs() < 0.02 {
+            has_16th_gap = true;
+        }
+    }
+    let total = (coarse + fine) as f32;
+    if total <= 0.0 {
+        return false;
+    }
+    has_16th_gap && coarse as f32 / total >= coarse_vote_ratio
+}
+
+/// Re-snap a COARSE bar's onsets to the 0.5 grid, merge collisions and
+/// same-pitch fragments, and recompute durations from the merged onset gaps.
+fn coarsen_bar(notes: Vec<QuantizedNote>, bpb: f32) -> Vec<QuantizedNote> {
+    // Re-snap every onset onto the 0.5 grid. Offsets already sitting on a 0.5
+    // multiple keep their exact position; 16th positions in (0.05, 0.45) are
+    // "zeroed out" onto the containing beat start (e.g. 0.25 -> 0, 0.75 ->
+    // 0.5, 1.25 -> 1.0), so over-split fragments collapse into the 8th grid.
+    let mut snapped: Vec<QuantizedNote> = Vec::with_capacity(notes.len());
+    for mut n in notes {
+        let offset = n.beat_start - n.bar_index as f32 * bpb;
+        let half = (offset / 0.5).floor() * 0.5;
+        let new_offset = if (offset - (offset / 0.5).round() * 0.5).abs() < 1e-4 {
+            offset
+        } else {
+            half.clamp(0.0, bpb - 0.5)
+        };
+        n.beat_start = n.bar_index as f32 * bpb + new_offset;
+        snapped.push(n);
+    }
+    snapped.sort_by(|a, b| {
+        a.beat_start
+            .partial_cmp(&b.beat_start)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| a.pitch.cmp(&b.pitch))
+    });
+
+    // Collision merge: two notes now share a snapped onset (monophonic melody)
+    // → keep the higher confidence, tie-break by lower pitch.
+    let mut merged: Vec<QuantizedNote> = Vec::with_capacity(snapped.len());
+    for n in snapped {
+        match merged.last_mut() {
+            Some(last) if (last.beat_start - n.beat_start).abs() < 1e-4 => {
+                let keep_last = if (last.confidence - n.confidence).abs() < 1e-6 {
+                    last.pitch <= n.pitch
+                } else {
+                    last.confidence >= n.confidence
+                };
+                if !keep_last {
+                    *last = n;
+                }
+            }
+            _ => merged.push(n),
+        }
+    }
+
+    // Same-pitch adjacent merge: note B starts where note A starts + snapped
+    // gap and A's duration ≈ that gap → A extends over both, B dropped.
+    let mut i = 0;
+    while i + 1 < merged.len() {
+        let gap = merged[i + 1].beat_start - merged[i].beat_start;
+        if merged[i].pitch == merged[i + 1].pitch
+            && gap > 0.0
+            && (merged[i].beat_duration - gap).abs() <= 0.1
+        {
+            let a = merged[i].clone();
+            let b = merged[i + 1].clone();
+            merged[i] = QuantizedNote {
+                beat_duration: b.beat_start + b.beat_duration - a.beat_start,
+                ..a
+            };
+            merged.remove(i + 1);
+        } else {
+            i += 1;
+        }
+    }
+
+    // Recompute durations from the final distinct snapped onsets. For the last
+    // note in the bar the horizon is the next 0.5 slot (or the bar end when
+    // closer), clamped to ≥ 1/6 beat (the smallest token).
+    let offsets: Vec<f32> = merged
+        .iter()
+        .map(|n| n.beat_start - n.bar_index as f32 * bpb)
+        .collect();
+    for (i, n) in merged.iter_mut().enumerate() {
+        let next = if i + 1 < offsets.len() {
+            offsets[i + 1] - offsets[i]
+        } else {
+            (0.5_f32).min(bpb - offsets[i])
+        };
+        n.beat_duration = next.max(1.0 / 6.0);
+    }
+    merged
+}
+
+/// Post-quantization pass that merges 16th-note over-segmentation fragments
+/// back onto the 8th-note grid, per-bar. Bars whose inter-onset gaps are NOT
+/// dominated by 16th spacing (genuine 16th passages) are left untouched.
+pub fn coarsen_rhythm(
+    notes: Vec<QuantizedNote>,
+    beats_per_bar: u32,
+    cfg: &RhythmCoarsenConfig,
+) -> Vec<QuantizedNote> {
+    if !cfg.enabled || notes.is_empty() || beats_per_bar == 0 {
+        return notes;
+    }
+    let bpb = beats_per_bar.max(2) as f32;
+    let debug = std::env::var_os("KEYSCRIBE_COARSEN_DEBUG").is_some();
+    if debug {
+        eprintln!(
+            "[coarsen-debug] {} notes, {} beats/bar",
+            notes.len(),
+            beats_per_bar
+        );
+    }
+
+    let max_bar = notes.iter().map(|n| n.bar_index).max().unwrap_or(0);
+    let mut out: Vec<QuantizedNote> = Vec::with_capacity(notes.len());
+    for bar in 0..=max_bar {
+        let group: Vec<QuantizedNote> = notes
+            .iter()
+            .filter(|n| n.bar_index == bar)
+            .cloned()
+            .collect();
+        if group.is_empty() {
+            continue;
+        }
+        let offsets = distinct_bar_offsets(&group, beats_per_bar);
+        let min_notes = beats_per_bar as usize * 2 + 1;
+        let coarse = bar_is_coarse(&offsets, cfg.coarse_vote_ratio, min_notes);
+        if debug {
+            eprintln!(
+                "[coarsen-debug] bar {}: {} notes, {} distinct offsets, coarse={}",
+                bar,
+                group.len(),
+                offsets.len(),
+                coarse
+            );
+            if coarse {
+                for n in &group {
+                    eprintln!(
+                        "[coarsen-debug]   pitch={} beat_start={:.3} dur={:.3} conf={:.3}",
+                        n.pitch, n.beat_start, n.beat_duration, n.confidence
+                    );
+                }
+            }
+        }
+        if coarse {
+            out.extend(coarsen_bar(group, bpb));
+        } else {
+            out.extend(group);
+        }
+    }
+
+    out.sort_by(|a, b| {
+        a.beat_start
+            .partial_cmp(&b.beat_start)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| a.pitch.cmp(&b.pitch))
+    });
+    out
 }
 
 /// Duration grid including triplet values, coarse-to-fine. The engraver can
@@ -1169,6 +1441,14 @@ pub fn quantize_aligned_notes_learned(
                 invalid_bars.insert(current.bar_index);
             }
         }
+    }
+    if std::env::var_os("KEYSCRIBE_QUANT_DEBUG").is_some() {
+        let total_bars = quantized.iter().map(|n| n.bar_index).collect::<std::collections::BTreeSet<_>>().len();
+        eprintln!(
+            "[quant-debug] learned engine: {}/{} bars fell back to the legacy grid",
+            invalid_bars.len(),
+            total_bars
+        );
     }
     if !invalid_bars.is_empty() {
         let legacy = quantize_aligned_notes(aligned, swing_sections, beats_per_bar);
@@ -1598,5 +1878,116 @@ mod tests {
         let q = quantize_aligned_notes(&notes, &swing, 4);
         assert!(q.iter().any(|n| n.swing_feel));
         assert!(q.iter().any(|n| n.swing_style == SwingStyle::Swing));
+    }
+
+    // ── Tier A1: rhythm coarsening ──
+
+    fn q_note(pitch: u8, bar: u32, offset: f32, duration: f32, confidence: f32) -> QuantizedNote {
+        QuantizedNote {
+            id: pitch as u32 * 100 + (offset * 100.0) as u32,
+            pitch,
+            beat_start: bar as f32 * 4.0 + offset,
+            beat_duration: duration,
+            confidence,
+            bar_index: bar,
+            beat_index: (offset % 4.0).floor() as u32,
+            intra_beat_pos: offset % 1.0,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn coarsen_rhythm_collapses_stray_sixteenths_onto_eighths() {
+        // Over-split bar: a full 8th grid (8 notes) plus a 16th fragment at the
+        // "and of 2" (1.25). The vote passes because the bar has > a full 8th
+        // grid (9 notes) and is dominated by 8th-or-larger gaps.
+        let offsets = [0.0f32, 0.5, 1.0, 1.25, 1.5, 2.0, 2.5, 3.0, 3.5];
+        let notes: Vec<QuantizedNote> = offsets
+            .iter()
+            .enumerate()
+            .map(|(i, &o)| q_note(60 + (i % 2) as u8, 0, o, 0.25, 0.5))
+            .collect();
+        let out = coarsen_rhythm(notes, 4, &RhythmCoarsenConfig::default());
+        // 1.25 -> 1.0 collides with the existing note at 1.0 (kept): 9 input
+        // notes collapse to 8 on the 0.5 grid, each with a 0.5 duration.
+        assert_eq!(out.len(), 8);
+        for n in &out {
+            assert!((n.beat_duration - 0.5).abs() < 1e-4, "dur {} wrong", n.beat_start);
+        }
+    }
+
+    #[test]
+    fn coarsen_rhythm_leaves_genuine_sixteenths_untouched() {
+        // Mixed 0.25 / 0.75 gaps: fine vote fails → bar is not coarse.
+        let offsets = [0.0f32, 0.25, 1.0, 1.25, 2.0, 2.25];
+        let notes: Vec<QuantizedNote> = offsets
+            .iter()
+            .enumerate()
+            .map(|(i, &o)| q_note(60 + i as u8, 0, o, 0.25, 0.8))
+            .collect();
+        let out = coarsen_rhythm(notes.clone(), 4, &RhythmCoarsenConfig::default());
+        assert_eq!(out.len(), notes.len());
+        for (a, b) in out.iter().zip(notes.iter()) {
+            assert!((a.beat_start - b.beat_start).abs() < 1e-4);
+            assert!((a.beat_duration - b.beat_duration).abs() < 1e-4);
+        }
+    }
+
+    #[test]
+    fn coarsen_rhythm_collision_keeps_higher_confidence() {
+        // Over-split bar (60 on the beat + a 16th fragment at 0.25) sitting on
+        // a coarse-dominated 8th grid. The two notes collide on the 0.5 snap;
+        // the higher-confidence one wins.
+        let mut notes = vec![
+            q_note(60, 0, 0.0, 0.25, 0.9),
+            q_note(62, 0, 0.25, 0.25, 0.4),
+        ];
+        for (i, off) in [0.5f32, 1.0, 1.5, 2.0, 2.5, 3.0, 3.5].iter().enumerate() {
+            notes.push(q_note(64 + i as u8, 0, *off, 0.25, 0.8));
+        }
+        let out = coarsen_rhythm(notes, 4, &RhythmCoarsenConfig::default());
+        assert_eq!(out.len(), 8);
+        assert_eq!(out[0].pitch, 60);
+        assert!((out[0].beat_duration - 0.5).abs() < 1e-4);
+    }
+
+    #[test]
+    fn coarsen_rhythm_leaves_single_note_and_empty_unchanged() {
+        let single = vec![q_note(60, 0, 0.5, 0.5, 0.9)];
+        let out = coarsen_rhythm(single.clone(), 4, &RhythmCoarsenConfig::default());
+        assert_eq!(out.len(), 1);
+        assert!((out[0].beat_start - single[0].beat_start).abs() < 1e-4);
+
+        let out = coarsen_rhythm(Vec::new(), 4, &RhythmCoarsenConfig::default());
+        assert!(out.is_empty());
+    }
+
+    #[test]
+    fn coarsen_rhythm_leaves_pure_eighth_bar_unchanged() {
+        let notes: Vec<QuantizedNote> = (0..8)
+            .map(|i| q_note(60 + i as u8, 0, i as f32 * 0.5, 0.5, 0.8))
+            .collect();
+        let out = coarsen_rhythm(notes.clone(), 4, &RhythmCoarsenConfig::default());
+        assert_eq!(out.len(), 8);
+        for (a, b) in out.iter().zip(notes.iter()) {
+            assert!((a.beat_start - b.beat_start).abs() < 1e-4);
+            assert!((a.beat_duration - b.beat_duration).abs() < 1e-4);
+        }
+    }
+
+    #[test]
+    fn coarsen_rhythm_disabled_passes_through() {
+        let notes: Vec<QuantizedNote> = (0..8)
+            .map(|i| q_note(60, 0, i as f32 * 0.25, 0.25, 0.5))
+            .collect();
+        let cfg = RhythmCoarsenConfig {
+            enabled: false,
+            coarse_vote_ratio: 0.70,
+        };
+        let out = coarsen_rhythm(notes.clone(), 4, &cfg);
+        assert_eq!(out.len(), 8);
+        for (a, b) in out.iter().zip(notes.iter()) {
+            assert!((a.beat_start - b.beat_start).abs() < 1e-4);
+        }
     }
 }

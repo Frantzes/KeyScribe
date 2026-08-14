@@ -7,9 +7,9 @@ use crate::leadsheet::instrument_separation::{
 };
 use crate::leadsheet::joint_tracker::JointRhythmConfig;
 use crate::leadsheet::quantize::{
-    detect_swing, quantize_aligned_notes, quantize_aligned_notes_learned,
+    coarsen_rhythm, detect_swing, quantize_aligned_notes, quantize_aligned_notes_learned,
     quantize_notes_with_rhythm_map, quantize_notes_with_ties, QuantizationConfig,
-    SwingDetectionConfig,
+    RhythmCoarsenConfig, SwingDetectionConfig,
 };
 use crate::leadsheet::tempo_map::{
     beat_at_time, detect_tempo_map, detect_time_signature_segments, TempoMapConfig,
@@ -38,6 +38,9 @@ pub struct LeadSheetPresetConfig {
     /// Optional explicit path to `melody_quantizer.onnx` (defaults to the
     /// resolver in `quantize::resolve_quantizer_model_path`).
     pub quantizer_model_path: Option<std::path::PathBuf>,
+    /// Post-quantization rhythm merge & coarsening pass (Tier A1). Disabled by
+    /// `--no-rhythm-coarsen`.
+    pub rhythm_coarsen: RhythmCoarsenConfig,
 }
 
 impl Default for LeadSheetPresetConfig {
@@ -55,6 +58,7 @@ impl Default for LeadSheetPresetConfig {
             swing_override: None,
             quantizer: crate::leadsheet::QuantizerEngine::default(),
             quantizer_model_path: None,
+            rhythm_coarsen: RhythmCoarsenConfig::default(),
         }
     }
 }
@@ -369,6 +373,11 @@ pub fn generate_lead_sheet_enhanced_with_timeline(
     if quantized.is_empty() {
         return None;
     }
+
+    // Tier A1: merge 16th over-segmentation fragments back onto the 8th-note
+    // grid per-bar (disableable). Genuine 16th bars are left untouched by the
+    // vote.
+    let quantized = coarsen_rhythm(quantized, beats_per_bar, &config.rhythm_coarsen);
 
     // ---- per-bar tempo map from actual beat positions ----
     let (tempo_map, tempo) = tempo_map_from_beats_and_downbeats(

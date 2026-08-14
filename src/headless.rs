@@ -46,6 +46,10 @@ fn default_melody_quantizer() -> String {
     "legacy".to_string()
 }
 
+fn default_true() -> bool {
+    true
+}
+
 /// Learned pipeline parameters written by the `tune` subcommand and applied by
 /// `sheet`/`midi` via `--config`. Explicit CLI flags override these defaults.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -70,6 +74,10 @@ pub struct TunedConfig {
     /// Fixed tempo grid override learned by `tune` (applies when the track
     /// has no explicit `--bpm`).
     pub bpm: Option<f32>,
+    /// Post-quantization rhythm merge & coarsening pass (Tier A1). Missing
+    /// from legacy config files → `true` (coarsening on by default).
+    #[serde(default = "default_true")]
+    pub rhythm_coarsen: bool,
 }
 
 impl Default for TunedConfig {
@@ -84,6 +92,7 @@ impl Default for TunedConfig {
             melody_stems: true,
             melody_quantizer: "learned".to_string(),
             bpm: None,
+            rhythm_coarsen: true,
         }
     }
 }
@@ -389,6 +398,12 @@ pub fn notes_from_analysis(
                     threshold,
                     &mut nid,
                 );
+                if std::env::var_os("KEYSCRIBE_QUANT_DEBUG").is_some() {
+                    eprintln!(
+                        "[quant-debug] stem extraction raw: {} notes -> melody reduction",
+                        notes.len()
+                    );
+                }
                 notes = match melody_mode {
                     MelodyMode::Polyphonic => notes,
                     MelodyMode::Skyline => extract_melody_skyline(&notes, outlier_semitones),
@@ -513,6 +528,9 @@ pub struct SheetOptions {
     pub quantizer: crate::leadsheet::QuantizerEngine,
     /// Optional explicit path to `melody_quantizer.onnx`.
     pub quantizer_model_path: Option<PathBuf>,
+    /// Run the post-quantization rhythm merge & coarsening pass (Tier A1).
+    /// `--no-rhythm-coarsen` disables it for the legacy output.
+    pub rhythm_coarsen: bool,
 }
 
 impl Default for SheetOptions {
@@ -529,6 +547,7 @@ impl Default for SheetOptions {
             chord_sample_strike: false,
             quantizer: crate::leadsheet::QuantizerEngine::default(),
             quantizer_model_path: None,
+            rhythm_coarsen: true,
         }
     }
 }
@@ -592,6 +611,7 @@ fn generate_sheet_inner(
     config.chord_analysis.chord_sample_strike = sheet_opts.chord_sample_strike;
     config.quantizer = sheet_opts.quantizer;
     config.quantizer_model_path = sheet_opts.quantizer_model_path.clone();
+    config.rhythm_coarsen.enabled = sheet_opts.rhythm_coarsen;
 
     let note_count = notes.len();
     let beat_count = beats.beats.len();
@@ -711,12 +731,24 @@ pub fn separate_stems(audio_path: &Path, out_dir: &Path) -> Result<Vec<PathBuf>>
     Ok(written)
 }
 
+/// A note ends when its probability falls below this fraction of its own peak
+/// (adaptive release). Shared by CLI and GUI extraction paths.
+pub const NOTE_RELEASE_RATIO: f32 = 0.55;
+/// Absolute probability floor used by the adaptive release / attack look-back.
+pub const NOTE_RELEASE_FLOOR: f32 = 0.05;
+/// When a note starts, search back up to this many frames for the low point
+/// where its probability began the rise.
+pub const NOTE_ATTACK_LOOKBACK: usize = 5;
+/// A frame is a re-articulation when the model's onset head fires at or above
+/// this while the note is still sounding — splits staccato repeats.
+pub const ONSET_SPLIT_THRESHOLD: f32 = 0.35;
+
 /// Convert a probability timeline into `NoteEvent`s, mirroring the app's
 /// `extract_events_from_timeline_data` logic so CLI and GUI agree. Notes are
 /// split at re-articulations (staccato repeats) via an adaptive release
 /// threshold and the model's onset head, and onsets are attack-adjusted so
 /// timing is accurate.
-fn extract_notes_from_timeline(
+pub(crate) fn extract_notes_from_timeline(
     timeline: &[Vec<f32>],
     onset_timeline: Option<&[Vec<f32>]>,
     step_sec: f32,
@@ -730,20 +762,10 @@ fn extract_notes_from_timeline(
     let note_count = (PIANO_HIGH_MIDI - PIANO_LOW_MIDI + 1) as usize;
     let mut out = Vec::new();
     let min_duration_sec = (step_sec * MIN_SHEET_NOTE_FRAMES as f32).max(0.05);
-    // Adaptive release: a note ends when its probability falls below this
-    // fraction of its own peak (or the absolute floor). A fixed threshold
-    // keeps staccato re-articulations merged into one long note; the
-    // peak-relative level splits them.
-    let release_ratio = 0.55f32;
-    let release_floor = 0.05f32;
-    // When a note starts, search back up to this many frames for the low
-    // point where its probability began the rise, and start there instead of
-    // at the threshold crossing (which lags the true onset).
-    let attack_lookback = 5usize;
-    // A frame is a re-articulation when the model's onset head fires while
-    // the note is still sounding — this splits staccato repeats even when the
-    // note probability never dips below the release level.
-    let onset_split_threshold = 0.35f32;
+    let release_ratio = NOTE_RELEASE_RATIO;
+    let release_floor = NOTE_RELEASE_FLOOR;
+    let attack_lookback = NOTE_ATTACK_LOOKBACK;
+    let onset_split_threshold = ONSET_SPLIT_THRESHOLD;
 
     let prob_at = |note_idx: usize, frame_idx: usize| -> f32 {
         timeline
@@ -760,6 +782,30 @@ fn extract_notes_from_timeline(
             .copied()
             .unwrap_or(0.0)
             .clamp(0.0, 1.0)
+    };
+    // The onset head is trained to peak exactly at attacks and is far sharper
+    // than the frame head's slow ramp (measured on Confirmation: frame-head
+    // onsets lead/lag the truth by up to a full 16th at 208 BPM, ±72 ms,
+    // flipping 8ths onto adjacent 16th slots). Whenever the onset head has a
+    // clear local peak near the frame-head estimate, position the onset
+    // (or re-articulation split) at that peak instead.
+    let refine_onset = |note_idx: usize, estimate: usize| -> usize {
+        let mut best_frame = estimate;
+        let mut best_prob = onset_at(note_idx, estimate);
+        let lo = estimate.saturating_sub(4);
+        let hi = (estimate + 4).min(timeline.len().saturating_sub(1));
+        for k in lo..=hi {
+            let p = onset_at(note_idx, k);
+            if p > best_prob {
+                best_prob = p;
+                best_frame = k;
+            }
+        }
+        if best_prob >= 0.30 {
+            best_frame
+        } else {
+            estimate
+        }
     };
 
     for note_idx in 0..note_count {
@@ -787,15 +833,18 @@ fn extract_notes_from_timeline(
                         k -= 1;
                         p_k = p_prev;
                     }
+                    onset = refine_onset(note_idx, onset);
                     run_start = Some(onset);
                     max_prob = prob;
                 } else {
                     max_prob = max_prob.max(prob);
                     // Re-articulation: the onset head fired on a sounding
-                    // note (staccato repeat) — split here.
+                    // note (staccato repeat) — split at the onset-head peak.
                     if onset_at(note_idx, frame_idx) >= onset_split_threshold {
+                        let split_frame = refine_onset(note_idx, frame_idx)
+                            .max(run_start.unwrap().saturating_add(1));
                         let start_time = run_start.unwrap() as f32 * step_sec;
-                        let mut end_time = frame_idx as f32 * step_sec;
+                        let mut end_time = split_frame as f32 * step_sec;
                         if end_time <= start_time {
                             end_time = start_time + step_sec;
                         }
@@ -809,7 +858,7 @@ fn extract_notes_from_timeline(
                             channel: None,
                         });
                         *next_id = next_id.saturating_add(1);
-                        run_start = Some(frame_idx);
+                        run_start = Some(split_frame);
                         max_prob = prob;
                     }
                 }

@@ -67,7 +67,7 @@ impl Objective {
         }
     }
 
-    fn score(&self, melody: f32, pitch: f32, root: f32, bar: f32, quality: f32) -> f32 {
+    pub fn score(&self, melody: f32, pitch: f32, root: f32, bar: f32, quality: f32) -> f32 {
         match self {
             // The timing-weighted melody_sim is compressed near zero by the
             // rhythm gap, so the reliable pitch_accuracy gets a direct vote
@@ -92,6 +92,13 @@ fn f1(precision: f32, recall: f32) -> f32 {
     } else {
         0.0
     }
+}
+
+/// Melody similarity: note values (pitch+onset F1 with coverage) plus onset
+/// and duration timing accuracy. Timing credits scale WITH note F1 — a few
+/// stray matches can't inflate the score via perfect timing.
+pub fn melody_similarity_public(note_report: &crate::sheet_compare::CompareReport) -> f32 {
+    melody_similarity(note_report)
 }
 
 /// Melody similarity: note values (pitch+onset F1 with coverage) plus onset
@@ -592,6 +599,7 @@ pub fn tune(dir: &Path, cfg: &TuneConfig) -> Result<TuneReport> {
         melody_stems: best.stems,
         melody_quantizer: "learned".to_string(),
         bpm: best.bpm,
+        rhythm_coarsen: true,
     };
 
     Ok(TuneReport {

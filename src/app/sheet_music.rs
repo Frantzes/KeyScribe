@@ -1361,107 +1361,11 @@ impl KeyScribeApp {
         threshold: f32,
         next_id: &mut u32,
     ) -> Vec<NoteEvent> {
-        if timeline.is_empty() || step_sec <= 0.0 {
-            return Vec::new();
-        }
-
-        let note_count = (PIANO_HIGH_MIDI - PIANO_LOW_MIDI + 1) as usize;
-        let mut out = Vec::new();
-        let min_duration_sec = (step_sec * MIN_SHEET_NOTE_FRAMES as f32).max(0.05);
-        // Adaptive release: a note ends when its probability falls below this
-        // fraction of its own peak (or the absolute floor). A fixed threshold
-        // keeps staccato re-articulations merged into one long note.
-        let release_ratio = 0.55f32;
-        let release_floor = 0.05f32;
-        // Attack look-back: search back up to this many frames for the low
-        // point where the probability began its rise, and start the note there
-        // instead of at the threshold crossing (which lags the true onset).
-        let attack_lookback = 5usize;
-
-        let prob_at = |note_idx: usize, frame_idx: usize| -> f32 {
-            timeline
-                .get(frame_idx)
-                .and_then(|f| f.get(note_idx))
-                .copied()
-                .unwrap_or(0.0)
-                .clamp(0.0, 1.0)
-        };
-
-        for note_idx in 0..note_count {
-            let mut run_start: Option<usize> = None;
-            let mut max_prob: f32 = 0.0;
-
-            for frame_idx in 0..timeline.len() {
-                let prob = prob_at(note_idx, frame_idx);
-                let active = prob >= threshold;
-
-                if active {
-                    if run_start.is_none() {
-                        let mut onset = frame_idx;
-                        let mut k = frame_idx;
-                        let mut p_k = prob;
-                        while k > 0 && frame_idx - k < attack_lookback {
-                            let p_prev = prob_at(note_idx, k - 1);
-                            if p_prev < release_floor && p_k > p_prev {
-                                onset = k - 1;
-                                break;
-                            }
-                            if p_prev >= p_k {
-                                break;
-                            }
-                            k -= 1;
-                            p_k = p_prev;
-                        }
-                        run_start = Some(onset);
-                        max_prob = prob;
-                    } else {
-                        max_prob = max_prob.max(prob);
-                    }
-                } else if let Some(start_idx) = run_start {
-                    let release_thr = (max_prob * release_ratio).max(release_floor);
-                    if prob < release_thr {
-                        let start_time = start_idx as f32 * step_sec;
-                        let mut end_time = frame_idx as f32 * step_sec;
-                        if end_time <= start_time {
-                            end_time = start_time + step_sec;
-                        }
-                        let velocity = (max_prob * 127.0).round().clamp(1.0, 127.0) as u8;
-                        out.push(NoteEvent {
-                            id: *next_id,
-                            pitch: (PIANO_LOW_MIDI as usize + note_idx) as u8,
-                            start_time,
-                            end_time,
-                            velocity,
-                            channel: None,
-                        });
-                        *next_id = next_id.saturating_add(1);
-                        run_start = None;
-                        max_prob = 0.0;
-                    }
-                }
-            }
-
-            if let Some(start_idx) = run_start {
-                let start_time = start_idx as f32 * step_sec;
-                let end_time = timeline.len() as f32 * step_sec;
-                let end_time = end_time.max(start_time + step_sec);
-                let velocity = (max_prob * 127.0).round().clamp(1.0, 127.0) as u8;
-                out.push(NoteEvent {
-                    id: *next_id,
-                    pitch: (PIANO_LOW_MIDI as usize + note_idx) as u8,
-                    start_time,
-                    end_time,
-                    velocity,
-                    channel: None,
-                });
-                *next_id = next_id.saturating_add(1);
-            }
-        }
-
-        // Merge only single-frame jitter so genuine re-articulations survive.
-        merge_adjacent_notes_with_gap(&mut out, step_sec);
-        out.retain(|n| n.end_time - n.start_time >= min_duration_sec);
-        out
+        // Delegate to the unified CLI extractor (headless.rs) so both paths
+        // stay identical. The GUI has no onset-head timeline here, so the
+        // onset-head split/refinement simply no-ops (the closure returns the
+        // frame-head estimate when the onset timeline is absent).
+        crate::headless::extract_notes_from_timeline(timeline, None, step_sec, threshold, next_id)
     }
 
     fn extract_note_events_from_timeline(&self, threshold: f32) -> Vec<NoteEvent> {

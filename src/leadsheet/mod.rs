@@ -37,11 +37,11 @@ pub use preset::{
     LeadSheetPresetConfig,
 };
 pub use quantize::{
-    detect_articulation, detect_grace_notes, detect_swing, learned_note_features,
+    coarsen_rhythm, detect_articulation, detect_grace_notes, detect_swing, learned_note_features,
     quantize_aligned_notes, quantize_aligned_notes_learned, quantize_notes,
     quantize_notes_with_rhythm_map, quantize_notes_with_tempo_map, quantize_notes_with_ties,
     resolve_quantizer_model_path, QuantizationConfig, QuantizerEngine, QuantizerToken,
-    SwingDetectionConfig, TiedNote, LEARNED_TOKEN_TABLE,
+    RhythmCoarsenConfig, SwingDetectionConfig, TiedNote, LEARNED_TOKEN_TABLE,
 };
 pub use tempo_map::{
     beat_at_time, detect_tempo_map, detect_time_signature_segments, tempo_map_from_beats,

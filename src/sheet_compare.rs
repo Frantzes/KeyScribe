@@ -506,7 +506,55 @@ pub fn compare_note_lists(
     }
 }
 
-/// Parse the first time signature's beats-per-bar from a MusicXML string.
+#[cfg(test)]
+mod a1_diag {
+    use super::*;
+    use std::path::Path;
+
+    fn per_bar_matches(refn: &[MidiNote], trans: &[MidiNote], tol: f32) -> Vec<(u32, usize, f32)> {
+        let mut out = Vec::new();
+        for bar in 0..100 {
+            let r: Vec<&MidiNote> = refn.iter().filter(|n| (n.onset_beats / 4.0).floor() as u32 == bar).collect();
+            let t: Vec<&MidiNote> = trans.iter().filter(|n| (n.onset_beats / 4.0).floor() as u32 == bar).collect();
+            if r.is_empty() && t.is_empty() { continue; }
+            let rep = compare_note_lists(
+                &r.iter().map(|n| (**n).clone()).collect::<Vec<_>>(),
+                &t.iter().map(|n| (**n).clone()).collect::<Vec<_>>(),
+                tol,
+            );
+            out.push((bar, rep.transcription_note_count, rep.note_accuracy * rep.transcription_note_count as f32));
+        }
+        out
+    }
+
+    #[test]
+    #[ignore]
+    fn diag() {
+        let refn = load_notes(Path::new("out/omnibook/Confirmation.musicxml")).unwrap();
+        let no = load_notes(Path::new("C:/Users/Fran/AppData/Local/Temp/opencode/conf_no_a1.musicxml")).unwrap();
+        let co = load_notes(Path::new("C:/Users/Fran/AppData/Local/Temp/opencode/conf_a1c.musicxml")).unwrap();
+        eprintln!("DIAG ref={} no={} co={}", refn.len(), no.len(), co.len());
+        for bar in [0u32, 1, 7, 30, 31, 35] {
+            let r: Vec<MidiNote> = refn.iter().filter(|n| (n.onset_beats / 4.0).floor() as u32 == bar).cloned().collect();
+            let n: Vec<MidiNote> = no.iter().filter(|n| (n.onset_beats / 4.0).floor() as u32 == bar).cloned().collect();
+            let c: Vec<MidiNote> = co.iter().filter(|n| (n.onset_beats / 4.0).floor() as u32 == bar).cloned().collect();
+            eprintln!("DIAG bar{} REF: {:?}", bar, r.iter().map(|n| format!("{}({:.2}/{:.2})", n.pitch, n.onset_beats, n.dur_beats)).collect::<Vec<_>>().join(" "));
+            eprintln!("DIAG bar{} NO : {:?}", bar, n.iter().map(|n| format!("{}({:.2}/{:.2})", n.pitch, n.onset_beats, n.dur_beats)).collect::<Vec<_>>().join(" "));
+            eprintln!("DIAG bar{} CO : {:?}", bar, c.iter().map(|n| format!("{}({:.2}/{:.2})", n.pitch, n.onset_beats, n.dur_beats)).collect::<Vec<_>>().join(" "));
+        }
+        let pn = per_bar_matches(&refn, &no, 0.25);
+        let pc = per_bar_matches(&refn, &co, 0.25);
+        for (bar, cnt_n, m_n) in &pn {
+            let m_c = pc.iter().find(|(b, _, _)| b == bar).map(|(_, _, m)| *m).unwrap_or(0.0);
+            let cnt_c = pc.iter().find(|(b, c, _)| b == bar).map(|(_, c, _)| *c).unwrap_or(0);
+            let delta = m_c as i32 - *m_n as i32;
+            if *cnt_n > 0 && delta != 0 {
+                eprintln!("DIAG bar {} no={}matches({}) co={}matches({}) delta={}",
+                    bar, cnt_n, m_n, cnt_c, m_c, delta);
+            }
+        }
+    }
+}
 pub fn parse_beats_per_bar(xml: &str) -> anyhow::Result<u32> {
     let doc = parse_doc(xml)?;
     let beats = doc

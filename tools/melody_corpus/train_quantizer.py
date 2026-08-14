@@ -63,7 +63,10 @@ def parse_score(path: Path) -> tuple[np.ndarray, np.ndarray, float, int]:
                 octave = int(pitch.findtext("octave", "4"))
                 pcs = {"C": 0, "D": 2, "E": 4, "F": 5, "G": 7, "A": 9, "B": 11}
                 midi = (octave + 1) * 12 + pcs[step] + alter
-                rows.append((onset, duration, midi, len(rows) % beats_per_bar))
+                # beat_within_bar derived from the real onset so it matches the
+                # Rust featurizer (`learned_note_features`: beat_index % bpb).
+                beat_in_bar = int(onset) % beats_per_bar
+                rows.append((onset, duration, midi, beat_in_bar))
 
     rows.sort(key=lambda row: row[0])
     starts = np.asarray([row[0] for row in rows], dtype=np.float32)
@@ -125,22 +128,42 @@ def main() -> None:
     parser.add_argument("--output", type=Path, default=Path("models/melody_quantizer.onnx"))
     parser.add_argument("--epochs", type=int, default=20)
     parser.add_argument("--repeats", type=int, default=8)
+    parser.add_argument(
+        "--holdout",
+        type=str,
+        default="",
+        help="comma-separated track stems to EXCLUDE from training (e.g. "
+        "Confirmation,Ornithology,Donna_Lee). Their examples are reported as a "
+        "holdout accuracy on the final epoch and never seen by the model.",
+    )
     args = parser.parse_args()
 
     random.seed(1234)
     np.random.seed(1234)
     torch.manual_seed(1234)
 
+    holdout_stems = {s.strip() for s in args.holdout.split(",") if s.strip()}
+
     all_x: list[np.ndarray] = []
     all_y: list[np.ndarray] = []
+    holdout_x: list[np.ndarray] = []
+    holdout_y: list[np.ndarray] = []
     files = sorted(args.corpus.glob("*.xml"))
     if not files:
         raise SystemExit(f"no MusicXML files found in {args.corpus}")
     for path in files:
+        stem = path.stem
         rows, _, tempo, beats_per_bar = parse_score(path)
         x, y = make_examples(rows, tempo, beats_per_bar, args.repeats)
-        all_x.append(x)
-        all_y.append(y)
+        if stem in holdout_stems:
+            holdout_x.append(x)
+            holdout_y.append(y)
+        else:
+            all_x.append(x)
+            all_y.append(y)
+
+    if not all_x:
+        raise SystemExit("no training files left after holdout")
 
     x = torch.from_numpy(np.concatenate(all_x))
     y = torch.from_numpy(np.concatenate(all_y))
@@ -148,15 +171,32 @@ def main() -> None:
     counts = torch.bincount(y, minlength=12).float().clamp_min(1.0)
     weights = (counts.sum() / counts).sqrt()
     optimizer = torch.optim.AdamW(model.parameters(), lr=2e-3, weight_decay=1e-4)
+    holdout_ok = len(holdout_x) > 0
+    if holdout_ok:
+        hx = torch.from_numpy(np.concatenate(holdout_x))
+        hy = torch.from_numpy(np.concatenate(holdout_y))
+        print(
+            f"training on {len(y)} examples from {len(all_x)} tracks; "
+            f"holdout {len(hy)} examples from {len(holdout_x)} tracks: "
+            f"{sorted(holdout_stems)}"
+        )
+    else:
+        print(f"training on {len(y)} examples from {len(all_x)} tracks (no holdout)")
     for epoch in range(args.epochs):
         optimizer.zero_grad()
         logits = model(x)
         loss = nn.functional.cross_entropy(logits, y, weight=weights)
         loss.backward()
         optimizer.step()
-        if epoch == 0 or (epoch + 1) % 5 == 0:
+        if epoch == 0 or (epoch + 1) % 5 == 0 or epoch == args.epochs - 1:
             accuracy = (logits.argmax(dim=1) == y).float().mean().item()
-            print(f"epoch={epoch + 1} loss={loss.item():.4f} accuracy={accuracy:.4f}")
+            line = f"epoch={epoch + 1} loss={loss.item():.4f} accuracy={accuracy:.4f}"
+            if holdout_ok:
+                with torch.no_grad():
+                    hlogits = model(hx)
+                hacc = (hlogits.argmax(dim=1) == hy).float().mean().item()
+                line += f" holdout_accuracy={hacc:.4f}"
+            print(line)
 
     args.output.parent.mkdir(parents=True, exist_ok=True)
     example = torch.zeros((1, 4, 9), dtype=torch.float32)

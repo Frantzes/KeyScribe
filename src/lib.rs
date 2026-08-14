@@ -5,6 +5,7 @@ pub mod core;
 pub mod cqt;
 pub mod demucs;
 pub mod dsp;
+pub mod eval_corpus;
 pub mod headless;
 pub mod inference;
 pub mod leadsheet;

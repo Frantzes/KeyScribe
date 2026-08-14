@@ -81,6 +81,10 @@ mod cli_impl {
             /// resolver next to the executable / in the working directory).
             #[arg(long)]
             quantizer_model: Option<PathBuf>,
+            /// Disable the post-quantization rhythm merge & coarsening pass
+            /// (Tier A1). Coarsening is on by default.
+            #[arg(long)]
+            no_rhythm_coarsen: bool,
             /// Beat offset within the bar (0.0 = downbeat) at which to sample
             /// notes for the primary chord. Negative (default) uses the legacy
             /// max-simultaneous-notes scan.
@@ -246,6 +250,46 @@ mod cli_impl {
             #[arg(long, default_value_t = 0.65)]
             blend: f32,
         },
+        /// Batch evaluation harness: run the full pipeline + compare over every
+        /// (audio, reference.musicxml) pair in a directory and print an
+        /// aggregated dashboard (plus optional JSON report).
+        EvalCorpus {
+            /// Directory containing (audio, reference.musicxml) pairs.
+            #[arg(short, long)]
+            input: PathBuf,
+            /// Write the aggregate report here as JSON.
+            #[arg(short, long)]
+            output: Option<PathBuf>,
+            /// Per-track BPM override file: a JSON object {"Track": bpm, ...}
+            /// or one `<track> <bpm>` per line. Makes runs reproducible when
+            /// the ML beat tracker misfires on a track's meter.
+            #[arg(long)]
+            bpm_file: Option<PathBuf>,
+            /// Key color sensitivity (0.0-1.0).
+            #[arg(long)]
+            key_sensitivity: Option<f32>,
+            /// Melody reduction mode: poly, skyline, heuristic.
+            #[arg(long, value_enum)]
+            melody: Option<MelodyArg>,
+            /// Rhythm-quantization engine: legacy | learned.
+            #[arg(long)]
+            quantizer: Option<String>,
+            /// Explicit path to melody_quantizer.onnx.
+            #[arg(long)]
+            quantizer_model: Option<PathBuf>,
+            /// Separate into stems (requires models/htdemucs_6s.onnx).
+            #[arg(long, num_args = 0..=1, default_missing_value = "true")]
+            stems: Option<bool>,
+            /// Chord onset tolerance in beats.
+            #[arg(long, default_value_t = 0.5)]
+            tolerance: f32,
+            /// Directory containing basic-pitch.onnx.
+            #[arg(long)]
+            model_dir: Option<PathBuf>,
+            /// Objective to score the aggregate: melody, root, chord, balanced.
+            #[arg(long, default_value = "balanced")]
+            objective: String,
+        },
     }
 
     #[derive(Clone, Copy, clap::ValueEnum)]
@@ -302,6 +346,7 @@ mod cli_impl {
                 no_stems_melody,
                 quantizer,
                 quantizer_model,
+                no_rhythm_coarsen,
                 config,
                 render,
                 transition_matrix,
@@ -346,6 +391,7 @@ mod cli_impl {
                     chord_sample_strike: chord_strike,
                     quantizer: quantizer_engine,
                     quantizer_model_path: quantizer_model,
+                    rhythm_coarsen: !no_rhythm_coarsen,
                 };
                 let t_opts = TranscribeOptions {
                     threshold: headless::key_sensitivity_to_threshold(key_sensitivity),
@@ -642,6 +688,51 @@ mod cli_impl {
                     lt.alpha,
                     lt.blend_w
                 );
+            }
+            Command::EvalCorpus {
+                input,
+                output,
+                bpm_file,
+                key_sensitivity,
+                melody,
+                quantizer,
+                quantizer_model,
+                stems,
+                tolerance,
+                model_dir,
+                objective,
+            } => {
+                use keyscribe_lib::eval_corpus::{self, EvalCorpusConfig};
+                use keyscribe_lib::tune::Objective;
+
+                let objective = Objective::parse(&objective)?;
+                let bpm_overrides = bpm_file
+                    .as_deref()
+                    .map(eval_corpus::parse_bpm_overrides)
+                    .transpose()?
+                    .unwrap_or_default();
+                let cfg = EvalCorpusConfig {
+                    objective,
+                    key_sensitivity: key_sensitivity.unwrap_or(0.23),
+                    melody: melody.map(Into::into).unwrap_or(MelodyArg::Heuristic.into()),
+                    quantizer: match quantizer {
+                        Some(q) => keyscribe_lib::leadsheet::QuantizerEngine::parse(&q)
+                            .ok_or_else(|| anyhow::anyhow!("unknown --quantizer '{q}' (expected legacy|learned)"))?,
+                        None => keyscribe_lib::leadsheet::QuantizerEngine::default(),
+                    },
+                    quantizer_model_path: quantizer_model,
+                    use_stems: stems.unwrap_or(false),
+                    onset_tolerance_beats: tolerance,
+                    note_tolerance_beats: tolerance,
+                    bpm_overrides,
+                    model_dir,
+                };
+                let report = eval_corpus::eval_corpus(&input, &cfg)?;
+                eval_corpus::print_report(&report);
+                if let Some(out) = output {
+                    eval_corpus::write_report(&out, &report)?;
+                    println!("\nwrote {}", out.display());
+                }
             }
         }
         Ok(())

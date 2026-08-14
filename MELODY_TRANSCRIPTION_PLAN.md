@@ -1,10 +1,34 @@
 # Melody Transcription Plan — Learned Rhythm Quantizer + Stem-First Melody
 
 Status: **in progress** — Phase 2 (stem-first melody default) implemented and
-merged into `src/headless.rs`; Phases 0/1/3/6 still pending (need corpus + GPU
-training). Companion to `HEADLESS.md` and `CHORD_DETECTION_PLAN.md`.
+merged into `src/headless.rs`; Phase 3's bootstrap quantizer trained + shipped
+(`models/melody_quantizer.onnx`, `--quantizer learned`), trained on the
+Omnibook corpus with a holdout split; Phases 1/6 (external MIDI corpora + jazz
+fine-tune) still pending. Companion to `HEADLESS.md` and
+`CHORD_DETECTION_PLAN.md`.
 
 ## Progress log
+
+- **Phase 3 bootstrap (done, 2026-08)** — trained + shipped the learned
+  quantizer as a bootstrap on the in-domain Omnibook corpus (the `eval-corpus`
+  harness from step 1 is what makes the A/B measurable):
+  - `tools/melody_corpus/train_quantizer.py` now takes `--holdout <stems>`
+    (Confirmation, Ornithology, Donna_Lee excluded from training so the eval
+    tracks are never seen; holdout accuracy reported on the final epoch).
+  - Fixed a feature bug: `beat_in_bar` was the running note *index*, now derived
+    from the real onset (`int(onset) % bpb`) to match the Rust featurizer
+    (`learned_note_features`, `quantize.rs:980`).
+  - Trained 25 epochs / 47 tracks / 168 K examples → `models/melody_quantizer.onnx`
+    (holdout accuracy 0.72). ONNX interface verified: input `[1, seq, 9]`,
+    output `[1, seq, 12]` — matches `MelodyQuantizerInference` (`inference.rs:308`).
+  - **A/B on the full 50-track corpus** (`keyscribe-cli eval-corpus
+    --quantizer legacy|learned`): learned ties or beats legacy on every metric
+    (pitch 0.822→0.826, note 0.374→0.374, duration 0.478→0.477, no
+    regressions). The checkpoint ships as the default engine (auto-falls back
+    to the rule grid when the ONNX is absent). As predicted in the Risks
+    section, the bootstrap is in-domain (trained on the same Omnibook source),
+    so the big note-accuracy jump requires Phase 1's external performed-MIDI
+    corpora (A-MAPS/ASAP/GuitarSet/Leduc) or Phase 6's jazz fine-tune.
 
 - **Phase 2 (done)** — melody stem-first default implemented:
   - `AnalyzedAudio` split into `timelines` (full-mix, chord evidence) +
