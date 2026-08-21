@@ -175,6 +175,44 @@ pub struct CrossValidatedBeats {
 
 const RHYTHM_PHASE_TARGETS: [f32; 6] = [0.0, 1.0 / 6.0, 1.0 / 3.0, 0.5, 2.0 / 3.0, 5.0 / 6.0];
 
+/// Score how well a candidate beat grid aligns the melody onsets to the rhythm
+/// vocabulary, weighted toward strong beats. Onbeat (0.0) and half-beat (0.5)
+/// positions are far more common in real music than passing 16ths/triplets, so
+/// a grid that displaces strong-beat notes must cost more than one that only
+/// misplaces subdivisions.
+pub(crate) fn score_phase_alignment(
+    notes: &[NoteEvent],
+    beats: &[f32],
+    downbeats: &[f32],
+) -> f32 {
+    let aligned = associate_note_events(notes, beats, downbeats);
+    if aligned.is_empty() {
+        return f32::INFINITY;
+    }
+    let total: f32 = aligned
+        .iter()
+        .map(|n| {
+            let (min_dist, closest) = RHYTHM_PHASE_TARGETS
+                .iter()
+                .map(|target| ((n.intra_beat_pos - target).abs(), *target))
+                .fold((f32::INFINITY, 0.0f32), |a, b| if b.0 < a.0 { b } else { a });
+            // Strong-beat weighting: onbeat and half-beat positions are much
+            // more common in real music — a grid that aligns them correctly
+            // should score much better than one that only aligns passing
+            // subdivisions.
+            let weight = if closest.abs() < 0.01 {
+                3.0 // onbeat (beat 1, 2, 3, 4)
+            } else if (closest - 0.5).abs() < 0.01 {
+                2.0 // offbeat 8th ("and")
+            } else {
+                1.0 // subdivisions (16ths, triplets)
+            };
+            weight * min_dist
+        })
+        .sum();
+    total / aligned.len() as f32
+}
+
 /// Refine a tracker grid's metric and phase using detected melody onsets.
 /// BeatThis can return a musically plausible half-time grid, or place its first
 /// beat a fraction late/early. Testing the base and doubled metric at a small
@@ -195,21 +233,8 @@ pub fn refine_beat_phase(notes: &[NoteEvent], base: &CrossValidatedBeats) -> Cro
     intervals.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
     let period = intervals[intervals.len() / 2];
 
-    let score = |beats: &[f32], downbeats: &[f32]| -> f32 {
-        let aligned = associate_note_events(notes, &beats, &downbeats);
-        if aligned.is_empty() {
-            return f32::INFINITY;
-        }
-        let total: f32 = aligned
-            .iter()
-            .map(|n| {
-                RHYTHM_PHASE_TARGETS
-                    .iter()
-                    .map(|target| (n.intra_beat_pos - target).abs())
-                    .fold(f32::INFINITY, f32::min)
-            })
-            .sum();
-        total / aligned.len() as f32
+let score = |beats: &[f32], downbeats: &[f32]| -> f32 {
+        score_phase_alignment(notes, beats, downbeats)
     };
 
     let doubled_beats = || {
@@ -299,30 +324,81 @@ pub fn refine_beat_phase(notes: &[NoteEvent], base: &CrossValidatedBeats) -> Cro
         }
     }
 
-    let mut best_score = score(&base.beats, &base.downbeats);
+let mut best_score = score(&base.beats, &base.downbeats);
     let mut best_beats = base.beats.clone();
     let mut best_downbeats = base.downbeats.clone();
     let mut best_bpb = base.beats_per_bar;
     let mut best_bpm = base.bpm;
+    let mut best_period = period;
     let mut best_shift = 0.0f32;
     let mut best_doubled = false;
     let mut changed = false;
+    let mut candidates: Vec<(f32, f32, bool)> = Vec::new(); // (score, shift, doubled)
 
     for source in sources {
         let candidate_period = source.period;
-        for shift in [-0.25 * candidate_period, 0.0, 0.25 * candidate_period] {
+        // 16 candidates: -0.5 to +0.4375 in steps of 1/16 of the period.
+        // At 208 BPM this is 18 ms resolution — smaller than onset detection
+        // noise (~30 ms) — so the optimal phase is always reachable.
+        let n_steps = 16i32;
+        for step in (-n_steps / 2)..=(n_steps / 2 - 1) {
+            let shift = step as f32 / n_steps as f32 * candidate_period;
             let beats: Vec<f32> = source.beats.iter().map(|t| *t + shift).collect();
             let downbeats: Vec<f32> = source.downbeats.iter().map(|t| *t + shift).collect();
             let candidate_score = score(&beats, &downbeats);
-            if candidate_score + 0.01 < best_score {
+            candidates.push((candidate_score, shift, source.doubled));
+            // Accept a candidate only when it is meaningfully better (the +0.01
+            // stability threshold), or when it ties the current winner and is
+            // closer to the source's natural grid — a tie-break that keeps an
+            // equally-good grid from flipping to an arbitrary phase-shifted one.
+            let is_better = candidate_score + 0.01 < best_score;
+            // Ties resolve by closeness to the base grid: prefer the period
+            // nearest the tracker's own period (the base grid is the most
+            // likely), then the non-doubled metric level, then the smallest
+            // phase shift. This keeps an equally-good 16th or 8th grid from
+            // displacing a musically-plausible quarter grid.
+            let is_tie_preferred = candidate_score <= best_score + 1e-6
+                && {
+                    let cand_dist = (candidate_period - period).abs();
+                    let best_dist = (best_period - period).abs();
+                    if cand_dist + 1e-6 < best_dist {
+                        true
+                    } else if cand_dist > best_dist + 1e-6 {
+                        false
+                    } else if best_doubled != source.doubled {
+                        !source.doubled // prefer the non-doubled metric level on ties
+                    } else {
+                        shift.abs() < best_shift.abs()
+                    }
+                };
+            if is_better || is_tie_preferred {
                 best_score = candidate_score;
                 best_beats = beats;
                 best_downbeats = downbeats;
                 best_bpb = source.beats_per_bar;
                 best_bpm = source.bpm;
+                best_period = candidate_period;
                 best_shift = shift;
                 best_doubled = source.doubled;
                 changed = true;
+            }
+        }
+    }
+
+    // Local gradient refinement: test ±period/32 in 4 sub-steps around the
+    // winning shift to find the precise optimum. At 208 BPM, period/32 ≈ 9ms.
+    if changed {
+        let fine_step = period / 32.0;
+        for sub in [-2.0, -1.0, 1.0, 2.0] {
+            let fine_shift = sub * fine_step;
+            let fine_beats: Vec<f32> = best_beats.iter().map(|t| *t + fine_shift).collect();
+            let fine_downbeats: Vec<f32> = best_downbeats.iter().map(|t| *t + fine_shift).collect();
+            let fine_score = score(&fine_beats, &fine_downbeats);
+            if fine_score + 0.005 < best_score {
+                best_score = fine_score;
+                best_beats = fine_beats;
+                best_downbeats = fine_downbeats;
+                best_shift += fine_shift;
             }
         }
     }
@@ -336,12 +412,379 @@ pub fn refine_beat_phase(notes: &[NoteEvent], base: &CrossValidatedBeats) -> Cro
     refined.downbeats = best_downbeats;
     refined.beats_per_bar = best_bpb;
     refined.bpm = best_bpm;
-    if std::env::var_os("KEYSCRIBE_BEAT_PHASE_DEBUG").is_some() {
+    if std::env::var_os("KEYSCRIBE_PHASE_DEBUG").is_some() {
+        eprintln!(
+            "[phase] candidates={} best_score={best_score:.4} shift_ms={:.1} doubled={best_doubled}",
+            candidates.len(),
+            best_shift * 1000.0
+        );
+        let mut ranked: Vec<(f32, f32, bool)> = candidates.clone();
+        ranked.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
+        for (rank, (sc, sh, db)) in ranked.iter().take(3).enumerate() {
+            eprintln!(
+                "[phase] top{} score={sc:.4} shift_ms={:.1} doubled={db}",
+                rank + 1,
+                sh * 1000.0
+            );
+        }
+    }
+if std::env::var_os("KEYSCRIBE_BEAT_PHASE_DEBUG").is_some() {
         eprintln!(
             "[beats] grid refinement doubled={best_doubled} shift={best_shift:.4}s period={period:.4}s score={best_score:.4} bpb={best_bpb}"
         );
     }
-    refined
+    recalibrate_beat_grid_elastic(notes, &refined)
+}
+
+/// Refine a fixed-BPM synthetic beat grid's phase (offset) using note onsets.
+/// Keeps the tempo (BPM) and beats-per-bar fixed, and only searches for the
+/// optimal phase shift in `[-0.5*period, +0.5*period]`.
+pub fn refine_beat_phase_fixed_bpm(
+    notes: &[NoteEvent],
+    base: &CrossValidatedBeats,
+) -> CrossValidatedBeats {
+    if notes.is_empty() || base.beats.len() < 2 {
+        return base.clone();
+    }
+    let period = 60.0 / base.bpm.clamp(30.0, 400.0);
+    let score = |beats: &[f32], downbeats: &[f32]| -> f32 {
+        score_phase_alignment(notes, beats, downbeats)
+    };
+
+    let mut best_score = score(&base.beats, &base.downbeats);
+    let mut best_beats = base.beats.clone();
+    let mut best_downbeats = base.downbeats.clone();
+    let mut best_shift = 0.0f32;
+    let mut changed = false;
+
+    let n_steps = 16i32;
+    for step in (-n_steps / 2)..=(n_steps / 2 - 1) {
+        let shift = step as f32 / n_steps as f32 * period;
+        let beats: Vec<f32> = base.beats.iter().map(|t| *t + shift).collect();
+        let downbeats: Vec<f32> = base.downbeats.iter().map(|t| *t + shift).collect();
+        let candidate_score = score(&beats, &downbeats);
+        if std::env::var_os("KEYSCRIBE_PHASE_DEBUG").is_some() {
+            eprintln!(
+                "[phase-fixed] step={step} shift_ms={:.1} score={candidate_score:.4} vs best={best_score:.4}",
+                shift * 1000.0
+            );
+        }
+        if candidate_score + 0.002 < best_score {
+            best_score = candidate_score;
+            best_beats = beats;
+            best_downbeats = downbeats;
+            best_shift = shift;
+            changed = true;
+        }
+    }
+
+    // Local gradient refinement: test ±period/32 around the winning shift
+    if changed {
+        let fine_step = period / 32.0;
+        for sub in [-2.0, -1.0, 1.0, 2.0] {
+            let fine_shift = sub * fine_step;
+            let fine_beats: Vec<f32> = best_beats.iter().map(|t| *t + fine_shift).collect();
+            let fine_downbeats: Vec<f32> = best_downbeats.iter().map(|t| *t + fine_shift).collect();
+            let fine_score = score(&fine_beats, &fine_downbeats);
+            if fine_score + 0.002 < best_score {
+                best_score = fine_score;
+                best_beats = fine_beats;
+                best_downbeats = fine_downbeats;
+                best_shift += fine_shift;
+            }
+        }
+    }
+
+    let mut refined = if changed {
+        let mut r = base.clone();
+        r.beats = best_beats;
+        r.downbeats = best_downbeats;
+        if std::env::var_os("KEYSCRIBE_PHASE_DEBUG").is_some() {
+            eprintln!(
+                "[phase-fixed] best_score={best_score:.4} shift_ms={:.1}",
+                best_shift * 1000.0
+            );
+        }
+        r
+    } else {
+        base.clone()
+    };
+
+    recalibrate_beat_grid_elastic(notes, &refined)
+}
+
+/// Dynamically recalibrate beat positions across measures using an inertial
+/// elastic grid. Real performances (and rendered audio) can experience micro-drift
+/// or expressive timing variations across dozens of measures. This tracks a
+/// measure-by-measure bounded phase adjustment with momentum smoothing,
+/// preserving continuous monotonic beat spacing.
+pub fn recalibrate_beat_grid_elastic(
+    notes: &[NoteEvent],
+    base: &CrossValidatedBeats,
+) -> CrossValidatedBeats {
+    if notes.is_empty() || base.beats.len() < 4 {
+        return base.clone();
+    }
+
+    let bpb = base.beats_per_bar.max(2) as usize;
+    let n_beats = base.beats.len();
+    let n_measures = (n_beats + bpb - 1) / bpb;
+    if n_measures < 2 {
+        return base.clone();
+    }
+
+    let base_score = score_phase_alignment(notes, &base.beats, &base.downbeats);
+    if !base_score.is_finite() {
+        return base.clone();
+    }
+
+    let mut intervals: Vec<f32> = base
+        .beats
+        .windows(2)
+        .map(|w| w[1] - w[0])
+        .filter(|d| d.is_finite() && *d > 0.001)
+        .collect();
+    if intervals.is_empty() {
+        return base.clone();
+    }
+    intervals.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let period = intervals[intervals.len() / 2];
+
+    // Max local shift per measure: ±15% of a beat (~25-45ms)
+    let max_shift = 0.15 * period;
+    let n_steps = 8i32;
+
+    let mut measure_shifts = vec![0.0f32; n_measures];
+    let mut running_phase = 0.0f32;
+
+    for m in 0..n_measures {
+        let b_start = m * bpb;
+        let b_end = ((m + 1) * bpb).min(n_beats);
+        if b_start >= n_beats {
+            break;
+        }
+
+        let b_ctx_start = b_start.saturating_sub(1);
+        let b_ctx_end = (b_end + 1).min(n_beats);
+        let ctx_beats = &base.beats[b_ctx_start..b_ctx_end];
+        if ctx_beats.len() < 2 {
+            measure_shifts[m] = running_phase;
+            continue;
+        }
+
+        let t_start = ctx_beats.first().copied().unwrap_or(0.0) - 0.05;
+        let t_end = ctx_beats.last().copied().unwrap_or(0.0) + period + 0.05;
+
+        let measure_notes: Vec<NoteEvent> = notes
+            .iter()
+            .filter(|n| n.start_time >= t_start && n.start_time <= t_end)
+            .cloned()
+            .collect();
+
+        if measure_notes.is_empty() {
+            running_phase *= 0.9;
+            measure_shifts[m] = running_phase;
+            continue;
+        }
+
+        let measure_start_beat = base.beats[b_start];
+        let mut best_m_score = f32::INFINITY;
+        let mut best_m_shift = running_phase;
+
+        for step in -n_steps..=n_steps {
+            let shift = (step as f32 / n_steps as f32) * max_shift;
+            let mut m_total_err = 0.0f32;
+            let mut m_weight_sum = 0.0f32;
+
+            for n in &measure_notes {
+                let dt = (n.start_time - (measure_start_beat + shift)) / period;
+                let intra_pos = dt.rem_euclid(1.0);
+                let (min_dist, closest) = RHYTHM_PHASE_TARGETS
+                    .iter()
+                    .map(|target| {
+                        let d = (intra_pos - target).abs().min((intra_pos - (target + 1.0)).abs()).min((intra_pos - (target - 1.0)).abs());
+                        (d, *target)
+                    })
+                    .fold((f32::INFINITY, 0.0f32), |a, b| if b.0 < a.0 { b } else { a });
+                let weight = if closest.abs() < 0.01 {
+                    3.0
+                } else if (closest - 0.5).abs() < 0.01 {
+                    2.0
+                } else {
+                    1.0
+                };
+                m_total_err += weight * min_dist;
+                m_weight_sum += weight;
+            }
+
+            if m_weight_sum > 0.0 {
+                let raw_score = m_total_err / m_weight_sum;
+                let diff = (shift - running_phase) / period;
+                let inertia_cost = 0.20 * diff * diff;
+                let total_m_score = raw_score + inertia_cost;
+                if total_m_score < best_m_score {
+                    best_m_score = total_m_score;
+                    best_m_shift = shift;
+                }
+            }
+        }
+
+        // Momentum update (EMA with alpha = 0.70)
+        running_phase = 0.70 * running_phase + 0.30 * best_m_shift;
+        measure_shifts[m] = running_phase;
+    }
+
+    // Interpolate beat shifts smoothly to prevent discontinuities
+    let mut elastic_beats = Vec::with_capacity(n_beats);
+    for i in 0..n_beats {
+        let m = i / bpb;
+        let j = i % bpb;
+        let u = j as f32 / bpb as f32;
+        let next_m = (m + 1).min(n_measures - 1);
+        let shift = (1.0 - u) * measure_shifts[m] + u * measure_shifts[next_m];
+        elastic_beats.push(base.beats[i] + shift);
+    }
+
+    // Enforce strict monotonicity: each beat interval must be >= 0.5 * period
+    for i in 1..elastic_beats.len() {
+        if elastic_beats[i] < elastic_beats[i - 1] + 0.5 * period {
+            elastic_beats[i] = elastic_beats[i - 1] + 0.5 * period;
+        }
+    }
+
+    // Recompute downbeats from elastic beat positions
+    let mut elastic_downbeats = Vec::new();
+    for i in (0..elastic_beats.len()).step_by(bpb) {
+        elastic_downbeats.push(elastic_beats[i]);
+    }
+
+    let elastic_score = score_phase_alignment(notes, &elastic_beats, &elastic_downbeats);
+    if std::env::var_os("KEYSCRIBE_PHASE_DEBUG").is_some() {
+        eprintln!(
+            "[phase-elastic] base_score={base_score:.4} elastic_score={elastic_score:.4}"
+        );
+    }
+
+    // Only accept if strictly better than base
+    if elastic_score + 0.001 < base_score {
+        let mut refined = base.clone();
+        refined.beats = elastic_beats;
+        refined.downbeats = elastic_downbeats;
+        refined
+    } else {
+        base.clone()
+    }
+}
+
+/// Validate and optionally rotate the downbeat assignment within the bar.
+/// BeatThis can place beat 1 on the wrong beat of the bar (common in jazz
+/// without strong drums on beat 1), shifting every note by 1-3 beats. This
+/// tests 0..beats_per_bar rotations and picks the one where the designated
+/// "beat 1" positions carry the highest aggregate onset energy.
+///
+/// Only applies the rotation if it wins by a clear margin (`min_margin`,
+/// default 0.15 = 15%) to avoid rotating a correct grid on weak evidence.
+pub fn validate_downbeat_rotation(
+    notes: &[NoteEvent],
+    beats: &mut CrossValidatedBeats,
+    min_margin: f32,
+) {
+    let bpb = beats.beats_per_bar.max(2) as usize;
+    if notes.is_empty() || beats.beats.len() < 4 || bpb < 2 {
+        return;
+    }
+
+    // Median beat duration for a tempo-adaptive onset window.
+    let mut intervals: Vec<f32> = beats
+        .beats
+        .windows(2)
+        .map(|w| w[1] - w[0])
+        .filter(|d| d.is_finite() && *d > 0.001)
+        .collect();
+    if intervals.is_empty() {
+        return;
+    }
+    intervals.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let beat_duration = intervals[intervals.len() / 2];
+    let window = 0.15 * beat_duration;
+
+    // Per-beat onset energy profile: sum of note velocities within ±0.15 ×
+    // beat_duration of each beat.
+    let mut onset_energy: Vec<f32> = vec![0.0; beats.beats.len()];
+    for n in notes {
+        if !n.start_time.is_finite() {
+            continue;
+        }
+        for (i, &b) in beats.beats.iter().enumerate() {
+            if (n.start_time - b).abs() <= window {
+                onset_energy[i] += n.velocity as f32 / 127.0;
+            }
+        }
+    }
+
+    // Downbeat strength per rotation r in 0..beats_per_bar: the candidate
+    // downbeats for rotation r are indices r, r+bpb, ... plus a bonus for the
+    // secondary strong beat (beat 3 at r + bpb/2 in 4/4).
+    let mut strength = vec![0.0f32; bpb];
+    for r in 0..bpb {
+        let mut db_sum = 0.0f32;
+        let mut db_count = 0usize;
+        let mut b3_sum = 0.0f32;
+        let mut b3_count = 0usize;
+        let mut idx = r;
+        while idx < onset_energy.len() {
+            db_sum += onset_energy[idx];
+            db_count += 1;
+            let b3 = idx + bpb / 2;
+            if b3 < onset_energy.len() {
+                b3_sum += onset_energy[b3];
+                b3_count += 1;
+            }
+            idx += bpb;
+        }
+        let db_mean = db_sum / db_count.max(1) as f32;
+        let b3_mean = b3_sum / b3_count.max(1) as f32;
+        strength[r] = db_mean + 0.3 * b3_mean;
+    }
+
+    let mut best_r = 0usize;
+    for (r, &s) in strength.iter().enumerate() {
+        if s > strength[best_r] {
+            best_r = r;
+        }
+    }
+
+    if std::env::var_os("KEYSCRIBE_DOWNBEAT_DEBUG").is_some() {
+        eprintln!(
+            "[downbeat] strength={} best_r={} best={:.3} current={:.3} margin={}",
+            strength
+                .iter()
+                .enumerate()
+                .map(|(r, s)| format!("r{r}={s:.3}"))
+                .collect::<Vec<String>>()
+                .join(" "),
+            best_r,
+            strength[best_r],
+            strength[0],
+            min_margin
+        );
+    }
+
+    // Margin check: the rotation must win by at least `min_margin` over the
+    // current grid (r = 0) or we leave a correct grid alone.
+    if best_r == 0 || strength[best_r] < (1.0 + min_margin) * strength[0] {
+        return;
+    }
+
+    // Apply the rotation: drop the first best_r beats (they become anacrusis,
+    // handled by postprocess_downbeats) and re-derive downbeats every bpb-th
+    // beat of the remaining array.
+    beats.beats = beats.beats[best_r..].to_vec();
+    let mut new_downbeats: Vec<f32> = beats.beats.iter().step_by(bpb).copied().collect();
+    if new_downbeats.len() >= 2 {
+        new_downbeats.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        beats.downbeats = new_downbeats;
+    }
 }
 
 /// Run beat-this on up to three audio sources (combined, drums-only, bass-only)
@@ -772,7 +1215,11 @@ fn correct_beat_metric_level(result: &mut BeatTrackResult) {
 
             // If beats-per-bar is implausible (< 2.5 or > 6.0), the metric level is wrong.
             // Try doubling (half-time) or halving (double-time) the beat count.
-            if beats_per_bar < 2.5 && bpm < 70.0 {
+            // beat-this regularly reports half-time on fast music (e.g. 104 BPM
+            // for a 208 BPM bebop head), so the doubling guard must cover the
+            // full range of plausible half-time reports (up to ~130 BPM, i.e.
+            // true 260 BPM — the upper bound of jazz tempos).
+            if beats_per_bar < 2.5 && bpm < 130.0 {
                 // Too few beats detected per measure → likely half-time
                 // Double the number of beats by interpolating midpoints
                 let mut new_beats = Vec::with_capacity(result.beats.len() * 2 - 1);
@@ -793,7 +1240,7 @@ fn correct_beat_metric_level(result: &mut BeatTrackResult) {
         }
     } else {
         // No downbeats: use simple BPM range heuristic
-        if bpm < 50.0 {
+        if bpm < 130.0 {
             // Likely half-time: double the beat count
             let mut new_beats = Vec::with_capacity(result.beats.len() * 2 - 1);
             for w in result.beats.windows(2) {
@@ -813,13 +1260,24 @@ fn correct_beat_metric_level(result: &mut BeatTrackResult) {
 mod tests {
     use super::*;
 
-    fn note(start: f32) -> NoteEvent {
+fn note(start: f32) -> NoteEvent {
         NoteEvent {
             id: 0,
             pitch: 60,
             start_time: start,
             end_time: start + 0.2,
             velocity: 100,
+            channel: None,
+        }
+    }
+
+    fn note_v(start: f32, velocity: u8) -> NoteEvent {
+        NoteEvent {
+            id: 0,
+            pitch: 60,
+            start_time: start,
+            end_time: start + 0.2,
+            velocity,
             channel: None,
         }
     }
@@ -866,9 +1324,184 @@ mod tests {
             confidence: 1.0,
             source_count: 1,
         };
-        let notes = vec![note(0.25), note(0.5), note(0.75), note(1.0), note(1.25)];
+let notes = vec![note(0.25), note(0.5), note(0.75), note(1.0), note(1.25)];
         let refined = refine_beat_phase(&notes, &base);
         assert_eq!(refined.beats_per_bar, 4);
         assert!((refined.beats[1] - 0.5).abs() < 1e-4);
     }
+
+    #[test]
+    fn phase_refinement_corrects_sixteenth_beat_offset() {
+        // Base grid offset by +0.0625 of the period (a 16th at 120 BPM). The
+        // legacy 3-candidate search (shift -0.25/0/+0.25 period) cannot reach
+        // this; the 16-candidate sweep shifts by exactly -0.03125.
+        let base = CrossValidatedBeats {
+            beats: vec![0.03125, 0.53125, 1.03125, 1.53125, 2.03125],
+            downbeats: vec![0.03125, 2.03125],
+            beats_per_bar: 4,
+            bpm: 120.0,
+            confidence: 1.0,
+            source_count: 1,
+        };
+        let notes = vec![note(0.0), note(0.5), note(1.0), note(1.5)];
+        let refined = refine_beat_phase(&notes, &base);
+        assert!((refined.beats[0] - 0.0).abs() < 1e-4);
+        assert!((refined.beats[1] - 0.5).abs() < 1e-4);
+    }
+
+    #[test]
+    fn score_prefers_onbeat_alignment() {
+        // A grid aligned to the onbeat must score better than one aligned to a
+        // 16th slot for the same notes.
+        let notes = vec![note(0.0), note(0.5), note(1.0), note(1.5)];
+        let onbeat = (vec![0.0, 0.5, 1.0, 1.5, 2.0], vec![0.0, 2.0]);
+        let sixteenth = (vec![0.125, 0.625, 1.125, 1.625, 2.125], vec![0.125, 2.125]);
+        let on_score = score_phase_alignment(&notes, &onbeat.0, &onbeat.1);
+        let si_score = score_phase_alignment(&notes, &sixteenth.0, &sixteenth.1);
+        assert!(on_score < si_score);
+    }
+
+    #[test]
+    fn local_refinement_improves_on_coarse_winner() {
+        // Base offset of 0.09375s (0.1875 period) at 120 BPM. The 16-candidate
+        // sweep finds the exact correction (shift -0.09375) and the refined
+        // score is strictly better than the base grid's.
+        let base = CrossValidatedBeats {
+            beats: vec![0.09375, 0.59375, 1.09375, 1.59375, 2.09375],
+            downbeats: vec![0.09375, 2.09375],
+            beats_per_bar: 4,
+            bpm: 120.0,
+            confidence: 1.0,
+            source_count: 1,
+        };
+        let notes = vec![note(0.0), note(0.5), note(1.0), note(1.5)];
+        let refined = refine_beat_phase(&notes, &base);
+        assert!((refined.beats[0] - 0.0).abs() < 1e-4);
+        let base_score = score_phase_alignment(&notes, &base.beats, &base.downbeats);
+        let refined_score = score_phase_alignment(&notes, &refined.beats, &refined.downbeats);
+        assert!(refined_score + 0.001 < base_score);
+    }
+
+    #[test]
+    fn downbeat_rotation_keeps_correct_grid() {
+        let mut beats = CrossValidatedBeats {
+            beats: vec![0.0, 0.5, 1.0, 1.5, 2.0],
+            downbeats: vec![0.0, 2.0],
+            beats_per_bar: 4,
+            bpm: 120.0,
+            confidence: 1.0,
+            source_count: 1,
+        };
+        let notes = vec![note(0.0), note(1.0), note(2.0)];
+        validate_downbeat_rotation(&notes, &mut beats, 0.15);
+        assert_eq!(beats.downbeats, vec![0.0, 2.0]);
+        assert_eq!(beats.beats, vec![0.0, 0.5, 1.0, 1.5, 2.0]);
+    }
+
+    #[test]
+    fn downbeat_rotation_rotates_when_notes_on_beat_2() {
+        let mut beats = CrossValidatedBeats {
+            beats: vec![0.0, 0.5, 1.0, 1.5, 2.0, 2.5],
+            downbeats: vec![0.0, 2.0],
+            beats_per_bar: 4,
+            bpm: 120.0,
+            confidence: 1.0,
+            source_count: 1,
+        };
+        let notes = vec![note(0.5), note(1.5), note(2.5)];
+        validate_downbeat_rotation(&notes, &mut beats, 0.15);
+        assert_eq!(beats.downbeats, vec![0.5, 2.5]);
+        assert!((beats.beats[0] - 0.5).abs() < 1e-4);
+    }
+
+    #[test]
+    fn downbeat_rotation_blocked_by_weak_margin() {
+        // Uniform onsets with a slight accent on beats 1 and 5: rotation 1
+        // wins narrowly (~10%) but below the 15% margin, so the grid stays.
+        let mut beats = CrossValidatedBeats {
+            beats: vec![0.0, 0.5, 1.0, 1.5, 2.0, 2.5],
+            downbeats: vec![0.0, 2.0],
+            beats_per_bar: 4,
+            bpm: 120.0,
+            confidence: 1.0,
+            source_count: 1,
+        };
+        let notes = vec![
+            note(0.0),
+            note_v(0.5, 113),
+            note(1.0),
+            note(1.5),
+            note(2.0),
+            note_v(2.5, 113),
+        ];
+        validate_downbeat_rotation(&notes, &mut beats, 0.15);
+        assert_eq!(beats.downbeats, vec![0.0, 2.0]);
+        assert_eq!(beats.beats, vec![0.0, 0.5, 1.0, 1.5, 2.0, 2.5]);
+
+        // With a tiny margin the same evidence is enough to rotate.
+        let mut beats2 = CrossValidatedBeats {
+            beats: vec![0.0, 0.5, 1.0, 1.5, 2.0, 2.5],
+            downbeats: vec![0.0, 2.0],
+            beats_per_bar: 4,
+            bpm: 120.0,
+            confidence: 1.0,
+            source_count: 1,
+        };
+        validate_downbeat_rotation(&notes, &mut beats2, 0.05);
+        assert_eq!(beats2.downbeats, vec![0.5, 2.5]);
+    }
+
+    #[test]
+    fn fixed_bpm_refinement_shifts_phase_without_changing_tempo() {
+        // Base grid at 120 BPM starting at 0.0, but notes start at 0.057s (57ms offset)
+        let base = CrossValidatedBeats {
+            beats: vec![0.0, 0.5, 1.0, 1.5, 2.0],
+            downbeats: vec![0.0, 2.0],
+            beats_per_bar: 4,
+            bpm: 120.0,
+            confidence: 1.0,
+            source_count: 1,
+        };
+        let notes = vec![
+            note(0.057),
+            note(0.557),
+            note(1.057),
+            note(1.557),
+        ];
+        let refined = refine_beat_phase_fixed_bpm(&notes, &base);
+        assert_eq!(refined.bpm, 120.0);
+        assert_eq!(refined.beats_per_bar, 4);
+        assert!((refined.beats[0] - 0.057).abs() < 0.015);
+    }
+
+    #[test]
+    fn elastic_grid_recalibrates_tempo_drift_across_measures() {
+        // Measure 0: 120 BPM (period 0.5s) at offset 0.0s -> beats at 0.0, 0.5, 1.0, 1.5
+        // Measure 1: notes drifted by +30ms -> notes at 2.03, 2.53, 3.03, 3.53
+        let base = CrossValidatedBeats {
+            beats: vec![0.0, 0.5, 1.0, 1.5, 2.0, 2.5, 3.0, 3.5, 4.0],
+            downbeats: vec![0.0, 2.0, 4.0],
+            beats_per_bar: 4,
+            bpm: 120.0,
+            confidence: 1.0,
+            source_count: 1,
+        };
+        let notes = vec![
+            note(0.0),
+            note(0.5),
+            note(1.0),
+            note(1.5),
+            note(2.03),
+            note(2.53),
+            note(3.03),
+            note(3.53),
+        ];
+        let refined = recalibrate_beat_grid_elastic(&notes, &base);
+        assert_eq!(refined.bpm, 120.0);
+        // Measure 0 beat should stay close to 0.0
+        assert!((refined.beats[0] - 0.0).abs() < 0.01);
+        // Measure 1 beats should adapt toward +0.03
+        assert!(refined.beats[4] > 2.005);
+    }
 }
+

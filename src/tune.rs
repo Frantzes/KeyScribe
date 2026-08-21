@@ -600,6 +600,8 @@ pub fn tune(dir: &Path, cfg: &TuneConfig) -> Result<TuneReport> {
         melody_quantizer: "learned".to_string(),
         bpm: best.bpm,
         rhythm_coarsen: true,
+        chord_collapse: true,
+        chord_split: 0.0,
     };
 
     Ok(TuneReport {

@@ -85,6 +85,15 @@ mod cli_impl {
             /// (Tier A1). Coarsening is on by default.
             #[arg(long)]
             no_rhythm_coarsen: bool,
+            /// Disable the jazz-extension→7th-chord quality collapse (Tier A2).
+            /// Collapse is on by default.
+            #[arg(long)]
+            no_chord_collapse: bool,
+            /// Half-bar chord split threshold 0.0-1.0 (Tier A2 Part 2): bars
+            /// whose two whitened halves differ by more than this are emitted
+            /// as two chords (one per half). 0 = off (one chord per bar).
+            #[arg(long, default_value_t = 0.0)]
+            chord_split: f32,
             /// Beat offset within the bar (0.0 = downbeat) at which to sample
             /// notes for the primary chord. Negative (default) uses the legacy
             /// max-simultaneous-notes scan.
@@ -347,6 +356,8 @@ mod cli_impl {
                 quantizer,
                 quantizer_model,
                 no_rhythm_coarsen,
+                no_chord_collapse,
+                chord_split,
                 config,
                 render,
                 transition_matrix,
@@ -392,6 +403,8 @@ mod cli_impl {
                     quantizer: quantizer_engine,
                     quantizer_model_path: quantizer_model,
                     rhythm_coarsen: !no_rhythm_coarsen,
+                    chord_collapse: !no_chord_collapse,
+                    chord_split,
                 };
                 let t_opts = TranscribeOptions {
                     threshold: headless::key_sensitivity_to_threshold(key_sensitivity),

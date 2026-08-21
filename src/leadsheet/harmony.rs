@@ -47,6 +47,14 @@ pub struct BarProfile {
     pub bass_note: Option<u8>,
     /// Total activation energy (sum of `pcp`) — low-energy bars are skipped.
     pub energy: f32,
+    /// Mean per-pitch-class profile split into (first-half, second-half) when
+    /// the bar is a half-bar split candidate (Tier A2 Part 2). `None` when the
+    /// bar's bpb is too small to split or there are no frames in a half.
+    pub halves: Option<([f32; 12], [f32; 12])>,
+    /// Bass-register halves, matching `halves`'s layout.
+    pub halves_bass: Option<([f32; 12], [f32; 12])>,
+    /// Lowest bass pitch with strong activation in the second half, if any.
+    pub bass_note_second: Option<u8>,
 }
 
 /// Estimated key: tonic pitch class + major/minor + diatonic scale mask.
@@ -287,6 +295,9 @@ pub fn compute_bar_profiles(
             bass_pcp: [0.0; 12],
             bass_note: None,
             energy: 0.0,
+            halves: None,
+            halves_bass: None,
+            bass_note_second: None,
         };
         for pc in 0..12 {
             prof.pcp[pc] = pcp[pc] / n;
@@ -297,6 +308,61 @@ pub fn compute_bar_profiles(
             if mx[i] >= 0.25 {
                 prof.bass_note = Some((21 + i) as u8);
                 break;
+            }
+        }
+        // Half-bar profiles (Tier A2 Part 2): first half = bins in beats
+        // [0, bpb/2), second half = [bpb/2, bpb). `bins_per_bar` is always even
+        // (PROFILE_BIN_BEATS = 0.25), so the split lands exactly on a bin
+        // boundary; an odd `bpb` gives the leftover beat-bin to the second half.
+        let half_bins = bins_per_bar / 2;
+        if half_bins > 0 && half_bins < bins_per_bar {
+            let mut pcp1 = [0.0f32; 12];
+            let mut pcp2 = [0.0f32; 12];
+            let mut bass1 = [0.0f32; 12];
+            let mut bass2 = [0.0f32; 12];
+            let mut mx2 = [0.0f32; 88];
+            let mut n1 = 0usize;
+            let mut n2 = 0usize;
+            for b in 0..half_bins {
+                if bin_frames[base + b] == 0 {
+                    continue;
+                }
+                n1 += bin_frames[base + b];
+                for pc in 0..12 {
+                    pcp1[pc] += bin_pcp[base + b][pc];
+                    bass1[pc] += bin_bass[base + b][pc];
+                }
+            }
+            for b in half_bins..bins_per_bar {
+                if bin_frames[base + b] == 0 {
+                    continue;
+                }
+                n2 += bin_frames[base + b];
+                for pc in 0..12 {
+                    pcp2[pc] += bin_pcp[base + b][pc];
+                    bass2[pc] += bin_bass[base + b][pc];
+                }
+                for i in 0..88 {
+                    if bin_max[base + b][i] > mx2[i] {
+                        mx2[i] = bin_max[base + b][i];
+                    }
+                }
+            }
+            if n1 > 0 && n2 > 0 {
+                let n1 = n1 as f32;
+                let n2 = n2 as f32;
+                let h1 = pcp1.map(|v| v / n1);
+                let h2 = pcp2.map(|v| v / n2);
+                let hb1 = bass1.map(|v| v / n1);
+                let hb2 = bass2.map(|v| v / n2);
+                for i in 0..88 {
+                    if mx2[i] >= 0.25 {
+                        prof.bass_note_second = Some((21 + i) as u8);
+                        break;
+                    }
+                }
+                prof.halves = Some((h1, h2));
+                prof.halves_bass = Some((hb1, hb2));
             }
         }
         profiles.push(prof);
@@ -430,6 +496,28 @@ pub(crate) const ALL_TEMPLATES: [(&str, &[u8]); 27] = [
     ("\u{0394}9#11", &[0, 4, 7, 11, 2, 6]),
 ];
 
+/// The quality suffixes that survive the extension collapse unchanged. Every
+/// template suffix must map into this set; enumerate `ALL_TEMPLATES` in tests
+/// rather than duplicating it.
+pub(crate) const KEEP_QUALITIES: [&str; 12] = [
+    "", "-", "dim", "aug", "sus2", "sus4", "7", "\u{0394}7", "-7", "-\u{0394}7",
+    "dim7", "-7b5",
+];
+
+/// Collapse jazz-extended qualities to the nearest 7th-chord class
+/// (user decision 2026-08-14, mirrors CHORD_DETECTION_PLAN.md Decision 2).
+/// Triads, 7ths and suspensions pass through unchanged.
+pub(crate) fn collapse_quality_to_seventh(suffix: &str) -> &str {
+    match suffix {
+        "9" | "7b9" | "7#9" | "7#11" | "13" | "7#5" => "7",
+        "\u{0394}9" | "\u{0394}13" | "\u{0394}7#11" | "\u{0394}9#11" => "\u{0394}7",
+        "-9" | "-11" | "-13" => "-7",
+        "6" => "",
+        "m6" => "-",
+        other => other,
+    }
+}
+
 /// Simplicity bonus so a plain triad/7th wins unless the extension tones are
 /// clearly present in the profile. Each extra template interval adds ~0.15 of
 /// spurious mass on a noisy floor, so the penalty must match that to keep
@@ -482,6 +570,42 @@ fn soft_contrast(whitened: &[f32; 12], root: u8, intervals: &[u8]) -> f32 {
 /// slash-chord alternatives.
 const WHITEN_SHARPEN_POWER: f32 = 1.5;
 
+/// Whitened (floor-subtracted, sharpened) profile + its total energy, matching
+/// the inline math in the emission loop so split-half comparison uses the same
+/// transform.
+fn whiten_profile(pcp: &[f32; 12]) -> ([f32; 12], f32) {
+    let mut sorted: Vec<f32> = pcp.to_vec();
+    sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let floor = 0.7 * sorted[sorted.len() / 2];
+    let mut whitened = [0.0f32; 12];
+    let mut energy = 0.0f32;
+    for pc in 0..12 {
+        whitened[pc] = (pcp[pc] - floor).max(0.0).powf(WHITEN_SHARPEN_POWER);
+        energy += whitened[pc];
+    }
+    (whitened, energy)
+}
+
+/// Cosine similarity of two whitened pitch-class profiles (Tier A2 Part 2
+/// split decision).
+fn profile_cosine(a: &[f32; 12], b: &[f32; 12]) -> f32 {
+    let mut dot = 0.0f32;
+    let mut na = 0.0f32;
+    let mut nb = 0.0f32;
+    for pc in 0..12 {
+        dot += a[pc] * b[pc];
+        na += a[pc] * a[pc];
+        nb += b[pc] * b[pc];
+    }
+    let na = na.sqrt();
+    let nb = nb.sqrt();
+    if na <= 1e-9 || nb <= 1e-9 {
+        0.0
+    } else {
+        dot / (na * nb)
+    }
+}
+
 /// Detect chords per bar from the soft probability timeline: whitened per-bar
 /// pitch-class profiles (P1), joint (root, quality) template matching with a
 /// bass anchor (P3), a key-estimate prior, and a functional-harmony Viterbi
@@ -506,34 +630,79 @@ pub fn detect_chords_from_timeline(
 
     let n_qualities = ALL_TEMPLATES.len();
     let n_states = 12 * n_qualities;
-    let mut emissions = vec![vec![0.0f32; n_states]; profiles.len()];
-    let mut whitened_energy = vec![0.0f32; profiles.len()];
-    for (bar, prof) in profiles.iter().enumerate() {
-        let mut sorted: Vec<f32> = prof.pcp.to_vec();
-        sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-        let floor = 0.7 * sorted[sorted.len() / 2];
-        let mut whitened = [0.0f32; 12];
-        for pc in 0..12 {
-            whitened[pc] = (prof.pcp[pc] - floor).max(0.0).powf(WHITEN_SHARPEN_POWER);
-            whitened_energy[bar] += whitened[pc];
+
+    // Build per-segment chord windows (Tier A2 Part 2): one segment per
+    // unsplit bar, two per split bar. A bar is split when its two whitened
+    // halves are dissimilar enough (`1 - cosine > split_threshold`) — the
+    // signature of a chord change mid-bar (bebop heads change twice per bar).
+    struct Segment {
+        bar: usize,
+        half: Option<usize>,
+        pcp: [f32; 12],
+        bass_pcp: [f32; 12],
+        bass_note: Option<u8>,
+    }
+    let mut segments: Vec<Segment> = Vec::with_capacity(profiles.len());
+    for prof in profiles.iter() {
+        let split = if config.split_threshold > 0.0 {
+            match (prof.halves, prof.halves_bass) {
+                (Some((h1, h2)), Some((hb1, hb2))) => {
+                    let (w1, e1) = whiten_profile(&h1);
+                    let (w2, e2) = whiten_profile(&h2);
+                    e1 > 1e-4
+                        && e2 > 1e-4
+                        && (1.0 - profile_cosine(&w1, &w2)) > config.split_threshold
+                }
+                _ => false,
+            }
+        } else {
+            false
+        };
+        if split {
+            if let (Some((h1, h2)), Some((hb1, hb2))) = (prof.halves, prof.halves_bass) {
+                segments.push(Segment {
+                    bar: prof.bar_index,
+                    half: Some(0),
+                    pcp: h1,
+                    bass_pcp: hb1,
+                    bass_note: prof.bass_note,
+                });
+                segments.push(Segment {
+                    bar: prof.bar_index,
+                    half: Some(1),
+                    pcp: h2,
+                    bass_pcp: hb2,
+                    bass_note: prof.bass_note_second,
+                });
+                continue;
+            }
         }
+        segments.push(Segment {
+            bar: prof.bar_index,
+            half: None,
+            pcp: prof.pcp,
+            bass_pcp: prof.bass_pcp,
+            bass_note: prof.bass_note,
+        });
+    }
+
+    let mut emissions = vec![vec![0.0f32; n_states]; segments.len()];
+    let mut whitened_energy = vec![0.0f32; segments.len()];
+    for (seg_i, seg) in segments.iter().enumerate() {
+        let (whitened, energy) = whiten_profile(&seg.pcp);
+        whitened_energy[seg_i] = energy;
         // Bass-register profile (P3): the walking bass is nearly a delta
         // function on one pitch class (root or a neighbor), so templates are
         // scored against both the full profile and the bass profile, and the
         // root additionally gets a direct bass-pitch bonus. This breaks the
         // C6/Am7-style relative-chord ties the comp register can't resolve.
-        let mut bass_sorted: Vec<f32> = prof.bass_pcp.to_vec();
-        bass_sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-        let bass_floor = 0.7 * bass_sorted[bass_sorted.len() / 2];
-        let bass_whitened: [f32; 12] = prof
-            .bass_pcp
-            .map(|v| (v - bass_floor).max(0.0).powf(WHITEN_SHARPEN_POWER));
+        let (bass_whitened, _) = whiten_profile(&seg.bass_pcp);
         for root in 0..12u8 {
             for (q, (_, intervals)) in ALL_TEMPLATES.iter().enumerate() {
                 let mut e = 0.55 * soft_contrast(&whitened, root, intervals)
                     + 0.45 * soft_contrast(&bass_whitened, root, intervals)
                     + simplicity_bonus(intervals);
-                if let Some(b) = prof.bass_note {
+                if let Some(b) = seg.bass_note {
                     let b = b % 12;
                     if b == root {
                         e += 0.45;
@@ -552,24 +721,19 @@ pub fn detect_chords_from_timeline(
                     // are common even when not the tonic key's scale.
                     e += 0.04;
                 }
-                emissions[bar][root as usize * n_qualities + q] = e;
+                emissions[seg_i][root as usize * n_qualities + q] = e;
             }
         }
     }
 
     if std::env::var_os("KEYSCRIBE_HARMONY_DEBUG").is_some() {
-        for (bar, prof) in profiles.iter().enumerate().take(40) {
-            let mut sorted: Vec<f32> = prof.pcp.to_vec();
-            sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-            let floor = 0.7 * sorted[sorted.len() / 2];
-            let whitened: [f32; 12] = prof
-                .pcp
-                .map(|v| (v - floor).max(0.0).powf(WHITEN_SHARPEN_POWER));
+        for (seg_i, seg) in segments.iter().enumerate().take(60) {
+            let (whitened, _) = whiten_profile(&seg.pcp);
             let pcs = pcs_from_profile(&whitened);
             let mut ranked: Vec<(u8, usize, f32)> = Vec::new();
             for root in 0..12u8 {
                 for q in 0..n_qualities {
-                    ranked.push((root, q, emissions[bar][root as usize * n_qualities + q]));
+                    ranked.push((root, q, emissions[seg_i][root as usize * n_qualities + q]));
                 }
             }
             ranked.sort_by(|a, b| b.2.partial_cmp(&a.2).unwrap_or(std::cmp::Ordering::Equal));
@@ -579,19 +743,19 @@ pub fn detect_chords_from_timeline(
                 .map(|(r, q, e)| {
                     format!(
                         "{}={:.2}",
-                        chord_symbol_from_root(*r, ALL_TEMPLATES[*q].0, prof.bass_note.map(|b| b % 12)),
+                        chord_symbol_from_root(*r, ALL_TEMPLATES[*q].0, seg.bass_note.map(|b| b % 12)),
                         e
                     )
                 })
                 .collect();
-            let pcp_str: Vec<String> = prof
+            let pcp_str: Vec<String> = seg
                 .pcp
                 .iter()
                 .enumerate()
                 .filter(|(_, v)| **v > 0.02)
                 .map(|(pc, v)| format!("{}:{:.2}", pc, v))
                 .collect();
-            let bass_str: Vec<String> = prof
+            let bass_str: Vec<String> = seg
                 .bass_pcp
                 .iter()
                 .enumerate()
@@ -599,9 +763,14 @@ pub fn detect_chords_from_timeline(
                 .map(|(pc, v)| format!("{}:{:.2}", pc, v))
                 .collect();
             eprintln!(
-                "[harmony] bar {:>2} bass={:?} basspcp[{}] key={}{} pcs=[{}] pcp[{}] top[{}]",
-                bar,
-                prof.bass_note,
+                "[harmony] bar {:>2}{} bass={:?} basspcp[{}] key={}{} pcs=[{}] pcp[{}] top[{}]",
+                seg.bar,
+                match seg.half {
+                    None => "",
+                    Some(0) => "+",
+                    _ => "-",
+                },
+                seg.bass_note,
                 bass_str.join(" "),
                 pitch_class_char(key.tonic),
                 if key.minor { "m" } else { "" },
@@ -615,7 +784,7 @@ pub fn detect_chords_from_timeline(
         }
     }
 
-    // P2: functional-harmony Viterbi over the bar sequence. The per-bar
+    // P2: functional-harmony Viterbi over the segment sequence. The per-bar
     // argmax is often a coin flip between equally-plausible templates; the
     // transition prior (cadential V-I roots, sustained roots, common stepwise
     // motion) resolves those ties while staying weak enough that a strong
@@ -623,25 +792,36 @@ pub fn detect_chords_from_timeline(
     // was loaded from a corpus, it is blended in as the data-driven prior.
     let path = viterbi_best_path(&emissions, 12, n_qualities, learned_transitions().as_deref());
 
-    // Emit one chord per bar at the downbeat, following the Viterbi path.
-    // The key estimate still influences the choice through the diatonic prior
-    // in the emission.
+    // Emit one chord per segment at its start (bar downbeat, or half-bar),
+    // following the Viterbi path. The key estimate still influences the choice
+    // through the diatonic prior in the emission.
     let min_energy = (config.chord_min_simultaneous.max(1) as f32) * 0.2;
     let mut out = Vec::new();
     let mut last_symbol = String::new();
-    for (bar, prof) in profiles.iter().enumerate() {
-        if whitened_energy[bar] < min_energy {
+    for (seg_i, seg) in segments.iter().enumerate() {
+        if whitened_energy[seg_i] < min_energy {
             continue;
         }
-        let s = path[bar];
+        let s = path[seg_i];
         let root = (s / n_qualities) as u8;
-        let suffix = ALL_TEMPLATES[s % n_qualities].0;
-        let symbol = chord_symbol_from_root(root, suffix, prof.bass_note.map(|b| b % 12));
+        let raw_suffix = ALL_TEMPLATES[s % n_qualities].0;
+        let suffix = if config.collapse_extensions {
+            collapse_quality_to_seventh(raw_suffix)
+        } else {
+            raw_suffix
+        };
+        let symbol = chord_symbol_from_root(root, suffix, seg.bass_note.map(|b| b % 12));
         if symbol == last_symbol {
             continue;
         }
+        let beat_start = seg.bar as f32 * profile_step
+            + if seg.half == Some(1) {
+                profile_step / 2.0
+            } else {
+                0.0
+            };
         out.push(ChordSymbolChange {
-        beat_start: bar as f32 * profile_step,
+            beat_start,
             symbol: symbol.clone(),
         });
         last_symbol = symbol;
@@ -726,7 +906,7 @@ fn viterbi_best_path(
                         c = learned;
                     }
                 }
-                let v = prev[s1] + c;
+                let v = prev[s1] - c;
                 if v > best {
                     best = v;
                     best_s1 = s1;
@@ -747,4 +927,32 @@ fn viterbi_best_path(
         path[bar - 1] = s;
     }
     path
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn collapse_maps_every_template_into_keep_set() {
+        for (suffix, _) in ALL_TEMPLATES {
+            let collapsed = collapse_quality_to_seventh(suffix);
+            assert!(
+                KEEP_QUALITIES.contains(&collapsed),
+                "{suffix:?} collapsed to {collapsed:?}, not in keep set"
+            );
+        }
+    }
+
+    #[test]
+    fn collapse_maps_extensions_to_sevenths() {
+        assert_eq!(collapse_quality_to_seventh("13"), "7");
+        assert_eq!(collapse_quality_to_seventh("-11"), "-7");
+        assert_eq!(collapse_quality_to_seventh("\u{0394}13"), "\u{0394}7");
+        assert_eq!(collapse_quality_to_seventh("-7b5"), "-7b5");
+        assert_eq!(collapse_quality_to_seventh("6"), "");
+        assert_eq!(collapse_quality_to_seventh("m6"), "-");
+        assert_eq!(collapse_quality_to_seventh("7#11"), "7");
+        assert_eq!(collapse_quality_to_seventh("\u{0394}9#11"), "\u{0394}7");
+    }
 }

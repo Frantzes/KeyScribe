@@ -18,7 +18,7 @@ pub use beat_association::{
 pub use beat_tracking::{
     cross_validate_beat_sources, detect_beats_from_notes, detect_beats_from_stems, run_beat_this,
     run_beat_this_combined, run_beat_this_multi, BeatTrackConfig, BeatTrackDevice,
-    refine_beat_phase, BeatTrackResult, CrossValidatedBeats,
+    refine_beat_phase, refine_beat_phase_fixed_bpm, recalibrate_beat_grid_elastic, validate_downbeat_rotation, BeatTrackResult, CrossValidatedBeats,
 };
 pub use bpm::{detect_bpm, BpmDetectionConfig, TempoEstimate};
 pub use chord::{debug_chord_notes_to_json, detect_chord_changes, detect_chord_changes_per_bar, ChordAnalysisConfig};
@@ -37,11 +37,12 @@ pub use preset::{
     LeadSheetPresetConfig,
 };
 pub use quantize::{
-    coarsen_rhythm, detect_articulation, detect_grace_notes, detect_swing, learned_note_features,
-    quantize_aligned_notes, quantize_aligned_notes_learned, quantize_notes,
-    quantize_notes_with_rhythm_map, quantize_notes_with_tempo_map, quantize_notes_with_ties,
-    resolve_quantizer_model_path, QuantizationConfig, QuantizerEngine, QuantizerToken,
-    RhythmCoarsenConfig, SwingDetectionConfig, TiedNote, LEARNED_TOKEN_TABLE,
+    coarsen_rhythm, detect_articulation, detect_grace_notes, detect_swing,
+    fill_melody_durations, learned_note_features, quantize_aligned_notes,
+    quantize_aligned_notes_learned, quantize_notes, quantize_notes_with_rhythm_map,
+    quantize_notes_with_tempo_map, quantize_notes_with_ties, resolve_quantizer_model_path,
+    QuantizationConfig, QuantizerEngine, QuantizerToken, RhythmCoarsenConfig,
+    SwingDetectionConfig, TiedNote, LEARNED_TOKEN_TABLE,
 };
 pub use tempo_map::{
     beat_at_time, detect_tempo_map, detect_time_signature_segments, tempo_map_from_beats,

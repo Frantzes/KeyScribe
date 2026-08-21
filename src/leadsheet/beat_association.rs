@@ -75,8 +75,42 @@ pub fn associate_notes_to_beat_grid(
         let beat_duration_sec = (next_beat - prev_beat).max(0.001);
         let intra_beat_pos = ((onset - prev_beat) / beat_duration_sec).clamp(0.0, 1.0);
 
-        let raw_beat_index = find_beat_index(onset, &beats);
-        
+        // Beat-boundary snap: if the note is within a small tempo-adaptive
+        // margin of the next beat, reassign it to beat_index+1 at pos=0.0.
+        // This fixes notes that land 5-20 ms before a beat and get assigned
+        // to the previous beat at pos≈0.96, which cascades into a wrong
+        // bar_index. The threshold scales with tempo: at 60 BPM 8% = 80ms
+        // (too wide), at 208 BPM 8% = 23ms (correct). Clamp to [0.04, 0.10].
+        let beat_dur_ms = beat_duration_sec * 1000.0;
+        let snap_threshold = (15.0 / beat_dur_ms).clamp(0.04, 0.10);
+        let (adj_intra, adj_beat_bump) = if intra_beat_pos > (1.0 - snap_threshold) {
+            (0.0f32, 1u32) // snap forward to next beat
+        } else if intra_beat_pos < snap_threshold {
+            (0.0f32, 0u32) // snap to current beat start
+        } else {
+            (intra_beat_pos, 0u32)
+        };
+
+        let raw_beat_index = (find_beat_index(onset, &beats) + adj_beat_bump)
+            .min((beats.len() - 1) as u32);
+
+        // If the note moved to the next beat, refresh the surrounding beat
+        // pair so the stored timings match the assigned beat index.
+        let (prev_beat, next_beat) = if adj_beat_bump > 0 {
+            let p = beats
+                .get(raw_beat_index as usize)
+                .copied()
+                .unwrap_or(prev_beat);
+            let n = beats
+                .get(raw_beat_index as usize + 1)
+                .copied()
+                .unwrap_or_else(|| p + beat_duration_sec);
+            (p, n)
+        } else {
+            (prev_beat, next_beat)
+        };
+        let beat_duration_sec = (next_beat - prev_beat).max(0.001);
+
         let (bar_index, beat_offset_in_bar) = find_structural_position(
             raw_beat_index,
             &beats,
@@ -95,7 +129,7 @@ pub fn associate_notes_to_beat_grid(
             original_end_time: end,
             beat_index: raw_beat_index,
             bar_index,
-            intra_beat_pos,
+            intra_beat_pos: adj_intra,
             prev_beat_time: prev_beat,
             next_beat_time: next_beat,
             beat_duration_sec,
@@ -248,5 +282,66 @@ mod tests {
         let beats = vec![0.0, 0.5, 1.0, 1.5, 2.0, 2.5, 3.0, 3.5];
         let downbeats = vec![0.0, 2.0, 4.0];
         assert_eq!(beats_per_bar_from_downbeats(&downbeats, &beats), 4);
+    }
+
+    #[test]
+    fn note_before_beat_snaps_forward_to_next_beat() {
+        // onset=0.49 (2 ms before the 0.5 beat) => intra 0.98, must snap to
+        // beat_index=1 at pos 0.0, not beat_index=0 at pos 0.98.
+        let beats = vec![0.0, 0.5, 1.0];
+        let aligned = associate_notes_to_beat_grid(
+            &[0.49], &[60], &[100], &[0.6],
+            &beats, &[0.0],
+            &BeatAssociationConfig::default(),
+        );
+        assert_eq!(aligned.len(), 1);
+        let note = &aligned[0];
+        assert_eq!(note.beat_index, 1);
+        assert!((note.intra_beat_pos - 0.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn note_just_after_beat_snaps_to_beat_start() {
+        // onset=0.01 => intra 0.02, snap to beat_index=0 at pos 0.0.
+        let beats = vec![0.0, 0.5, 1.0];
+        let aligned = associate_notes_to_beat_grid(
+            &[0.01], &[60], &[100], &[0.2],
+            &beats, &[0.0],
+            &BeatAssociationConfig::default(),
+        );
+        assert_eq!(aligned.len(), 1);
+        let note = &aligned[0];
+        assert_eq!(note.beat_index, 0);
+        assert!((note.intra_beat_pos - 0.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn genuine_half_beat_note_unchanged() {
+        let beats = vec![0.0, 0.5, 1.0];
+        let aligned = associate_notes_to_beat_grid(
+            &[0.25], &[60], &[100], &[0.4],
+            &beats, &[0.0],
+            &BeatAssociationConfig::default(),
+        );
+        assert_eq!(aligned.len(), 1);
+        let note = &aligned[0];
+        assert_eq!(note.beat_index, 0);
+        assert!((note.intra_beat_pos - 0.5).abs() < 0.01);
+    }
+
+    #[test]
+    fn slow_tempo_guard_keeps_far_note_unsnapped() {
+        // 60 BPM => beat_dur 1.0s, snap_threshold clamped to 0.04. intra 0.91
+        // is below 0.96 so the note stays at 0.91 (not snapped forward).
+        let beats = vec![0.0, 1.0, 2.0];
+        let aligned = associate_notes_to_beat_grid(
+            &[0.91], &[60], &[100], &[1.2],
+            &beats, &[0.0],
+            &BeatAssociationConfig::default(),
+        );
+        assert_eq!(aligned.len(), 1);
+        let note = &aligned[0];
+        assert_eq!(note.beat_index, 0);
+        assert!((note.intra_beat_pos - 0.91).abs() < 0.01);
     }
 }

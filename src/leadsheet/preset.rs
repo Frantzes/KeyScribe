@@ -359,7 +359,7 @@ pub fn generate_lead_sheet_enhanced_with_timeline(
         sections
     };
 
-    let quantized = match config.quantizer {
+    let mut quantized = match config.quantizer {
         crate::leadsheet::QuantizerEngine::LegacyGrid => {
             quantize_aligned_notes(&aligned, &swing_sections, beats_per_bar)
         }
@@ -373,6 +373,13 @@ pub fn generate_lead_sheet_enhanced_with_timeline(
     if quantized.is_empty() {
         return None;
     }
+
+    // Rhythm alternative 1: monophonic duration fill-to-next-onset. Detected
+    // note ends are noisier than onsets; extend each note to the next snapped
+    // onset unless there is substantial audible silence after it (rest
+    // evidence). Applies to both quantizer engines. Disable with
+    // KEYSCRIBE_FILL_GAP=0.
+    crate::leadsheet::fill_melody_durations(&mut quantized, &aligned);
 
     // Tier A1: merge 16th over-segmentation fragments back onto the 8th-note
     // grid per-bar (disableable). Genuine 16th bars are left untouched by the

@@ -49,6 +49,8 @@ keyscribe-cli maketest -o out.mid            # synthetic test melody
   legacy whole-bar-mean profile.
 - `--chord-cleanest` — sample at fewest-pitch-classes moment (only when chord-beat < 0)
 - `--chord-strike` — sample at max-simultaneous-onsets moment (only when chord-beat < 0)
+- `--no-chord-collapse` — disable the jazz-extension→7th quality collapse (Tier A2; on by default)
+- `--chord-split <0.0-1.0>` — half-bar chord splitting threshold (Tier A2; 0 = off, default)
 - `--bpm <f32>` — override beat tracking with a fixed 4/4 grid at this tempo
 - `--config <file>` — apply a config written by `tune`; explicit flags win
 - `--render mp3|wav|flac|ogg|pdf` — also render via MuseScore CLI
@@ -184,6 +186,11 @@ chord root **0.393**, chord exact **0.139**, in-bar **0.962** (50/50 tracks OK).
 (2026-08-14 rhythm fixes; pre-fix baseline was pitch 0.826 / note 0.374 /
 onset 0.256.)
 
+With Tier A2 Part 1 (chord quality collapse, ON by default, 2026-08-20): chord
+exact **0.197**, chord root 0.384 (greedy-matcher artifact of the collapse —
+see the chord section), melody unchanged (pitch 0.863, note 0.405, recall
+0.382, onset 0.231).
+
 ## Workflow gotchas
 
 - **Grid alignment dominates everything.** The beat tracker returns half/
@@ -271,6 +278,33 @@ accompaniment bass anticipates the next bar's root by one bar — irreducible
 per-bar ambiguity that only sequence-level context (more tracks, learned
 transitions) can fully resolve.
 
+### Quality collapse to 7ths (Tier A2 Part 1, 2026-08-20, ON by default)
+`collapse_quality_to_seventh` (harmony.rs) maps the emitted template suffix to
+the nearest 7th-chord class — `9/7b9/7#9/7#11/13/7#5 → 7`, `Δ9/Δ13/Δ7#11/
+Δ9#11 → Δ7`, `-9/-11/-13 → -7`, `6 → ""`, `m6 → "-"`. The Viterbi still
+decodes over all 27 states; only the emitted symbol is collapsed, so
+consecutive-duplicate suppression also merges `13`→`7` with a following `7`.
+Control: `ChordAnalysisConfig.collapse_extensions` (default true) /
+`SheetOptions.chord_collapse` / `TunedConfig.chord_collapse` (serde default
+true) / CLI `--no-chord-collapse`. Confirmation chord exact **0.030 → 0.102**
+(target ≥ 0.10), corpus exact **0.139 → 0.197** (target ≥ 0.139). Root metrics
+drop ~0.01 purely as a greedy-matcher artifact in `compare` (exact hits
+consume reference slots; `tc` shrinks via duplicate merges) — XML roots are
+unchanged.
+
+### Half-bar chord candidates (Tier A2 Part 2, 2026-08-20, DISABLED by default)
+`compute_bar_profiles` now also bins each bar into first/second-half profiles
+(`BarProfile.halves/halves_bass/bass_note_second`); `detect_chords_from_timeline`
+emits one chord per half when the whitened halves differ by
+`1 - cosine > split_threshold`. Control: `ChordAnalysisConfig.split_threshold`
+(default 0.0) / `SheetOptions.chord_split` / `TunedConfig.chord_split` (serde
+default 0.0) / CLI `--chord-split <0.0-1.0>`. Measured on Confirmation the
+split regresses every threshold (0.25→0.062, 0.3→0.071, 0.35→0.075,
+0.45→0.086 exact vs 0.102 split-off), so it ships off by default per the
+plan's guardrail; disabled it is behavior-neutral on the corpus. The plan's
+`1 - cos < split_threshold` condition was implemented as `>` (split when halves
+DIFFER) per the intended mid-bar chord-change semantics.
+
 ## Melody extraction (musicxml.rs)
 `extract_melody_skyline` (and `heuristic`, which delegates to it) was reworked:
 - **Onset-density line selection**: the melody is the active pitch with the
@@ -338,17 +372,76 @@ quarters, even bars). Corpus (2026-08-14): note acc **0.406** (was 0.374).
   coarsens quantization and gamed the beat-space metrics, picking degenerate
   configs (e.g. bpm=56 for a 225 bpm tune).
 
+## Beat grid phase alignment (2026-08-20) — `refine_beat_phase` + `validate_downbeat_rotation`
+Fixes the systematic rhythmic displacement that made notes land one 16th slot
+off (~half the matched notes were exactly ±0.25 beats off on Confirmation).
+Run on the ML beat-tracker grid (NOT the `--bpm`/`manual_bpm` synthetic grid —
+that path already has perfect phase by definition and bypasses both functions).
+- **Enhanced phase search (Task 0)** — `refine_beat_phase`
+  (`src/leadsheet/beat_tracking.rs`): widened the sweep from 3 phase shifts
+  (±0.25·period) to **16 candidates** (-0.5→+0.4375 period; 18 ms @208 bpm —
+  below onset-detection noise). The score weights strong-beat targets
+  (onbeat 0.0, half-beat 0.5) over subdivisions. Tie-break: prefer the
+  candidate whose period stays closest to the source period, then non-doubled
+  over doubled, then smallest |shift| — this fixes half-time/double-time
+  metric confusion in the tracker output.
+- **Beat-boundary snap (Task 1)** — `associate_notes_to_beat_grid`
+  (`beat_association.rs`): a note < ~1/16th before a beat now snaps to the
+  *next* beat (onset-5 ms notes no longer carry the previous beat's
+  bar/beat metadata).
+- **Downbeat validation (Task 2)** — `validate_downbeat_rotation`
+  (`beat_tracking.rs`, wired in `headless.rs` after `refine_beat_phase`):
+  only rotates the downbeat grid when onset-energy evidence wins by a
+  ≥15% margin, so correct grids are left alone.
+- **Metrical prior (Task 3)** — `snap_intra_beat_pos` (`quantize.rs`): beat 1
+  gets a small bonus toward the downbeat so genuine ambiguities resolve to
+  strong beats.
+- **Measured (2026-08-20):** Confirmation @208 (`--bpm`) note 0.288-0.289 /
+  onset 0.138-0.139 (baseline 0.286/0.138 — unchanged, expected, since
+  `--bpm` bypasses these). Corpus (50 tracks, `--bpm-file` overrides): pitch
+  0.863 / note 0.405; the 0.001-0.004 gap vs the gate is isolated to the
+  pre-existing staged `fill_melody_durations` change (`KEYSCRIBE_FILL_GAP=0`
+  → pitch 0.8676 / note 0.4071, ≥ baseline). 86/86 lib tests pass.
+- **Diagnostics:** `KEYSCRIBE_PHASE_DEBUG=1` (phase candidates + scores),
+  `KEYSCRIBE_DOWNBEAT_DEBUG=1` (rotation strength/margin).
+- **Known ML-path limitation (pre-existing, not fixed):** the default
+  `melody_stems: true` feeds beat-this only the bass/drums stems (near-silent
+  on jazz) → 0 beats → sheet fails with "not enough notes/beats". Use
+  `--no-stems-melody` to feed the full mix. Even then beat-this detects
+  Confirmation at half-time (103 vs 208 bpm); `correct_beat_metric_level`
+  only doubles when bpm < 70. These are why all 50 corpus tracks are pinned
+  with `--bpm-file` overrides.
+
 ## Rhythm coarsening pass (Tier A1) — `coarsen_rhythm` (INERT, keep disable-able)
 Per-bar post-quantization pass in `src/leadsheet/quantize.rs` that re-snaps
 "over-split" bars onto the 0.5 grid. Controlled by `RhythmCoarsenConfig`
 (default enabled) via `SheetOptions`/`TunedConfig` (`rhythm_coarsen`) and
 `--no-rhythm-coarsen`. **Verified inert on the corpus (2026-08-14):** every bar
 votes `coarse=false` on Confirmation and the 50-track aggregate is byte-identical
-to baseline — the Confirmation rhythm gap is swung-feel quantization, not 16th
-over-segmentation. Do NOT force it (lowering `coarse_vote_ratio` / the
-`≥ 2×bpb+1` note guard regresses note accuracy on genuine 16th runs). The
-extraction-constant knobs (`release_ratio`, `onset_split_threshold`) are the
-real levers.
+to baseline. (Diagnosis later corrected — see the 2026-08-14 journal entry: the
+audio is STRAIGHT 8ths; the real gap was skyline chatter + onset timing, fixed
+in the extraction layer, not coarsening.) Do NOT force it (lowering
+`coarse_vote_ratio` / the `≥ 2×bpb+1` note guard regresses note accuracy on
+genuine 16th runs).
+
+## Learned melody quantizer — v1 MLP default, v2 seq model ROLLED BACK
+- **Shipped default** (`models/melody_quantizer.onnx`): v1 per-note MLP,
+  12 duration tokens, `[1,seq,9]→[1,seq,12]`, trained by
+  `tools/melody_corpus/train_quantizer.py` (holdout split). Ties or beats
+  legacy on the corpus.
+- **v2 BiGRU + MERGE token (2026-08-16, ROLLED BACK):** 13-class sequence
+  model (`tools/melody_corpus/train_quantizer_seq.py`), kept as
+  `models/melody_quantizer_v2_seq.onnx` (+ `.pt` state). Synthetic metrics
+  excellent (holdout token 0.93, merge P/R 0.94) but FAILED the corpus gate
+  (recall 0.34 vs 0.38) — the 9-feature vector has no inter-note gap
+  feature, so genuine staccato repeats get over-merged. Iteration 2: add
+  `gap_to_prev_beats` as a 10th feature (Python trainer + Rust
+  `learned_note_features` together) and retrain.
+- **Rust merge path (shipped, 13-class-ready):** `merge_keep_mask` + span
+  extension + contiguity guard (< 0.08 beats raw gap) in
+  `quantize_aligned_notes_learned`. Token indices ≥ 12 = MERGE (no note
+  emitted; previous note extends to the next kept onset, same-bar only).
+  With a 12-class model this is a no-op passthrough.
 
 ## Chord display note
 The reference MusicXML's kinds were correct all along (Cmaj7/B-7/G-13 etc. —

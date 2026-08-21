@@ -1,7 +1,8 @@
 # Tier A2 — Chord quality collapse to 7ths + half-bar chord candidates
 
 Date: 2026-08-14
-Status: NOT STARTED
+Status: DONE 2026-08-20 (Part 1 shipped on by default; Part 2 shipped DISABLED by
+default — it regresses Confirmation at every split threshold; see "Results")
 Owner: implementer (any AI model — follow steps exactly, in order)
 Companion plans: `2026-08-14_IMPLEMENTATION_PLAN_INDEX.md` (read first)
 
@@ -172,6 +173,38 @@ target\release\keyscribe-cli.exe eval-corpus out\omnibook --bpm-file out\omniboo
 - chord exact ≥ 0.139, root ≥ 0.393, melody metrics within ±0.01 of baseline.
 - If Part 2 regresses the corpus, ship Part 2 disabled by default
   (`split_threshold = 0.0`) — Part 1 alone is already a win.
+
+## Results (2026-08-20)
+
+Part 1 (collapse) shipped, ON by default (`--no-chord-collapse` to disable):
+
+- Confirmation @208 (`--bpm --melody heuristic`): chord exact **0.030 → 0.102**
+  (target ≥ 0.10 ✓), root 0.340 → 0.327. Root dip is a greedy-matcher artifact
+  (the `compare` tool marks reference slots used on exact hits, shrinking the
+  remaining root pool; `tc` also drops 100→98 as consecutive-duplicate
+  suppression merges `13`→`7` with a following `7`). Verified the XML roots are
+  byte-identical except those 2 merged duplicates — the collapse never changes
+  a root. Accepted by user as a documented metric artifact.
+- Corpus (50 tracks, `eval-corpus`, `--melody heuristic`): chord exact
+  **0.139 → 0.197**, root 0.393 → 0.384 (same artifact). Melody unchanged
+  (pitch 0.863, note 0.405, recall 0.382, onset 0.231).
+- `cargo test --no-default-features --lib`: 88 passed, 0 failed, 1 ignored.
+
+Part 2 (half-bar splitting) implemented but **shipped DISABLED by default**
+(`--chord-split <x>` to enable; `TunedConfig.chord_split` / tuned grid not
+wired):
+
+- Sweep on Confirmation (collapse on): split 0.25 → exact 0.062/root 0.231,
+  0.3 → 0.071/0.232, 0.35 → 0.075/0.253, 0.45 → 0.086/0.258. Every point
+  regresses the split-off baseline (0.102/0.327). The half-bar whitened
+  profiles are too noisy (half the frames) and the Viterbi segment path
+  degrades without a per-segment energy recalibration.
+- Behavior-neutral when disabled: corpus with default config is identical to
+  Part 1-only (exact 0.197, root 0.384), so the segment refactor is safe.
+- Note: the plan's split condition `1 - cos < split_threshold` is inverted;
+  implemented as `1 - cos > split_threshold` (split when halves DIFFER), which
+  is the intended "chord change mid-bar" semantics. Empirical result stands
+  regardless.
 
 ## Docs
 

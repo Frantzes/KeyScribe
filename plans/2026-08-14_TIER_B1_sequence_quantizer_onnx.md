@@ -1,7 +1,11 @@
 # Tier B1 — Sequence-model melody quantizer with merge tokens (ONNX)
 
 Date: 2026-08-14
-Status: NOT STARTED
+Status: EXECUTED 2026-08-16 — GATE FAILED, ROLLED BACK (v1 restored as
+default; seq model kept as `models/melody_quantizer_v2_seq.onnx`; Rust merge
+path shipped as a no-op-compatible upgrade). See PROGRESS_JOURNAL 2026-08-16
+for the measured A/B and the root cause (missing gap feature). Iteration 2
+premise: add `gap_to_prev_beats` as a 10th feature and retrain.
 Owner: implementer (any AI model — follow steps exactly, in order)
 Prerequisite: Tier A1 (`2026-08-14_TIER_A1_rhythm_merge_coarsening.md`)
 helps but is not strictly required; do A1 first if possible.

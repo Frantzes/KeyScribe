@@ -10,7 +10,8 @@ use anyhow::{anyhow, Context, Result};
 
 use crate::leadsheet::{
     cross_validate_beat_sources, generate_lead_sheet_enhanced_with_timeline, refine_beat_phase,
-    BeatTrackConfig, CrossValidatedBeats, LeadSheetFoundation, LeadSheetPresetConfig, NoteEvent,
+    refine_beat_phase_fixed_bpm, validate_downbeat_rotation, BeatTrackConfig, CrossValidatedBeats,
+    LeadSheetFoundation, LeadSheetPresetConfig, NoteEvent,
 };
 use crate::musicxml::{
     build_musicxml_document, extract_melody_heuristic, extract_melody_skyline,
@@ -78,6 +79,14 @@ pub struct TunedConfig {
     /// from legacy config files → `true` (coarsening on by default).
     #[serde(default = "default_true")]
     pub rhythm_coarsen: bool,
+    /// Collapse jazz-extended chord qualities to the nearest 7th-chord class.
+    /// Missing from legacy config files → `true` (collapse on by default).
+    #[serde(default = "default_true")]
+    pub chord_collapse: bool,
+    /// Half-bar chord split threshold (`0.0` = one chord per bar). Missing
+    /// from legacy config files → `0.0` (disabled).
+    #[serde(default)]
+    pub chord_split: f32,
 }
 
 impl Default for TunedConfig {
@@ -93,6 +102,8 @@ impl Default for TunedConfig {
             melody_quantizer: "learned".to_string(),
             bpm: None,
             rhythm_coarsen: true,
+            chord_collapse: true,
+            chord_split: 0.0,
         }
     }
 }
@@ -523,6 +534,13 @@ pub struct SheetOptions {
     /// When true and `chord_sample_beat < 0`, scan the first half of the bar but
     /// pick the position where the most notes onset together (the strike moment).
     pub chord_sample_strike: bool,
+    /// Collapse jazz-extended chord qualities (9ths/11ths/13ths/altered) to the
+    /// nearest 7th-chord class before output. `--no-chord-collapse` disables.
+    pub chord_collapse: bool,
+    /// Half-bar split threshold (Tier A2 Part 2): bars whose two whitened
+    /// halves differ by more than this are emitted as two chords (one per
+    /// half). `0.0` = disabled (one chord per bar). `--chord-split <x>`.
+    pub chord_split: f32,
     /// Rhythm-quantization engine for the melody. `LearnedOnnx` (default) falls
     /// back to the rule grid when `melody_quantizer.onnx` is absent.
     pub quantizer: crate::leadsheet::QuantizerEngine,
@@ -545,6 +563,8 @@ impl Default for SheetOptions {
             chord_sample_beat: -1.0,
             chord_sample_cleanest: false,
             chord_sample_strike: false,
+            chord_collapse: true,
+            chord_split: 0.0,
             quantizer: crate::leadsheet::QuantizerEngine::default(),
             quantizer_model_path: None,
             rhythm_coarsen: true,
@@ -599,8 +619,15 @@ fn generate_sheet_inner(
     );
 
     let beats = match sheet_opts.manual_bpm {
-        Some(bpm) => synthetic_beat_grid(bpm, analysis.duration_sec),
-        None => refine_beat_phase(&notes, &analysis.beats),
+        Some(bpm) => {
+            let syn = synthetic_beat_grid(bpm, analysis.duration_sec);
+            refine_beat_phase_fixed_bpm(&notes, &syn)
+        }
+        None => {
+            let mut refined = refine_beat_phase(&notes, &analysis.beats);
+            validate_downbeat_rotation(&notes, &mut refined, 0.25);
+            refined
+        }
     };
 
     let mut config = LeadSheetPresetConfig::default();
@@ -609,6 +636,8 @@ fn generate_sheet_inner(
     config.chord_analysis.chord_sample_beat = sheet_opts.chord_sample_beat;
     config.chord_analysis.chord_sample_cleanest = sheet_opts.chord_sample_cleanest;
     config.chord_analysis.chord_sample_strike = sheet_opts.chord_sample_strike;
+    config.chord_analysis.collapse_extensions = sheet_opts.chord_collapse;
+    config.chord_analysis.split_threshold = sheet_opts.chord_split;
     config.quantizer = sheet_opts.quantizer;
     config.quantizer_model_path = sheet_opts.quantizer_model_path.clone();
     config.rhythm_coarsen.enabled = sheet_opts.rhythm_coarsen;
@@ -837,14 +866,16 @@ pub(crate) fn extract_notes_from_timeline(
                     run_start = Some(onset);
                     max_prob = prob;
                 } else {
-                    max_prob = max_prob.max(prob);
-                    // Re-articulation: the onset head fired on a sounding
-                    // note (staccato repeat) — split at the onset-head peak.
-                    if onset_at(note_idx, frame_idx) >= onset_split_threshold {
-                        let split_frame = refine_onset(note_idx, frame_idx)
-                            .max(run_start.unwrap().saturating_add(1));
-                        let start_time = run_start.unwrap() as f32 * step_sec;
-                        let mut end_time = split_frame as f32 * step_sec;
+                    // Adaptive release: even though prob >= threshold, if the
+                    // probability has collapsed well below the note's own peak,
+                    // the note has effectively ended and a new (possibly
+                    // different) excitation is sustaining above threshold. End
+                    // the current note and let the next frame re-trigger.
+                    let release_thr = (max_prob * release_ratio).max(release_floor);
+                    if prob < release_thr {
+                        let start_idx = run_start.unwrap();
+                        let start_time = start_idx as f32 * step_sec;
+                        let mut end_time = frame_idx as f32 * step_sec;
                         if end_time <= start_time {
                             end_time = start_time + step_sec;
                         }
@@ -858,8 +889,36 @@ pub(crate) fn extract_notes_from_timeline(
                             channel: None,
                         });
                         *next_id = next_id.saturating_add(1);
-                        run_start = Some(split_frame);
+                        // Re-start a new note at this frame since prob is still
+                        // above the raw threshold (a fresh excitation).
+                        let onset = refine_onset(note_idx, frame_idx);
+                        run_start = Some(onset);
                         max_prob = prob;
+                    } else {
+                        max_prob = max_prob.max(prob);
+                        // Re-articulation: the onset head fired on a sounding
+                        // note (staccato repeat) — split at the onset-head peak.
+                        if onset_at(note_idx, frame_idx) >= onset_split_threshold {
+                            let split_frame = refine_onset(note_idx, frame_idx)
+                                .max(run_start.unwrap().saturating_add(1));
+                            let start_time = run_start.unwrap() as f32 * step_sec;
+                            let mut end_time = split_frame as f32 * step_sec;
+                            if end_time <= start_time {
+                                end_time = start_time + step_sec;
+                            }
+                            let velocity = (max_prob * 127.0).round().clamp(1.0, 127.0) as u8;
+                            out.push(NoteEvent {
+                                id: *next_id,
+                                pitch: (PIANO_LOW_MIDI as usize + note_idx) as u8,
+                                start_time,
+                                end_time,
+                                velocity,
+                                channel: None,
+                            });
+                            *next_id = next_id.saturating_add(1);
+                            run_start = Some(split_frame);
+                            max_prob = prob;
+                        }
                     }
                 }
             } else if let Some(start_idx) = run_start {

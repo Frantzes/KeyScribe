@@ -673,7 +673,12 @@ fn sixteenth_triplet_grid() -> Vec<f32> {
     vec![0.0, 1.0 / 6.0, 1.0 / 3.0, 0.5, 2.0 / 3.0, 5.0 / 6.0, 1.0]
 }
 
-fn snap_intra_beat_pos(pos: f32, grid: &[f32]) -> (f32, f32) {
+fn snap_intra_beat_pos(
+    pos: f32,
+    grid: &[f32],
+    beat_in_bar: u32,
+    beats_per_bar: u32,
+) -> (f32, f32) {
     if grid.is_empty() {
         return (0.0, 1.0);
     }
@@ -686,7 +691,7 @@ fn snap_intra_beat_pos(pos: f32, grid: &[f32]) -> (f32, f32) {
     // grid, so real subdivisions still win.
     let slot_penalty = |g: f32| -> f32 {
         let frac = (g * 12.0).round() / 12.0;
-        if frac.abs() < 1e-3 || (frac - 0.5).abs() < 1e-3 || (frac - 1.0).abs() < 1e-3 {
+        let base = if frac.abs() < 1e-3 || (frac - 0.5).abs() < 1e-3 || (frac - 1.0).abs() < 1e-3 {
             0.0 // onbeats and straight 8ths
         } else if (frac - 0.25).abs() < 1e-3 || (frac - 0.75).abs() < 1e-3 {
             0.045 // 16ths
@@ -694,7 +699,21 @@ fn snap_intra_beat_pos(pos: f32, grid: &[f32]) -> (f32, f32) {
             0.03 // triplet 8ths
         } else {
             0.06 // 16th triplets
-        }
+        };
+        // Metrical strength prior: on strong beats (1 and 3 in 4/4), the
+        // onbeat slot (0.0) gets a small extra pull. A genuine 16th at large
+        // distance still wins, but when the onset is ambiguously between an
+        // 8th and a 16th, the onbeat wins on strong beats.
+        let metrical_bonus = if frac.abs() < 1e-3 || (frac - 1.0).abs() < 1e-3 {
+            match beat_in_bar {
+                0 => 0.02, // beat 1
+                b if beats_per_bar > 2 && b == beats_per_bar / 2 => 0.01, // beat 3
+                _ => 0.0,
+            }
+        } else {
+            0.0
+        };
+        base - metrical_bonus
     };
     let mut best = grid[0];
     let mut best_cost = (pos - grid[0]).abs() + slot_penalty(grid[0]);
@@ -708,7 +727,88 @@ fn snap_intra_beat_pos(pos: f32, grid: &[f32]) -> (f32, f32) {
     (best, (pos - best).abs())
 }
 
+/// Tier B1 MERGE_INTO_PREVIOUS decoding: given one vocabulary index per
+/// detection, return a keep mask. A detection whose token index is outside
+/// `LEARNED_TOKEN_TABLE` (the 13th class) is a fragment of the PREVIOUS
+/// detection and is not emitted (a leading merge with no previous note is
+/// dropped). A v1 12-class model produces no out-of-vocab indices, so this
+/// is a no-op passthrough for it.
+pub(crate) fn merge_keep_mask(tokens: &[u32]) -> Vec<bool> {
+    let vocab = LEARNED_TOKEN_TABLE.len() as u32;
+    tokens.iter().map(|&t| t < vocab).collect()
+}
+
 // ── Main Aligned Quantization Entry Point ──────────────────────────────────
+
+/// Duration fill (rhythm alternative 1): monophonic lead-sheet lines are
+/// mostly continuous — a note lasts until the next onset. Detected note ends
+/// (adaptive-release times) are far noisier than onsets, so duration error is
+/// dominated by under-filling. This pass extends each note's duration to the
+/// next snapped onset UNLESS there is substantial audible silence after it
+/// (rest evidence): `raw_gap_beats > fill_max_gap` keeps the note short.
+/// `KEYSCRIBE_FILL_GAP=<beats>` overrides the threshold (debug/sweep), and
+/// `KEYSCRIBE_FILL_GAP=0` disables the pass.
+pub fn fill_melody_durations(
+    quantized: &mut [QuantizedNote],
+    aligned: &[BeatAlignedNote],
+) {
+    if quantized.len() < 2 {
+        return;
+    }
+    let mut max_gap = 0.30f32;
+    let mut enabled = true;
+    if let Ok(v) = std::env::var("KEYSCRIBE_FILL_GAP") {
+        if let Ok(f) = v.parse::<f32>() {
+            if f <= 0.0 {
+                enabled = false;
+            } else {
+                max_gap = f;
+            }
+        }
+    }
+    if !enabled {
+        return;
+    }
+    let raw_by_id: std::collections::HashMap<u32, &BeatAlignedNote> =
+        aligned.iter().map(|n| (n.id, n)).collect();
+
+    let mut debug_filled = 0usize;
+    for i in 0..quantized.len().saturating_sub(1) {
+        let cur = &quantized[i];
+        let next = &quantized[i + 1];
+        let snapped_gap = next.beat_start - cur.beat_start;
+        if snapped_gap <= cur.beat_duration || snapped_gap <= 0.0 {
+            continue; // already spans, or next onset is not after this note
+        }
+        let Some(raw) = raw_by_id.get(&cur.id).copied() else { continue };
+        let raw_gap_beats = (next_raw_start(&quantized[i + 1], &raw_by_id)
+            - raw.original_end_time)
+            / raw.beat_duration_sec.max(0.001);
+        if raw_gap_beats <= max_gap {
+            quantized[i].beat_duration = snapped_gap.min(4.0);
+            debug_filled += 1;
+        }
+    }
+    if std::env::var_os("KEYSCRIBE_QUANT_DEBUG").is_some() {
+        eprintln!(
+            "[quant-debug] duration fill: extended {} of {} notes (max gap {:.2} beats)",
+            debug_filled,
+            quantized.len(),
+            max_gap
+        );
+    }
+}
+
+/// Raw onset (seconds) of the note following `q`, via the aligned table.
+fn next_raw_start(
+    q: &QuantizedNote,
+    raw_by_id: &std::collections::HashMap<u32, &BeatAlignedNote>,
+) -> f32 {
+    raw_by_id
+        .get(&q.id)
+        .map(|n| n.original_start_time)
+        .unwrap_or(f32::INFINITY)
+}
 
 pub fn quantize_aligned_notes(
     aligned: &[BeatAlignedNote],
@@ -790,7 +890,12 @@ pub fn quantize_aligned_notes(
         } else {
             grid_for(i)
         };
-        let (snapped_pos, snap_error) = snap_intra_beat_pos(note.intra_beat_pos, &sub_grid);
+        let (snapped_pos, snap_error) = snap_intra_beat_pos(
+            note.intra_beat_pos,
+            &sub_grid,
+            note.beat_index % beats_per_bar,
+            beats_per_bar,
+        );
         snapped.push(Snapped {
             note,
             style,
@@ -1382,21 +1487,137 @@ pub fn quantize_aligned_notes_learned(
         }
     };
 
+    // Tier B1: vocabulary index >= LEARNED_TOKEN_TABLE.len() is the
+    // MERGE_INTO_PREVIOUS class — the detection is a spurious fragment of
+    // the previous detection. Merged detections emit no note; the previous
+    // note's duration is extended to span them.
+    //
+    // Gap guard: training fragments are CONTIGUOUS (near-zero gap), but a
+    // genuine staccato re-articulation has real silence between the notes
+    // and must NOT be merged even when the model says so (corpus A/B:
+    // unguarded merging cost recall 0.38 -> 0.34). Only honor the merge
+    // when the detection starts within MERGE_MAX_GAP_BEATS of the previous
+    // kept detection's end.
+    const MERGE_MAX_GAP_BEATS: f32 = 0.08;
+    let mut keep_mask = merge_keep_mask(&tokens);
+    let mut last_kept_end: Option<(usize, f32)> = None; // (sorted idx, end beats)
+    for i in 0..sorted.len() {
+        if keep_mask[i] {
+            let note = sorted[i];
+            let raw_end_beats = note.original_end_time
+                / note.beat_duration_sec.max(0.001);
+            last_kept_end = Some((i, raw_end_beats));
+            continue;
+        }
+        // A merge token: require contiguity with the previous KEPT note.
+        if let Some((_, prev_end)) = last_kept_end {
+            let note = sorted[i];
+            let raw_start_beats = note.original_start_time
+                / note.beat_duration_sec.max(0.001);
+            if raw_start_beats - prev_end > MERGE_MAX_GAP_BEATS {
+                keep_mask[i] = true; // real silence: keep as its own note
+            }
+        }
+    }
+
+    // Pre-compute each detection's snapped onset so merged spans can extend
+    // the previous kept note to the next kept onset.
+    let beat_pos: Vec<f32> = sorted
+        .iter()
+        .map(|n| n.beat_index as f32 + n.intra_beat_pos)
+        .collect();
+    let gap = |i: usize| -> f32 {
+        (beat_pos[i + 1] - beat_pos[i]).abs()
+    };
+    let grid_for = |i: usize| -> Vec<f32> {
+        let prev_gap = if i > 0 { gap(i - 1) } else { f32::INFINITY };
+        let next_gap = if i + 1 < beat_pos.len() { gap(i) } else { f32::INFINITY };
+        let near = |g: f32, target: f32, tol: f32| (g - target).abs() <= tol;
+        if prev_gap.is_finite() && next_gap.is_finite() {
+            let two_gap = prev_gap + next_gap;
+            if near(two_gap, 1.0 / 3.0, 0.07) {
+                sixteenth_triplet_grid()
+            } else if near(two_gap, 2.0 / 3.0, 0.10) {
+                eighth_triplet_grid()
+            } else {
+                straight_grid()
+            }
+        } else if near(prev_gap, 1.0 / 6.0, 0.045) || near(next_gap, 1.0 / 6.0, 0.045) {
+            sixteenth_triplet_grid()
+        } else if near(prev_gap, 1.0 / 3.0, 0.055) || near(next_gap, 1.0 / 3.0, 0.055) {
+            eighth_triplet_grid()
+        } else {
+            straight_grid()
+        }
+    };
+
+    let snapped_starts: Vec<f32> = sorted
+        .iter()
+        .enumerate()
+        .map(|(i, note)| {
+            let style = section_for(note).map(|s| s.style).unwrap_or(SwingStyle::Straight);
+            let sub_grid = if style == SwingStyle::Swing {
+                subdivision_grid(style)
+            } else {
+                grid_for(i)
+            };
+            let (snapped_pos, _) = snap_intra_beat_pos(
+                note.intra_beat_pos,
+                &sub_grid,
+                note.beat_index % beats_per_bar,
+                beats_per_bar,
+            );
+            note.beat_index as f32 + snapped_pos
+        })
+        .collect();
+
     let mut quantized: Vec<QuantizedNote> = Vec::with_capacity(sorted.len());
-    for (note, idx) in sorted.iter().zip(tokens.iter()) {
+    for (i, (note, idx)) in sorted.iter().zip(tokens.iter()).enumerate() {
+        if !keep_mask[i] {
+            continue;
+        }
         let style = section_for(note).map(|s| s.style).unwrap_or(SwingStyle::Straight);
         let token = LEARNED_TOKEN_TABLE
             .get(*idx as usize)
             .copied()
             .unwrap_or(LEARNED_TOKEN_TABLE[4]); // quarter fallback for out-of-vocab
-        let sub_grid = subdivision_grid(style);
-        let (snapped_pos, snap_error) = snap_intra_beat_pos(note.intra_beat_pos, &sub_grid);
+        let sub_grid = if style == SwingStyle::Swing {
+            subdivision_grid(style)
+        } else {
+            grid_for(i)
+        };
+        let (snapped_pos, snap_error) = snap_intra_beat_pos(
+            note.intra_beat_pos,
+            &sub_grid,
+            note.beat_index % beats_per_bar,
+            beats_per_bar,
+        );
         let beat_start = note.beat_index as f32 + snapped_pos;
+        let mut beat_duration = token.beats.max(1.0 / 6.0);
+        // Span extension: when the detections FOLLOWING this note were
+        // merged into it, cover up to the next KEPT detection's snapped
+        // onset (same bar only) or the bar end — never past it.
+        let mut k = i + 1;
+        while k < sorted.len() && !keep_mask[k] {
+            k += 1;
+        }
+        if k > i + 1 {
+            let bar_end = ((beat_start / beats_per_bar.max(1) as f32).floor() + 1.0)
+                * beats_per_bar.max(1) as f32;
+            let mut span_target = bar_end;
+            if k < sorted.len() && sorted[k].bar_index == note.bar_index {
+                span_target = snapped_starts[k];
+            }
+            let span = (span_target - beat_start).max(0.0);
+            if span > beat_duration {
+                beat_duration = span.min(bar_end - beat_start).max(1.0 / 6.0);
+            }
+        }
         quantized.push(QuantizedNote {
             id: note.id,
             pitch: note.pitch,
             beat_start,
-            beat_duration: token.beats.max(1.0 / 6.0),
+            beat_duration,
             velocity: note.velocity,
             channel: note.channel,
             confidence: (1.0 - snap_error * 2.0).clamp(0.3, 1.0),
@@ -1407,6 +1628,15 @@ pub fn quantize_aligned_notes_learned(
             swing_style: style,
             swing_feel: style == SwingStyle::Swing,
         });
+    }
+    if std::env::var_os("KEYSCRIBE_QUANT_DEBUG").is_some() {
+        let merged = keep_mask.iter().filter(|&&k| !k).count();
+        eprintln!(
+            "[quant-debug] learned engine: {} of {} detections merged into previous ({} notes emitted)",
+            merged,
+            tokens.len(),
+            quantized.len()
+        );
     }
 
     quantized.sort_by(|a, b| {
@@ -1690,7 +1920,7 @@ mod tests {
         let grid = subdivision_grid(SwingStyle::Straight);
         assert!(grid.iter().any(|p| (*p - 1.0 / 6.0).abs() < 1e-6));
         assert!(grid.iter().any(|p| (*p - 5.0 / 6.0).abs() < 1e-6));
-        let (snapped, _) = snap_intra_beat_pos(0.17, &grid);
+        let (snapped, _) = snap_intra_beat_pos(0.17, &grid, 0, 4);
         assert!((snapped - 1.0 / 6.0).abs() < 1e-6);
     }
 
@@ -1849,7 +2079,7 @@ mod tests {
 
     #[test]
     fn snap_intra_pos_to_on_beat() {
-        let (pos, err) = snap_intra_beat_pos(0.03, &[0.0, 0.5]);
+        let (pos, err) = snap_intra_beat_pos(0.03, &[0.0, 0.5], 0, 4);
         assert!((pos - 0.0).abs() < 0.001);
         assert!(err < 0.05);
     }
@@ -1857,9 +2087,30 @@ mod tests {
     #[test]
     fn snap_intra_pos_to_swing() {
         let grid = vec![0.0, 2.0 / 3.0];
-        let (pos, err) = snap_intra_beat_pos(0.65, &grid);
+        let (pos, err) = snap_intra_beat_pos(0.65, &grid, 0, 4);
         assert!((pos - 2.0 / 3.0).abs() < 0.001);
         assert!(err < 0.05);
+    }
+
+    #[test]
+    fn metrical_bonus_pulls_ambiguity_to_onbeat_on_strong_beat() {
+        let grid = straight_grid();
+        // p=0.14 on beat 1 (4/4): cost to 0.0 = 0.14 - 0.02 = 0.12, cost to
+        // 0.25 = 0.11 + 0.045 = 0.155 → onbeat wins.
+        let (pos, _) = snap_intra_beat_pos(0.14, &grid, 0, 4);
+        assert!((pos - 0.0).abs() < 1e-4);
+    }
+
+    #[test]
+    fn metrical_bonus_is_a_tiebreaker_not_a_decider() {
+        let grid = straight_grid();
+        // p=0.15: beat 1 (bonus 0.02) → 0.0 wins (0.13 vs 0.145); beat 2
+        // (no bonus) → 0.25 wins (0.15 vs 0.145). Same onset, different snap
+        // purely from metrical position.
+        let (pos1, _) = snap_intra_beat_pos(0.15, &grid, 0, 4);
+        assert!((pos1 - 0.0).abs() < 1e-4);
+        let (pos2, _) = snap_intra_beat_pos(0.15, &grid, 1, 4);
+        assert!((pos2 - 0.25).abs() < 1e-4);
     }
 
     #[test]
@@ -1989,5 +2240,31 @@ mod tests {
         for (a, b) in out.iter().zip(notes.iter()) {
             assert!((a.beat_start - b.beat_start).abs() < 1e-4);
         }
+    }
+
+    #[test]
+    fn merge_keep_mask_drops_merge_tokens() {
+        // quarter, merge, eighth, merge, merge -> only two notes survive.
+        let mask = merge_keep_mask(&[4, 12, 6, 12, 12]);
+        assert_eq!(mask, vec![true, false, true, false, false]);
+    }
+
+    #[test]
+    fn merge_keep_mask_leading_merge_is_dropped() {
+        let mask = merge_keep_mask(&[12, 4, 12, 4]);
+        assert_eq!(mask, vec![false, true, false, true]);
+    }
+
+    #[test]
+    fn merge_keep_mask_v1_vocab_passthrough() {
+        // A v1 12-class model never emits index >= 12: keep everything.
+        let tokens: Vec<u32> = (0..12u32).collect();
+        assert!(merge_keep_mask(&tokens).iter().all(|&k| k));
+        assert_eq!(merge_keep_mask(&tokens).len(), 12);
+    }
+
+    #[test]
+    fn merge_keep_mask_empty() {
+        assert!(merge_keep_mask(&[]).is_empty());
     }
 }

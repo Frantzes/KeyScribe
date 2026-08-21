@@ -23,6 +23,16 @@ pub struct ChordAnalysisConfig {
     /// position where the most notes ONSET together (the strike moment), instead
     /// of the most simultaneous sounding pitch classes.
     pub chord_sample_strike: bool,
+    /// Collapse jazz-extended qualities (9ths, 11ths, 13ths, altered) to the
+    /// nearest 7th-chord class before output (user decision 2026-08-14,
+    /// mirrors CHORD_DETECTION_PLAN.md Decision 2). The Viterbi still decodes
+    /// over the full 27-template set; only the emitted symbol is collapsed.
+    pub collapse_extensions: bool,
+    /// Half-bar split threshold (Tier A2 Part 2): a bar whose two whitened
+    /// halves have `1 - cosine` below this value is emitted as TWO chords
+    /// (one per half). `0.0` = disabled (one chord per bar, legacy behavior).
+    /// Enable around `0.35` after measuring.
+    pub split_threshold: f32,
 }
 
 impl Default for ChordAnalysisConfig {
@@ -36,6 +46,8 @@ impl Default for ChordAnalysisConfig {
             chord_sample_beat: -1.0,
             chord_sample_cleanest: false,
             chord_sample_strike: false,
+            collapse_extensions: true,
+            split_threshold: 0.0,
         }
     }
 }
