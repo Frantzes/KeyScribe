@@ -75,13 +75,35 @@ jobs:
 
   build-linux:
     needs: [version]
-    runs-on: ubuntu-latest
+    # Ubuntu 22.04 (glibc 2.35) so the portable binary and the AppImage run
+    # on older distros too. See scripts/build-appimage-compat.sh for the
+    # equivalent local container build.
+    runs-on: ubuntu-22.04
     steps:
       - uses: actions/checkout@v4
       - uses: actions-rust-lang/setup-rust-toolchain@v1
 
       - name: Install system dependencies
-        run: sudo apt-get update && sudo apt-get install -y libasound2-dev
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            pkg-config \
+            clang \
+            libclang-dev \
+            libasound2-dev \
+            libssl-dev \
+            libxkbcommon-dev \
+            libxkbcommon-x11-dev \
+            libwayland-dev \
+            libxrandr-dev \
+            libxinerama-dev \
+            libxcursor-dev \
+            libxi-dev \
+            libgl1-mesa-dev \
+            libegl1-mesa-dev \
+            python3-pip \
+            unzip \
+            zip
 
       - name: Cache ONNX models
         id: cache-models
@@ -104,11 +126,16 @@ jobs:
       - name: Package portable zip
         run: bash scripts/build-linux.sh --skip-cargo-build
 
+      - name: Package AppImage
+        run: bash scripts/build-appimage.sh --skip-bundle
+
       - uses: actions/upload-artifact@v4
         if: always()
         with:
           name: keyscribe-linux
-          path: build/linux/
+          path: |
+            build/linux/*.zip
+            build/linux/*.AppImage
 
   build-macos:
     needs: [version]
@@ -146,8 +173,36 @@ jobs:
           name: keyscribe-macos
           path: build/macos/keyscribe-macos-arm64.dmg
 
+  flatpak-bundle:
+    # Self-contained Flatpak (freedesktop 24.08 runtime): runs on any distro
+    # with Flatpak installed. Built with the same manifest developers use
+    # locally (flatpak/build-flatpak.sh) via Flathub's CI container.
+    needs: [version]
+    runs-on: ubuntu-latest
+    container:
+      image: ghcr.io/flathub-infra/flatpak-github-actions:gnome-48
+      options: --privileged
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build Flatpak bundle
+        uses: flatpak/flatpak-github-actions/flatpak-builder@v6
+        with:
+          bundle: keyscribe.flatpak
+          manifest-path: flatpak/com.frantzes.keyscribe.yml
+          cache-key: flatpak-builder-main
+
+      - name: Stage bundle artifact
+        run: mv keyscribe.flatpak keyscribe-linux-x86_64.flatpak
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: keyscribe-flatpak
+          path: keyscribe-linux-x86_64.flatpak
+
   release:
-    needs: [version, build-windows, build-linux, build-macos]
+    needs: [version, build-windows, build-linux, build-macos, flatpak-bundle]
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -165,10 +220,20 @@ jobs:
             exit 0
           fi
           ASSETS=()
+          # Single-file distributables are attached directly (no re-zipping).
+          shopt -s nullglob
+          for f in keyscribe-linux/*.AppImage keyscribe-flatpak/*.flatpak; do
+            ASSETS+=("$f")
+          done
+          # The remaining per-OS folders are zipped as before.
           for dir in keyscribe-windows keyscribe-linux keyscribe-macos; do
             if [ -d "$dir" ]; then
               ARCHIVE="${dir}.zip"
-              cd "$dir" && zip -r "../$ARCHIVE" . && cd ..
+              ( cd "$dir" && zip -r "../$ARCHIVE" . )
+              # Don't nest the already-attached AppImage inside the linux zip.
+              if [ "$dir" = "keyscribe-linux" ]; then
+                zip -d "$ARCHIVE" "*.AppImage" >/dev/null 2>&1 || true
+              fi
               ASSETS+=("$ARCHIVE")
             fi
           done

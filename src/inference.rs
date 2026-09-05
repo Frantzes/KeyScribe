@@ -2,7 +2,7 @@
 
 use anyhow::{anyhow, Result};
 use ort::{session::Session, value::Tensor};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 /// Configuration for Spotify Basic Pitch ONNX inference.
 #[derive(Debug, Clone)]
@@ -40,15 +40,30 @@ pub struct BasicPitchInference {
 
 impl BasicPitchInference {
     /// Create a new Basic Pitch inference engine.
+    ///
+    /// `config.model_path` may be an exact path or a bare filename; when it
+    /// does not exist as given, it is resolved next to the running
+    /// executable (`<exe>/models/<file>`, portable bundle/AppImage/Flatpak
+    /// layout) before falling back to the working directory. This keeps the
+    /// app working regardless of the launch CWD (e.g. desktop entries).
     pub fn new(config: InferenceConfig) -> Result<Self> {
-        if !Path::new(&config.model_path).exists() {
-            return Err(anyhow!(
-                "Basic Pitch ONNX model not found at: {}",
-                config.model_path
-            ));
-        }
+        let given = Path::new(&config.model_path);
+        let model_path: PathBuf = if given.exists() {
+            given.to_path_buf()
+        } else {
+            let filename = given
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or(&config.model_path);
+            crate::demucs::resolve_model_path(filename).ok_or_else(|| {
+                anyhow!(
+                    "Basic Pitch ONNX model not found at: {}",
+                    config.model_path
+                )
+            })?
+        };
 
-        let session = Session::builder()?.commit_from_file(&config.model_path)?;
+        let session = Session::builder()?.commit_from_file(&model_path)?;
         let input_name = session
             .inputs()
             .first()

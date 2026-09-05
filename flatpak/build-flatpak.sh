@@ -25,7 +25,8 @@ set -euo pipefail
 # com.frantzes.keyscribe.yml, so flatpak-builder can be run directly on the
 # manifest without this script. To bump the ONNX Runtime version, update the
 # URL and sha256 in the manifest (get them from
-# https://pypi.org/pypi/onnxruntime-gpu/<version>/json).
+# https://pypi.org/pypi/onnxruntime-gpu/<version>/json) plus the
+# libonnxruntime.so.<ver> symlink target in the onnxruntime-gpu module.
 # ──────────────────────────────────────────────────
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -75,6 +76,7 @@ FLATPAK_RUNTIMES=(
     "org.freedesktop.Platform//24.08"
     "org.freedesktop.Sdk//24.08"
     "org.freedesktop.Sdk.Extension.rust-stable//24.08"
+    "org.freedesktop.Sdk.Extension.llvm18//24.08"
 )
 
 for rt in "${FLATPAK_RUNTIMES[@]}"; do

@@ -497,7 +497,37 @@ pub(crate) fn app_cache_base_dir() -> PathBuf {
         }
     }
 
-    app_portable_base_dir()
+    // Portable layout keeps the cache next to the executable — but only when
+    // that location is actually writable. AppImage squashfs mounts
+    // (/tmp/.mount_*/...), Flatpak's /app, and protected install dirs
+    // (Program Files, /usr/bin) are read-only; writing there fails with
+    // EROFS. Fall back to the OS user cache dir in that case.
+    let portable = app_portable_base_dir();
+    if is_dir_writable(&portable) {
+        return portable;
+    }
+    if let Some(project_dirs) = app_project_dirs() {
+        return project_dirs.cache_dir().to_path_buf();
+    }
+    portable
+}
+
+/// Probe whether `dir` can be created and written to.
+///
+/// Read-only locations (AppImage mounts, Flatpak /app, system install dirs)
+/// fail here, signalling callers to use the OS user dirs instead.
+fn is_dir_writable(dir: &Path) -> bool {
+    if fs::create_dir_all(dir).is_err() {
+        return false;
+    }
+    let probe = dir.join(".keyscribe-write-test");
+    match fs::write(&probe, b"w") {
+        Ok(()) => {
+            let _ = fs::remove_file(&probe);
+            true
+        }
+        Err(_) => false,
+    }
 }
 
 fn ensure_parent_dir(path: &Path) -> bool {

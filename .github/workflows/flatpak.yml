@@ -9,8 +9,11 @@ name: Flatpak
 # and the rust-stable SDK extension from Flathub at build time.
 
 on:
+  # Validation only: main-branch releases (AppImage + Flatpak attached to the
+  # version-tag release) are built by build.yml. This workflow smoke-tests
+  # the Flatpak on feature branches and PRs.
   push:
-    branches: [main, "feat/flatpak-support"]
+    branches: ["feat/flatpak-support"]
     paths:
       - "flatpak/**"
       - ".github/workflows/flatpak.yml"
@@ -88,7 +91,9 @@ jobs:
             test -f /app/bin/models/htdemucs_6s.onnx && echo "ok: htdemucs model"
             test -f /app/bin/models/beat_this_small.onnx && echo "ok: beat model"
             test -f /app/bin/models/mel_spectrogram.onnx && echo "ok: mel model"
+            test -f /app/bin/models/basic-pitch.onnx && echo "ok: basic-pitch model"
             test -f /app/bin/cuda/libonnxruntime.so && echo "ok: cuda/ort libs"
+            test -f /app/bin/cuda/libcudart.so.12 && echo "ok: cuda runtime libs"
             test -f /app/share/applications/com.frantzes.keyscribe.desktop && echo "ok: desktop file"
             test -f /app/share/metainfo/com.frantzes.keyscribe.metainfo.xml && echo "ok: metainfo"
             test -f /app/share/icons/hicolor/256x256/apps/com.frantzes.keyscribe.png && echo "ok: icon"

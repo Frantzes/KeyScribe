@@ -259,18 +259,24 @@ pub fn verify_api_key(api_key: &str) -> Result<MvsepUserInfo> {
  .ok_or_else(|| anyhow!("No user data returned by MVSep"))
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Default)]
 struct MvsepCreateData {
- hash: Option<String>,
- message: Option<String>,
+  #[serde(default)]
+  hash: Option<String>,
+  #[serde(default)]
+  message: Option<String>,
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Default)]
 struct MvsepCreateResponse {
- success: bool,
- data: Option<MvsepCreateData>,
- error: Option<String>,
- message: Option<String>,
+  #[serde(default)]
+  success: bool,
+  #[serde(default)]
+  data: Option<MvsepCreateData>,
+  #[serde(default)]
+  error: Option<String>,
+  #[serde(default)]
+  message: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -309,6 +315,20 @@ pub fn is_invalid_token_error(err: &str) -> bool {
         || lower.contains("api key is required")
         || lower.contains("api key required")
         || lower.contains("unauthorized")
+}
+
+/// Compact a raw server response body into a short single-line snippet for
+/// error messages (whitespace-collapsed, truncated). Never includes the API
+/// key: MVSep responses echo job data, never credentials.
+fn body_text_snippet(body: &str) -> String {
+    let compact: String = body.split_whitespace().collect::<Vec<_>>().join(" ");
+    const MAX_SNIPPET_CHARS: usize = 300;
+    if compact.chars().count() <= MAX_SNIPPET_CHARS {
+        compact
+    } else {
+        let truncated: String = compact.chars().take(MAX_SNIPPET_CHARS).collect();
+        format!("{truncated}…")
+    }
 }
 
 /// Format an error message returned by MVSep into user-friendly explanations.
@@ -405,12 +425,38 @@ pub fn separate_audio_file(
 
     let job_hash = if let Some(body) = create_body {
         if !body.success {
+            // Log the full body for diagnosis; server rejections without a
+            // message (e.g. concurrent-job or rate limits on free accounts)
+            // previously surfaced as an opaque "Unknown MVSep error".
+            eprintln!("[mvsep] job creation rejected (HTTP {create_status}): {body_text}");
             let err_msg = body
                 .data
                 .and_then(|d| d.message)
                 .or(body.message)
                 .or(body.error)
-                .unwrap_or_else(|| "Unknown MVSep error during job creation".to_string());
+                .filter(|m| !m.trim().is_empty())
+                .map(|m| {
+                    let snippet = body_text_snippet(&body_text);
+                    if snippet.is_empty() {
+                        m
+                    } else {
+                        format!("{m} (server response: {snippet})")
+                    }
+                })
+                .unwrap_or_else(|| {
+                    let snippet = body_text_snippet(&body_text);
+                    let mut msg = format!(
+                        "MVSep rejected the job without an explanation (HTTP {create_status})"
+                    );
+                    if !snippet.is_empty() {
+                        msg.push_str(&format!(" — server response: {snippet}"));
+                    }
+                    msg.push_str(
+                        ". If you recently ran a separation, MVSep free accounts allow only \
+                         1 concurrent job: wait for the previous job to finish and retry.",
+                    );
+                    msg
+                });
             let formatted = format_mvsep_error(&err_msg);
             return Err(anyhow!("MVSep job creation failed: {formatted}"));
         }
@@ -425,6 +471,7 @@ pub fn separate_audio_file(
             ));
         }
         if !create_status.is_success() {
+            eprintln!("[mvsep] job creation HTTP {create_status}: {body_text}");
             let first_line = body_text.lines().next().unwrap_or("").trim();
             let summary = if !first_line.is_empty() {
                 format_mvsep_error(first_line)

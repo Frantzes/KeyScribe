@@ -15,6 +15,7 @@ command: keyscribe
 
 finish-args:
   - --share=ipc
+  - --share=network # MVSep cloud stem separation API (HTTPS)
   - --socket=x11
   - --socket=wayland
   - --device=dri
@@ -37,8 +38,8 @@ modules:
       - install -Dm755 bin/ffprobe /app/bin/ffprobe
     sources:
       - type: archive
-        url: https://github.com/BtbN/FFmpeg-Builds/releases/download/autobuild-2026-08-06-13-39/ffmpeg-N-125978-g95c43d7df7-linux64-gpl.tar.xz
-        sha256: 6fd6364a237569dc12940079acc636be9ff2b2f444552c0bad699186e3552c3d
+        url: https://github.com/BtbN/FFmpeg-Builds/releases/download/autobuild-2026-09-05-13-10/ffmpeg-N-126416-g9997fd0606-linux64-gpl.tar.xz
+        sha256: 13c82fe68c401eb3f3ae2e402beb480fdd384b4de7222ae368bdbab36e949ab6
         strip-components: 1
 
   # ──────────────────────────────────────────────
@@ -101,13 +102,61 @@ modules:
             cp -aP "$f" /app/bin/cuda/
           fi
         done
+      # The wheel only ships a versioned file, but the app loads the exact
+      # name `libonnxruntime.so` via ort::init_from (see src/demucs.rs).
+      # NOTE: keep the version in sync with the wheel pinned above.
+      - ln -sf libonnxruntime.so.1.24.4 /app/bin/cuda/libonnxruntime.so
       - ln -sf /app/bin/cuda/libonnxruntime.so /app/bin/libonnxruntime.so
       - cp -aP /app/bin/cuda/libonnxruntime_providers_cuda.so /app/bin/
     sources:
       - type: file
-        url: https://files.pythonhosted.org/packages/92/1d/2eb4443d9e85c5e219b61cd4995ef1d30bc5981c4bbb5dd624c9445edb8d/onnxruntime_gpu-1.24.2-cp312-cp312-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl
-        sha256: e4a3f793b291fb678583db0e78836319ab662f10a8485f7de858631b4ea5361c
-        dest-filename: onnxruntime_gpu-1.24.2-cp312-cp312-manylinux.whl
+        url: https://files.pythonhosted.org/packages/d0/2c/5b3fd4748cf7ed291eae541a37e426efc20ea04cb6e6a05768304ab0aa41/onnxruntime_gpu-1.24.4-cp312-cp312-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl
+        sha256: eb0e38f0c1ef3b76ae0081c8e51eed20dd8925aa916f0fc6f9b8b17d05610e99
+        dest-filename: onnxruntime_gpu-1.24.4-cp312-cp312-manylinux.whl
+
+  # ──────────────────────────────────────────────
+  # CUDA 12 runtime — NVIDIA cu12 pip wheels + nvrtc .deb
+  #
+  # These provide libcudart/cublas/cufft/curand/nvrtc for the ONNX Runtime
+  # CUDA execution provider. Pinned as file sources so the build stays
+  # fully offline (flatpak-builder build-commands have no network).
+  # Without these the app falls back to CPU inference.
+  # ──────────────────────────────────────────────
+  - name: cuda-libs
+    buildsystem: simple
+    build-commands:
+      - mkdir -p /app/bin/cuda wheel-extract
+      - |
+        for whl in ./*.whl; do python3 -m zipfile -e "$whl" wheel-extract; done
+        for lib in libcudart.so.12 libcublas.so.12 libcublasLt.so.12 \
+                   libcufft.so.11 libcurand.so.10; do
+          find wheel-extract -name "$lib" -exec cp -aP {} /app/bin/cuda/ \;
+        done
+      - |
+        mkdir -p nvrtc-data
+        ar p cuda-nvrtc.deb data.tar.xz | tar -xJ -C nvrtc-data
+        find nvrtc-data -name "libnvrtc*.so*" -exec cp -aP {} /app/bin/cuda/ \;
+    sources:
+      - type: file
+        url: https://files.pythonhosted.org/packages/bc/46/a92db19b8309581092a3add7e6fceb4c301a3fd233969856a8cbf042cd3c/nvidia_cuda_runtime_cu12-12.9.79-py3-none-manylinux2014_x86_64.manylinux_2_17_x86_64.whl
+        sha256: 25bba2dfb01d48a9b59ca474a1ac43c6ebf7011f1b0b8cc44f54eb6ac48a96c3
+        dest-filename: nvidia_cuda_runtime_cu12-12.9.79-py3-none-manylinux.whl
+      - type: file
+        url: https://files.pythonhosted.org/packages/cb/c0/0a517bfe63ccd3b92eb254d264e28fca3c7cab75d07daea315250fb1bf73/nvidia_cublas_cu12-12.9.2.10-py3-none-manylinux_2_27_x86_64.whl
+        sha256: e4f53a8ca8c5d6e8c492d0d0a3d565ecb59a751b19cfdaa4f6da0ab2104c1702
+        dest-filename: nvidia_cublas_cu12-12.9.2.10-py3-none-manylinux.whl
+      - type: file
+        url: https://files.pythonhosted.org/packages/95/f4/61e6996dd20481ee834f57a8e9dca28b1869366a135e0d42e2aa8493bdd4/nvidia_cufft_cu12-11.4.1.4-py3-none-manylinux2014_x86_64.manylinux_2_17_x86_64.whl
+        sha256: c67884f2a7d276b4b80eb56a79322a95df592ae5e765cf1243693365ccab4e28
+        dest-filename: nvidia_cufft_cu12-11.4.1.4-py3-none-manylinux.whl
+      - type: file
+        url: https://files.pythonhosted.org/packages/31/44/193a0e171750ca9f8320626e8a1f2381e4077a65e69e2fb9708bd479e34a/nvidia_curand_cu12-10.3.10.19-py3-none-manylinux_2_27_x86_64.whl
+        sha256: 49b274db4780d421bd2ccd362e1415c13887c53c214f0d4b761752b8f9f6aa1e
+        dest-filename: nvidia_curand_cu12-10.3.10.19-py3-none-manylinux.whl
+      - type: file
+        url: https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2204/x86_64/cuda-nvrtc-12-9_12.9.86-1_amd64.deb
+        sha256: 4e1cc14cc3578dd69286d9ac6a0623297e854ba09539b1780b6989d2199395af
+        dest-filename: cuda-nvrtc.deb
 
   # ──────────────────────────────────────────────
   # KeyScribe — Rust binary + desktop integration
@@ -122,38 +171,31 @@ modules:
         VEROVIO_SOURCE_DIR: /run/build/keyscribe/verovio-source
         LIBCLANG_PATH: /usr/lib/sdk/llvm18/lib
     build-commands:
-      # Copy CUDA 12 runtime .so files from the build host if available.
-      # This is optional — without CUDA the app falls back to CPU inference.
-      - |
-        for dir in /usr/local/cuda-12.6/lib64 /usr/local/cuda-12.5/lib64 \
-                   /usr/local/cuda-12.4/lib64 /usr/local/cuda/lib64; do
-          if [ -f "$dir/libcudart.so.12" ]; then
-            echo "Bundling CUDA 12 runtime from: $dir"
-            for lib in libcudart.so.12 libcublas.so.12 libcublasLt.so.12 \
-                       libcufft.so.11 libcurand.so.10 libnvrtc.so.12; do
-              if [ -f "$dir/$lib" ]; then
-                cp -aL "$dir/$lib" /app/bin/cuda/
-              fi
-            done
-            break
-          fi
-        done
       # Build Rust binary from vendored crates (no network needed). bindgen
       # crates need the SDK's gcc/glibc headers; clang from the llvm18
       # extension doesn't find them on its own.
+      # (CUDA 12/cuDNN/ORT libs arrive via the cuda-libs, cudnn and
+      # onnxruntime-gpu modules into /app/bin/cuda/ + /app/bin/.)
       - cargo --offline fetch --manifest-path Cargo.toml
       - |
         export BINDGEN_EXTRA_CLANG_ARGS="-I$(gcc -print-file-name=include) -I$(gcc -print-file-name=include-fixed) -I/usr/include"
         cargo build --offline --release --manifest-path Cargo.toml
       # Install binary
       - install -Dm755 target/release/keyscribe /app/bin/keyscribe
+      # basic-pitch.onnx is committed to git (not in the release assets), so
+      # it arrives via the staged repo sources above.
+      - install -Dm644 models/basic-pitch.onnx /app/bin/models/basic-pitch.onnx
       # Desktop integration
       - install -Dm644 flatpak/com.frantzes.keyscribe.desktop /app/share/applications/com.frantzes.keyscribe.desktop
       - install -Dm644 flatpak/com.frantzes.keyscribe.metainfo.xml /app/share/metainfo/com.frantzes.keyscribe.metainfo.xml
       - install -Dm644 icon.png /app/share/icons/hicolor/256x256/apps/com.frantzes.keyscribe.png
     sources:
       # Copy the repo root, skipping heavy/dev-only dirs so they don't get
-      # staged into the sandbox (target/, .venv/, vendor/, models/, ...).
+      # staged into the sandbox (target/, .venv/, vendor/, ...).
+      # NOTE: models/ is intentionally NOT skipped: basic-pitch.onnx is
+      # committed to git and installed from the staged tree (the other
+      # models arrive via the onnx-models module). assets/ holds the
+      # bundled Jost font embedded into the binary via include_bytes!.
       - type: dir
         path: ..
         dest: .
@@ -167,9 +209,7 @@ modules:
           - target
           - build
           - vendor
-          - models
           - demucs_output
-          - assets
       # Vendored Rust crates (generated by flatpak-cargo-generator.py) so the
       # build is fully offline and deterministic.
       - cargo-sources.json

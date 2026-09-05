@@ -99,8 +99,13 @@ if [[ "$SKIP_CARGO_BUILD" -eq 0 ]]; then
 fi
 
 BUNDLE_BINARY_NAME="keyscribe"
+# Honor CARGO_TARGET_DIR when set (e.g. container builds that keep the
+# host's target/ untouched); fall back to the workspace target/ dir.
+CARGO_TARGET_BASE="${CARGO_TARGET_DIR:-$REPO_ROOT/target}"
 BINARY_CANDIDATES=(
+    "$CARGO_TARGET_BASE/$TARGET/release/$BUNDLE_BINARY_NAME"
     "$REPO_ROOT/target/$TARGET/release/$BUNDLE_BINARY_NAME"
+    "$CARGO_TARGET_BASE/release/$BUNDLE_BINARY_NAME"
     "$REPO_ROOT/target/release/$BUNDLE_BINARY_NAME"
 )
 
@@ -160,6 +165,8 @@ done
 # --- FFmpeg Bundling ---
 FFMPEG_VENDOR_DIR="$REPO_ROOT/vendor/ffmpeg"
 FFMPEG_BIN_PATH="$FFMPEG_VENDOR_DIR/ffmpeg"
+# Newer BtbN tarballs place the binary at bin/ffmpeg instead of the root.
+FFMPEG_BIN_ALT="$FFMPEG_VENDOR_DIR/bin/ffmpeg"
 
 if [[ ! -f "$FFMPEG_BIN_PATH" ]]; then
     echo "FFmpeg not found in vendor/ffmpeg. Downloading static build..."
@@ -182,8 +189,17 @@ if [[ ! -f "$FFMPEG_BIN_PATH" ]]; then
     # Extract just the ffmpeg binary from the tarball
     # The tarball has a top-level directory like ffmpeg-7.1-amd64-static/
     tar -xJf "$FFMPEG_TAR" -C "$FFMPEG_VENDOR_DIR" --strip-components=1 --wildcards "*/ffmpeg"
-    
+    # Newer BtbN builds nest it one level deeper (bin/ffmpeg); hoist it up.
+    if [[ ! -f "$FFMPEG_BIN_PATH" && -f "$FFMPEG_BIN_ALT" ]]; then
+        mv "$FFMPEG_BIN_ALT" "$FFMPEG_BIN_PATH"
+        rmdir "$FFMPEG_VENDOR_DIR/bin" 2>/dev/null || true
+    fi
+
     rm -f "$FFMPEG_TAR"
+elif [[ -f "$FFMPEG_BIN_ALT" && ! -f "$FFMPEG_BIN_PATH" ]]; then
+    # Already downloaded by an older run of this script (nested bin/ layout).
+    mv "$FFMPEG_BIN_ALT" "$FFMPEG_BIN_PATH"
+    rmdir "$FFMPEG_VENDOR_DIR/bin" 2>/dev/null || true
 fi
 
 if [[ -f "$FFMPEG_BIN_PATH" ]]; then
@@ -244,14 +260,110 @@ done
 if [[ -n "$CUDA_TOOLKIT_LIB" ]]; then
     echo "CUDA runtime found in: $CUDA_TOOLKIT_LIB"
     for so in "${CUDA_SO_NAMES[@]}"; do
-        src="$CUDA_TOOLKIT_LIB/$so"
-        if [[ -f "$src" ]]; then
-            cp -P "$src" "$BUNDLE_DIR/$so"
-        fi
+        for src in "$CUDA_TOOLKIT_LIB/$so"*; do
+            if [[ -f "$src" || -L "$src" ]]; then
+                cp -P "$src" "$BUNDLE_DIR/"
+            fi
+        done
     done
     echo "Bundled CUDA runtime .so files"
 else
-    echo "Warning: CUDA 12 toolkit not found in default paths. GPU acceleration unavailable." >&2
+    # Fallback: fetch CUDA 12 runtime libs from NVIDIA's cu12 pip wheels
+    # (nvidia-cuda-runtime-cu12, nvidia-cublas-cu12, nvidia-cufft-cu12,
+    #  nvidia-curand-cu12, nvidia-nvrtc-cu12). The wheels ship versioned
+    #  .so files under nvidia/<pkg>/lib/.
+    echo "Local CUDA 12 toolkit not found; trying NVIDIA cu12 pip wheels..."
+    CUDA_VENDOR_DIR="$REPO_ROOT/vendor/cuda"
+    mkdir -p "$CUDA_VENDOR_DIR"
+    CUDA_WHEEL_PKGS=(
+        "nvidia-cuda-runtime-cu12"
+        "nvidia-cublas-cu12"
+        "nvidia-cufft-cu12"
+        "nvidia-curand-cu12"
+    )
+    # nvidia-nvrtc-cu12 does not exist on PyPI; NVRTC ships in the large
+    # nvidia-cuda-nvcc-cu12 wheel. Try it best-effort (optional).
+    CUDA_OPTIONAL_PKGS=(
+        "nvidia-cuda-nvcc-cu12"
+    )
+    CUDA_DL_OK=true
+    for pkg in "${CUDA_WHEEL_PKGS[@]}"; do
+        if ! ls "$CUDA_VENDOR_DIR"/${pkg}-*.whl >/dev/null 2>&1; then
+            if ! python3 -m pip download "$pkg" --no-deps -d "$CUDA_VENDOR_DIR" 2>/dev/null; then
+                echo "  Warning: failed to download $pkg" >&2
+                CUDA_DL_OK=false
+            fi
+        fi
+    done
+    for pkg in "${CUDA_OPTIONAL_PKGS[@]}"; do
+        if ! ls "$CUDA_VENDOR_DIR"/${pkg}-*.whl >/dev/null 2>&1; then
+            python3 -m pip download "$pkg" --no-deps -d "$CUDA_VENDOR_DIR" 2>/dev/null || \
+                echo "  Note: optional $pkg unavailable, continuing without it"
+        fi
+    done
+    # libnvrtc.so.12 is required by ort's CUDA EP preload list but ships in
+    # neither the cu12 pip wheels nor the nvcc wheel. Fetch it from NVIDIA's
+    # public CUDA .deb repo and unpack the .so files (needs `ar` + `tar`).
+    if ! ls "$CUDA_VENDOR_DIR"/libnvrtc.so.12* >/dev/null 2>&1; then
+        echo "  Fetching libnvrtc from NVIDIA CUDA .deb repo..."
+        NVRTC_DEB="$CUDA_VENDOR_DIR/cuda-nvrtc.deb"
+        # Match the .deb minor to the nvcc wheel if present, else default 12.9.
+        NVRTC_VER="12.9.86"
+        NVCC_WHL=$(ls "$CUDA_VENDOR_DIR"/nvidia_cuda_nvcc_cu12-*.whl 2>/dev/null | head -1)
+        if [[ -n "$NVCC_WHL" && "$NVCC_WHL" =~ -([0-9]+\.[0-9]+\.[0-9]+)- ]]; then
+            NVRTC_VER="${BASH_REMATCH[1]}"
+        fi
+        NVRTC_MINOR="${NVRTC_VER%.*}"
+        NVRTC_MAJOR="${NVRTC_MINOR%.*}"
+        NVRTC_PATCH="${NVRTC_MINOR#*.}"
+        NVRTC_URL="https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2204/x86_64/cuda-nvrtc-${NVRTC_MAJOR}-${NVRTC_PATCH}_${NVRTC_VER}-1_amd64.deb"
+        if curl -fL -o "$NVRTC_DEB" "$NVRTC_URL" 2>/dev/null; then
+            NVRTC_DATA="$CUDA_VENDOR_DIR/nvrtc-data"
+            rm -rf "$NVRTC_DATA"
+            mkdir -p "$NVRTC_DATA"
+            if ar p "$NVRTC_DEB" data.tar.xz 2>/dev/null | tar -xJ -C "$NVRTC_DATA" 2>/dev/null; then
+                while IFS= read -r src; do
+                    cp -P "$src" "$CUDA_VENDOR_DIR/"
+                done < <(find "$NVRTC_DATA" -name "libnvrtc*.so*" \( -type f -o -type l \) | sort)
+                echo "  Cached libnvrtc from .deb"
+            else
+                echo "  Warning: failed to unpack $NVRTC_DEB" >&2
+            fi
+            rm -rf "$NVRTC_DATA"
+            rm -f "$NVRTC_DEB"
+        else
+            echo "  Warning: failed to download $NVRTC_URL" >&2
+        fi
+    fi
+    if $CUDA_DL_OK; then
+        CUDA_EXTRACT_TMP="$CUDA_VENDOR_DIR/extract"
+        rm -rf "$CUDA_EXTRACT_TMP"
+        mkdir -p "$CUDA_EXTRACT_TMP"
+        for whl in "$CUDA_VENDOR_DIR"/*.whl; do
+            python3 -m zipfile -e "$whl" "$CUDA_EXTRACT_TMP"
+        done
+        for so in "${CUDA_SO_NAMES[@]}"; do
+            while IFS= read -r src; do
+                cp -P "$src" "$CUDA_VENDOR_DIR/"
+            done < <(find "$CUDA_EXTRACT_TMP" -name "$so*" \( -type f -o -type l \) | sort)
+        done
+        rm -rf "$CUDA_EXTRACT_TMP"
+        echo "Cached CUDA 12 runtime .so files in vendor/cuda"
+    fi
+    CUDA_BUNDLED=false
+    for so in "${CUDA_SO_NAMES[@]}"; do
+        for src in "$CUDA_VENDOR_DIR/$so"*; do
+            if [[ -f "$src" || -L "$src" ]]; then
+                cp -P "$src" "$BUNDLE_DIR/"
+                CUDA_BUNDLED=true
+            fi
+        done
+    done
+    if ! $CUDA_BUNDLED; then
+        echo "Warning: CUDA 12 runtime .so files unavailable. GPU acceleration unavailable; CPU fallback will be used." >&2
+    else
+        echo "Bundled CUDA runtime .so files from pip wheels"
+    fi
 fi
 
 # 2) cuDNN 9 .so files: download from NVIDIA if not already cached in vendor/cudnn.
@@ -282,11 +394,14 @@ if ! $CUDNN_READY; then
         tar -xJf "$CUDNN_TAR" -C "$EXTRACT_TMP"
         CUDNN_LIB_DIR=$(find "$EXTRACT_TMP" -type d -name "lib" | head -1)
         if [[ -n "$CUDNN_LIB_DIR" ]]; then
+            # Copy each .so.9 symlink AND its versioned target(s) so the
+            # links in the cache/bundle are not left dangling.
             for so in "${CUDNN_SO_NAMES[@]}"; do
-                src="$CUDNN_LIB_DIR/$so"
-                if [[ -f "$src" ]]; then
-                    cp -P "$src" "$CUDNN_VENDOR_DIR/$so"
-                fi
+                for src in "$CUDNN_LIB_DIR/$so"*; do
+                    if [[ -f "$src" || -L "$src" ]]; then
+                        cp -P "$src" "$CUDNN_VENDOR_DIR/"
+                    fi
+                done
             done
             echo "Cached cuDNN 9 .so files in vendor/cudnn"
         else
@@ -299,12 +414,13 @@ else
     echo "cuDNN 9 .so files already cached in vendor/cudnn"
 fi
 
-# Copy cuDNN .so files into the bundle.
+# Copy cuDNN .so files (links + versioned targets) into the bundle.
 for so in "${CUDNN_SO_NAMES[@]}"; do
-    src="$CUDNN_VENDOR_DIR/$so"
-    if [[ -f "$src" ]]; then
-        cp -P "$src" "$BUNDLE_DIR/$so"
-    fi
+    for src in "$CUDNN_VENDOR_DIR/$so"*; do
+        if [[ -f "$src" || -L "$src" ]]; then
+            cp -P "$src" "$BUNDLE_DIR/"
+        fi
+    done
 done
 
 # 3) Download ONNX Runtime GPU build (libonnxruntime.so etc.) from the pip wheel.
@@ -323,7 +439,7 @@ if ! ls "$ORT_VENDOR_DIR"/libonnxruntime.so* >/dev/null 2>&1; then
     fi
     if [[ -n "$PYTHON_CMD" ]]; then
         echo "  Trying pip download via $PYTHON_CMD..."
-        if $PYTHON_CMD -m pip download onnxruntime-gpu==1.24.2 --no-deps -d "$ORT_VENDOR_DIR" 2>/dev/null; then
+        if $PYTHON_CMD -m pip download onnxruntime-gpu==1.24.4 --no-deps -d "$ORT_VENDOR_DIR" 2>/dev/null; then
             WHL_FILE=$(find "$ORT_VENDOR_DIR" -maxdepth 1 -name "*.whl" | head -1)
             if [[ -n "$WHL_FILE" ]]; then
                 DOWNLOAD_SUCCESS=true
@@ -336,9 +452,9 @@ if ! ls "$ORT_VENDOR_DIR"/libonnxruntime.so* >/dev/null 2>&1; then
         echo "  Trying direct download from PyPI (via JSON API)..."
         PYPI_JSON=""
         if command -v curl >/dev/null 2>&1; then
-            PYPI_JSON=$(curl -sL "https://pypi.org/pypi/onnxruntime-gpu/1.24.2/json")
+            PYPI_JSON=$(curl -sL "https://pypi.org/pypi/onnxruntime-gpu/1.24.4/json")
         elif command -v wget >/dev/null 2>&1; then
-            PYPI_JSON=$(wget -qO- "https://pypi.org/pypi/onnxruntime-gpu/1.24.2/json")
+            PYPI_JSON=$(wget -qO- "https://pypi.org/pypi/onnxruntime-gpu/1.24.4/json")
         fi
         if [[ -n "$PYPI_JSON" ]] && [[ -n "$PYTHON_CMD" ]]; then
             DL_URL=$(echo "$PYPI_JSON" | $PYTHON_CMD -c "
@@ -381,17 +497,34 @@ for u in data.get('urls', []):
                     fi
                 done
             done
-            echo "  Cached ORT 1.24.2 GPU .so files in vendor/ort-gpu"
+            echo "  Cached ORT 1.24.4 GPU .so files in vendor/ort-gpu"
         else
             echo "  Warning: Could not find onnxruntime/capi in wheel." >&2
         fi
         rm -rf "$EXTRACT_DIR"
         rm -f "$ZIP_FILE"
+        # The app loads the exact name `libonnxruntime.so` via ort::init_from
+        # (see src/demucs.rs), but the wheel only ships a versioned file.
+        # Provide the unversioned symlink so init_from finds it.
+        ORT_VERSIONED=$(ls "$ORT_VENDOR_DIR"/libonnxruntime.so.* 2>/dev/null | grep -v '\.so$' | head -1)
+        if [[ -n "$ORT_VERSIONED" && ! -e "$ORT_VENDOR_DIR/libonnxruntime.so" ]]; then
+            ln -sf "$(basename "$ORT_VERSIONED")" "$ORT_VENDOR_DIR/libonnxruntime.so"
+            echo "  Created libonnxruntime.so symlink -> $(basename "$ORT_VERSIONED")"
+        fi
     else
         echo "  Warning: All download methods failed. GPU acceleration unavailable." >&2
     fi
 else
     echo "ORT GPU .so files already cached in vendor/ort-gpu"
+fi
+
+# Ensure the unversioned libonnxruntime.so symlink exists (the app loads
+# that exact name via ort::init_from; wheels only ship versioned files).
+# Done unconditionally so pre-existing caches get fixed too.
+ORT_VERSIONED=$(ls "$ORT_VENDOR_DIR"/libonnxruntime.so.* 2>/dev/null | grep -v '\.so$' | head -1)
+if [[ -n "$ORT_VERSIONED" && ! -e "$ORT_VENDOR_DIR/libonnxruntime.so" ]]; then
+    ln -sf "$(basename "$ORT_VERSIONED")" "$ORT_VENDOR_DIR/libonnxruntime.so"
+    echo "Created libonnxruntime.so symlink -> $(basename "$ORT_VERSIONED")"
 fi
 
 # Copy ORT .so files into the bundle (including versioned symlinks).
