@@ -31,6 +31,7 @@ pub fn associate_notes_to_beat_grid(
     pitches: &[u8],
     velocities: &[u8],
     end_times: &[f32],
+    rearticulations: &[bool],
     beat_times: &[f32],
     downbeat_times: &[f32],
     _config: &BeatAssociationConfig,
@@ -133,6 +134,7 @@ pub fn associate_notes_to_beat_grid(
             prev_beat_time: prev_beat,
             next_beat_time: next_beat,
             beat_duration_sec,
+            is_rearticulation: rearticulations[i],
         });
 
     }
@@ -207,20 +209,28 @@ fn find_structural_position(raw_beat_index: u32, beats: &[f32], downbeats: &[f32
     (nearest_downbeat_idx + bar_shift, offset % beats_per_bar)
 }
 pub fn associate_note_events(
-    note_events: &[crate::leadsheet::NoteEvent],
+    notes: &[crate::leadsheet::NoteEvent],
     beat_times: &[f32],
     downbeat_times: &[f32],
 ) -> Vec<BeatAlignedNote> {
-    let start_times: Vec<f32> = note_events.iter().map(|n| n.start_time).collect();
-    let pitches: Vec<u8> = note_events.iter().map(|n| n.pitch).collect();
-    let velocities: Vec<u8> = note_events.iter().map(|n| n.velocity).collect();
-    let end_times: Vec<f32> = note_events.iter().map(|n| n.end_time).collect();
-
+    let mut start_times = Vec::with_capacity(notes.len());
+    let mut pitches = Vec::with_capacity(notes.len());
+    let mut velocities = Vec::with_capacity(notes.len());
+    let mut end_times = Vec::with_capacity(notes.len());
+    let mut rearticulations = Vec::with_capacity(notes.len());
+    for n in notes {
+        start_times.push(n.start_time);
+        pitches.push(n.pitch);
+        velocities.push(n.velocity);
+        end_times.push(n.end_time);
+        rearticulations.push(n.is_rearticulation);
+    }
     associate_notes_to_beat_grid(
         &start_times,
         &pitches,
         &velocities,
         &end_times,
+        &rearticulations,
         beat_times,
         downbeat_times,
         &BeatAssociationConfig::default(),
@@ -256,7 +266,7 @@ mod tests {
     fn associates_note_between_two_beats() {
         let beats = vec![0.0, 0.5, 1.0, 1.5, 2.0];
         let aligned = associate_notes_to_beat_grid(
-            &[0.25], &[60], &[100], &[0.4],
+            &[0.25], &[60], &[100], &[0.4], &[false],
             &beats, &[0.0, 2.0],
             &BeatAssociationConfig::default(),
         );
@@ -270,7 +280,7 @@ mod tests {
     fn note_on_beat_gets_zero_intra_position() {
         let beats = vec![0.0, 0.5, 1.0];
         let aligned = associate_notes_to_beat_grid(
-            &[0.0], &[60], &[100], &[0.3],
+            &[0.0], &[60], &[100], &[0.3], &[false],
             &beats, &[0.0],
             &BeatAssociationConfig::default(),
         );
@@ -290,7 +300,7 @@ mod tests {
         // beat_index=1 at pos 0.0, not beat_index=0 at pos 0.98.
         let beats = vec![0.0, 0.5, 1.0];
         let aligned = associate_notes_to_beat_grid(
-            &[0.49], &[60], &[100], &[0.6],
+            &[0.49], &[60], &[100], &[0.6], &[false],
             &beats, &[0.0],
             &BeatAssociationConfig::default(),
         );
@@ -305,7 +315,7 @@ mod tests {
         // onset=0.01 => intra 0.02, snap to beat_index=0 at pos 0.0.
         let beats = vec![0.0, 0.5, 1.0];
         let aligned = associate_notes_to_beat_grid(
-            &[0.01], &[60], &[100], &[0.2],
+            &[0.01], &[60], &[100], &[0.2], &[false],
             &beats, &[0.0],
             &BeatAssociationConfig::default(),
         );
@@ -319,7 +329,7 @@ mod tests {
     fn genuine_half_beat_note_unchanged() {
         let beats = vec![0.0, 0.5, 1.0];
         let aligned = associate_notes_to_beat_grid(
-            &[0.25], &[60], &[100], &[0.4],
+            &[0.25], &[60], &[100], &[0.4], &[false],
             &beats, &[0.0],
             &BeatAssociationConfig::default(),
         );
@@ -335,7 +345,7 @@ mod tests {
         // is below 0.96 so the note stays at 0.91 (not snapped forward).
         let beats = vec![0.0, 1.0, 2.0];
         let aligned = associate_notes_to_beat_grid(
-            &[0.91], &[60], &[100], &[1.2],
+            &[0.91], &[60], &[100], &[1.2], &[false],
             &beats, &[0.0],
             &BeatAssociationConfig::default(),
         );

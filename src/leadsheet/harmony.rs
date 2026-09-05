@@ -304,8 +304,11 @@ pub fn compute_bar_profiles(
             prof.bass_pcp[pc] = bass[pc] / n;
             prof.energy += prof.pcp[pc];
         }
-        for i in 0..88 {
-            if mx[i] >= 0.25 {
+        // Extract lowest sounding bass fundamental, ignoring sub-audio rumble
+        // below E1 (MIDI 28, index 7) and requiring confirmed bass PCP energy.
+        for i in 7..40 {
+            let pc = (21 + i) % 12;
+            if mx[i] >= 0.25 && prof.bass_pcp[pc] >= 0.02 {
                 prof.bass_note = Some((21 + i) as u8);
                 break;
             }
@@ -355,8 +358,9 @@ pub fn compute_bar_profiles(
                 let h2 = pcp2.map(|v| v / n2);
                 let hb1 = bass1.map(|v| v / n1);
                 let hb2 = bass2.map(|v| v / n2);
-                for i in 0..88 {
-                    if mx2[i] >= 0.25 {
+                for i in 7..40 {
+                    let pc = (21 + i) % 12;
+                    if mx2[i] >= 0.25 && hb2[pc] >= 0.02 {
                         prof.bass_note_second = Some((21 + i) as u8);
                         break;
                     }
@@ -649,9 +653,14 @@ pub fn detect_chords_from_timeline(
                 (Some((h1, h2)), Some((hb1, hb2))) => {
                     let (w1, e1) = whiten_profile(&h1);
                     let (w2, e2) = whiten_profile(&h2);
+                    let cosine_dist = 1.0 - profile_cosine(&w1, &w2);
+                    let bass_changed = match (prof.bass_note, prof.bass_note_second) {
+                        (Some(b1), Some(b2)) => (b1 % 12) != (b2 % 12),
+                        _ => false,
+                    };
                     e1 > 1e-4
                         && e2 > 1e-4
-                        && (1.0 - profile_cosine(&w1, &w2)) > config.split_threshold
+                        && (cosine_dist > config.split_threshold || (bass_changed && cosine_dist > 0.20))
                 }
                 _ => false,
             }

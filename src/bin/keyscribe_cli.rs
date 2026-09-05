@@ -813,6 +813,7 @@ mod cli_impl {
                     end_time: start + 0.5,
                     velocity: 100,
                     channel: None,
+                    is_rearticulation: false,
                 });
                 id += 1;
             }

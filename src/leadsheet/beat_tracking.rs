@@ -776,11 +776,11 @@ pub fn validate_downbeat_rotation(
         return;
     }
 
-    // Apply the rotation: drop the first best_r beats (they become anacrusis,
-    // handled by postprocess_downbeats) and re-derive downbeats every bpb-th
-    // beat of the remaining array.
-    beats.beats = beats.beats[best_r..].to_vec();
-    let mut new_downbeats: Vec<f32> = beats.beats.iter().step_by(bpb).copied().collect();
+    // Apply the rotation: set new downbeats starting at the winning rotation
+    // offset (best_r). Keeping the full beats array preserves absolute timing
+    // and allows find_structural_position to assign beats 0..best_r to the
+    // anacrusis / pickup bar (measure 0).
+    let mut new_downbeats: Vec<f32> = beats.beats.iter().skip(best_r).step_by(bpb).copied().collect();
     if new_downbeats.len() >= 2 {
         new_downbeats.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
         beats.downbeats = new_downbeats;
@@ -1267,7 +1267,7 @@ fn note(start: f32) -> NoteEvent {
             start_time: start,
             end_time: start + 0.2,
             velocity: 100,
-            channel: None,
+            channel: None, is_rearticulation: false,
         }
     }
 
@@ -1278,7 +1278,7 @@ fn note(start: f32) -> NoteEvent {
             start_time: start,
             end_time: start + 0.2,
             velocity,
-            channel: None,
+            channel: None, is_rearticulation: false,
         }
     }
 
@@ -1411,7 +1411,7 @@ let notes = vec![note(0.25), note(0.5), note(0.75), note(1.0), note(1.25)];
         let notes = vec![note(0.5), note(1.5), note(2.5)];
         validate_downbeat_rotation(&notes, &mut beats, 0.15);
         assert_eq!(beats.downbeats, vec![0.5, 2.5]);
-        assert!((beats.beats[0] - 0.5).abs() < 1e-4);
+        assert_eq!(beats.beats, vec![0.0, 0.5, 1.0, 1.5, 2.0, 2.5]);
     }
 
     #[test]

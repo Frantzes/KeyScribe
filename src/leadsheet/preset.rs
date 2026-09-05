@@ -686,7 +686,7 @@ fn audio_to_note_events(audio: &[f32], tempo_map: &[TempoSegment]) -> Vec<NoteEv
                     start_time,
                     end_time,
                     velocity: ((max_rms * 127.0).round() as u8).clamp(1, 127),
-                    channel: None,
+                    channel: None, is_rearticulation: false,
                 });
             }
         }
@@ -702,7 +702,7 @@ fn audio_to_note_events(audio: &[f32], tempo_map: &[TempoSegment]) -> Vec<NoteEv
                 start_time,
                 end_time,
                 velocity: ((max_rms * 127.0).round() as u8).clamp(1, 127),
-                channel: None,
+                channel: None, is_rearticulation: false,
             });
         }
     }
@@ -806,7 +806,7 @@ fn extract_melody_events(notes: &[NoteEvent]) -> Vec<NoteEvent> {
                         start_time: segment_start,
                         end_time: t,
                         velocity: current_melody_velocity,
-                        channel: None,
+                        channel: None, is_rearticulation: false,
                     });
                 }
             }
@@ -822,7 +822,7 @@ fn extract_melody_events(notes: &[NoteEvent]) -> Vec<NoteEvent> {
                     start_time: t,
                     end_time: t,
                     velocity: ev.velocity,
-                    channel: None,
+                    channel: None, is_rearticulation: false,
                 });
             } else if let Some(pos) = active.iter().position(|n| n.pitch == ev.pitch) {
                 active.swap_remove(pos);
@@ -907,7 +907,7 @@ mod tests {
                 start_time: t,
                 end_time: t + 0.2,
                 velocity: 100,
-                channel: None,
+                channel: None, is_rearticulation: false,
             });
         }
 
@@ -931,7 +931,7 @@ mod tests {
                 start_time: 0.0,
                 end_time: 0.24,
                 velocity: 110,
-                channel: None,
+                channel: None, is_rearticulation: false,
             },
             NoteEvent {
                 id: 2,
@@ -939,7 +939,7 @@ mod tests {
                 start_time: 0.26,
                 end_time: 0.48,
                 velocity: 108,
-                channel: None,
+                channel: None, is_rearticulation: false,
             },
             NoteEvent {
                 id: 3,
@@ -947,7 +947,7 @@ mod tests {
                 start_time: 0.50,
                 end_time: 0.98,
                 velocity: 112,
-                channel: None,
+                channel: None, is_rearticulation: false,
             },
             NoteEvent {
                 id: 4,
@@ -955,7 +955,7 @@ mod tests {
                 start_time: 1.00,
                 end_time: 1.24,
                 velocity: 105,
-                channel: None,
+                channel: None, is_rearticulation: false,
             },
             NoteEvent {
                 id: 5,
@@ -963,7 +963,7 @@ mod tests {
                 start_time: 1.26,
                 end_time: 1.98,
                 velocity: 118,
-                channel: None,
+                channel: None, is_rearticulation: false,
             },
         ];
 

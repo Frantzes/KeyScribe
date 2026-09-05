@@ -810,6 +810,62 @@ fn next_raw_start(
         .unwrap_or(f32::INFINITY)
 }
 
+/// Sequence-level subdivision grid selection: dynamically identifies straight,
+/// 8th-triplet, and 16th-triplet rhythmic regimes across note sequences so that
+/// coherent runs (e.g. 3-note triplet licks or straight 16th runs) do not suffer
+/// single-note grid hopping.
+fn compute_subdivision_grids(beat_pos: &[f32]) -> Vec<Vec<f32>> {
+    let n = beat_pos.len();
+    if n == 0 {
+        return Vec::new();
+    }
+    let mut grids = vec![straight_grid(); n];
+    let gap = |i: usize| -> f32 {
+        if i + 1 < n {
+            (beat_pos[i + 1] - beat_pos[i]).abs()
+        } else {
+            f32::INFINITY
+        }
+    };
+    let near = |g: f32, target: f32, tol: f32| (g - target).abs() <= tol;
+
+    // 16th triplets (target 1/6):
+    for i in 0..n {
+        let prev_gap = if i > 0 { gap(i - 1) } else { f32::INFINITY };
+        let next_gap = gap(i);
+        let is_triplet_16th = (prev_gap.is_finite() && next_gap.is_finite() && near(prev_gap + next_gap, 1.0 / 3.0, 0.07))
+            || near(prev_gap, 1.0 / 6.0, 0.045)
+            || near(next_gap, 1.0 / 6.0, 0.045);
+        if is_triplet_16th {
+            grids[i] = sixteenth_triplet_grid();
+        }
+    }
+
+    // 8th triplets (target 1/3):
+    for i in 0..n {
+        if grids[i] == sixteenth_triplet_grid() {
+            continue;
+        }
+        let prev_gap = if i > 0 { gap(i - 1) } else { f32::INFINITY };
+        let next_gap = gap(i);
+        let is_triplet_8th = (prev_gap.is_finite() && next_gap.is_finite() && near(prev_gap + next_gap, 2.0 / 3.0, 0.10))
+            || near(prev_gap, 1.0 / 3.0, 0.055)
+            || near(next_gap, 1.0 / 3.0, 0.055);
+        if is_triplet_8th {
+            grids[i] = eighth_triplet_grid();
+        }
+    }
+
+    // Triplet bridge: if note i-1 and note i+1 are 8th triplets, note i is also 8th triplet
+    for i in 1..n.saturating_sub(1) {
+        if grids[i - 1] == eighth_triplet_grid() && grids[i + 1] == eighth_triplet_grid() {
+            grids[i] = eighth_triplet_grid();
+        }
+    }
+
+    grids
+}
+
 pub fn quantize_aligned_notes(
     aligned: &[BeatAlignedNote],
     swing_sections: &[SwingSection],
@@ -842,41 +898,11 @@ pub fn quantize_aligned_notes(
     // P2: choose the subdivision vocabulary from LOCAL onset spacing. Using a
     // single mixed grid makes every note nearest-snap independently, which
     // lands inside a triplet run on the wrong straight slot (the ±1/6-beat
-    // slips). Here straight runs only see straight slots, and triplet runs get
-    // their own clean 1/3 / 1/6 slots.
     let beat_pos: Vec<f32> = sorted
         .iter()
         .map(|n| n.beat_index as f32 + n.intra_beat_pos)
         .collect();
-    let gap = |i: usize| -> f32 {
-        (beat_pos[i + 1] - beat_pos[i]).abs()
-    };
-    let grid_for = |i: usize| -> Vec<f32> {
-        let prev_gap = if i > 0 { gap(i - 1) } else { f32::INFINITY };
-        let next_gap = if i + 1 < beat_pos.len() { gap(i) } else { f32::INFINITY };
-        let near = |g: f32, target: f32, tol: f32| (g - target).abs() <= tol;
-        // Two-gap sum is far more tolerant of onset jitter than a single gap:
-        // a triplet-8th pair sums to ~2/3 (two 1/3 gaps) while two straight
-        // 16ths sum to ~0.5 and two straight 8ths to ~1.0. This is what tells
-        // a genuine triplet run from a straight one even when the detected
-        // individual gaps are noisy (e.g. 0.263 + 0.438 ≈ 0.70 ≈ 2/3).
-        if prev_gap.is_finite() && next_gap.is_finite() {
-            let two_gap = prev_gap + next_gap;
-            if near(two_gap, 1.0 / 3.0, 0.07) {
-                sixteenth_triplet_grid()
-            } else if near(two_gap, 2.0 / 3.0, 0.10) {
-                eighth_triplet_grid()
-            } else {
-                straight_grid()
-            }
-        } else if near(prev_gap, 1.0 / 6.0, 0.045) || near(next_gap, 1.0 / 6.0, 0.045) {
-            sixteenth_triplet_grid()
-        } else if near(prev_gap, 1.0 / 3.0, 0.055) || near(next_gap, 1.0 / 3.0, 0.055) {
-            eighth_triplet_grid()
-        } else {
-            straight_grid()
-        }
-    };
+    let sub_grids = compute_subdivision_grids(&beat_pos);
 
     let mut snapped: Vec<Snapped> = Vec::with_capacity(sorted.len());
     for (i, note) in sorted.iter().enumerate() {
@@ -888,7 +914,7 @@ pub fn quantize_aligned_notes(
         let sub_grid = if style == SwingStyle::Swing {
             subdivision_grid(style)
         } else {
-            grid_for(i)
+            sub_grids.get(i).cloned().unwrap_or_else(straight_grid)
         };
         let (snapped_pos, snap_error) = snap_intra_beat_pos(
             note.intra_beat_pos,
@@ -917,7 +943,7 @@ pub fn quantize_aligned_notes(
             let sub_grid = if s.style == SwingStyle::Swing {
                 subdivision_grid(s.style)
             } else {
-                grid_for(i)
+                sub_grids.get(i).cloned().unwrap_or_else(straight_grid)
             };
             eprintln!(
                 "[quant-debug] pitch={} raw={:.4}s intra={:.3} beat_idx={} style={:?} grid={:?} -> snapped={:.3} beat_start={:.3}",
@@ -1502,21 +1528,35 @@ pub fn quantize_aligned_notes_learned(
     let mut keep_mask = merge_keep_mask(&tokens);
     let mut last_kept_end: Option<(usize, f32)> = None; // (sorted idx, end beats)
     for i in 0..sorted.len() {
+        let note = sorted[i];
+        let raw_start_beats = note.original_start_time / note.beat_duration_sec.max(0.001);
+
         if keep_mask[i] {
-            let note = sorted[i];
-            let raw_end_beats = note.original_end_time
-                / note.beat_duration_sec.max(0.001);
-            last_kept_end = Some((i, raw_end_beats));
-            continue;
-        }
-        // A merge token: require contiguity with the previous KEPT note.
-        if let Some((_, prev_end)) = last_kept_end {
-            let note = sorted[i];
-            let raw_start_beats = note.original_start_time
-                / note.beat_duration_sec.max(0.001);
-            if raw_start_beats - prev_end > MERGE_MAX_GAP_BEATS {
-                keep_mask[i] = true; // real silence: keep as its own note
+            // Algorithmic Tier B1 Heuristic: Over-segmentation merge.
+            if let Some((prev_idx, prev_end)) = last_kept_end {
+                let prev_note = sorted[prev_idx];
+                if note.pitch == prev_note.pitch 
+                    && (raw_start_beats - prev_end).abs() <= MERGE_MAX_GAP_BEATS 
+                    && !note.is_rearticulation {
+                    keep_mask[i] = false; // Merge it!
+                }
             }
+        }
+
+        if !keep_mask[i] {
+            // A merge token (from model or heuristic): require contiguity with the previous KEPT note.
+            if let Some((_, prev_end)) = last_kept_end {
+                if raw_start_beats - prev_end > MERGE_MAX_GAP_BEATS {
+                    keep_mask[i] = true; // real silence: keep as its own note
+                }
+            } else {
+                keep_mask[i] = true; // Leading merge: keep as its own note
+            }
+        }
+
+        if keep_mask[i] {
+            let raw_end_beats = note.original_end_time / note.beat_duration_sec.max(0.001);
+            last_kept_end = Some((i, raw_end_beats));
         }
     }
 
@@ -1526,30 +1566,7 @@ pub fn quantize_aligned_notes_learned(
         .iter()
         .map(|n| n.beat_index as f32 + n.intra_beat_pos)
         .collect();
-    let gap = |i: usize| -> f32 {
-        (beat_pos[i + 1] - beat_pos[i]).abs()
-    };
-    let grid_for = |i: usize| -> Vec<f32> {
-        let prev_gap = if i > 0 { gap(i - 1) } else { f32::INFINITY };
-        let next_gap = if i + 1 < beat_pos.len() { gap(i) } else { f32::INFINITY };
-        let near = |g: f32, target: f32, tol: f32| (g - target).abs() <= tol;
-        if prev_gap.is_finite() && next_gap.is_finite() {
-            let two_gap = prev_gap + next_gap;
-            if near(two_gap, 1.0 / 3.0, 0.07) {
-                sixteenth_triplet_grid()
-            } else if near(two_gap, 2.0 / 3.0, 0.10) {
-                eighth_triplet_grid()
-            } else {
-                straight_grid()
-            }
-        } else if near(prev_gap, 1.0 / 6.0, 0.045) || near(next_gap, 1.0 / 6.0, 0.045) {
-            sixteenth_triplet_grid()
-        } else if near(prev_gap, 1.0 / 3.0, 0.055) || near(next_gap, 1.0 / 3.0, 0.055) {
-            eighth_triplet_grid()
-        } else {
-            straight_grid()
-        }
-    };
+    let sub_grids = compute_subdivision_grids(&beat_pos);
 
     let snapped_starts: Vec<f32> = sorted
         .iter()
@@ -1559,7 +1576,7 @@ pub fn quantize_aligned_notes_learned(
             let sub_grid = if style == SwingStyle::Swing {
                 subdivision_grid(style)
             } else {
-                grid_for(i)
+                sub_grids.get(i).cloned().unwrap_or_else(straight_grid)
             };
             let (snapped_pos, _) = snap_intra_beat_pos(
                 note.intra_beat_pos,
@@ -1584,7 +1601,7 @@ pub fn quantize_aligned_notes_learned(
         let sub_grid = if style == SwingStyle::Swing {
             subdivision_grid(style)
         } else {
-            grid_for(i)
+            sub_grids.get(i).cloned().unwrap_or_else(straight_grid)
         };
         let (snapped_pos, snap_error) = snap_intra_beat_pos(
             note.intra_beat_pos,
@@ -1702,6 +1719,28 @@ pub fn quantize_aligned_notes_learned(
             .then_with(|| a.pitch.cmp(&b.pitch))
     });
 
+    // Fill melody durations across audible gaps
+    fill_melody_durations(&mut quantized, aligned);
+
+    // Monophonic collision deduplication
+    let mut mono: Vec<QuantizedNote> = Vec::with_capacity(quantized.len());
+    for note in quantized {
+        match mono.last_mut() {
+            Some(last) if (last.beat_start - note.beat_start).abs() < 1e-4 => {
+                let replace = if last.pitch == note.pitch {
+                    note.beat_duration > last.beat_duration
+                } else {
+                    note.confidence > last.confidence
+                };
+                if replace {
+                    *last = note;
+                }
+            }
+            _ => mono.push(note),
+        }
+    }
+    quantized = mono;
+
     quantized
 }
 
@@ -1801,7 +1840,7 @@ mod tests {
             start_time: start,
             end_time: end,
             velocity: 100,
-            channel: None,
+            channel: None, is_rearticulation: false,
         }
     }
 
@@ -1837,7 +1876,7 @@ mod tests {
             start_time: 0.49,
             end_time: 1.01,
             velocity: 100,
-            channel: None,
+            channel: None, is_rearticulation: false,
         }];
         let quantized = quantize_notes(&notes, 0.5, &QuantizationConfig::default());
         assert_eq!(quantized.len(), 1);
@@ -1853,7 +1892,7 @@ mod tests {
             start_time: 7.9,
             end_time: 8.4,
             velocity: 100,
-            channel: None,
+            channel: None, is_rearticulation: false,
         }];
         let map = vec![
             TempoSegment {
@@ -1886,7 +1925,7 @@ mod tests {
             start_time: 0.0,
             end_time: 0.165,
             velocity: 100,
-            channel: None,
+            channel: None, is_rearticulation: false,
         }];
         let map = vec![TempoSegment {
             start_time_sec: 0.0,
@@ -1963,7 +2002,7 @@ mod tests {
             start_time: 1.4,
             end_time: 2.6,
             velocity: 100,
-            channel: None,
+            channel: None, is_rearticulation: false,
         }];
         let map = vec![TempoSegment {
             start_time_sec: 0.0,
@@ -2012,7 +2051,7 @@ mod tests {
             start_time: 0.1,
             end_time: 0.4,
             velocity: 100,
-            channel: None,
+            channel: None, is_rearticulation: false,
         }];
         let map = vec![TempoSegment {
             start_time_sec: 0.0,
@@ -2055,7 +2094,7 @@ mod tests {
             id: 1,
             pitch,
             velocity: 100,
-            channel: None,
+            channel: None, is_rearticulation: false,
             original_start_time: start,
             original_end_time: end,
             beat_index: beat_idx,

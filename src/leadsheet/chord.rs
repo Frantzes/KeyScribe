@@ -47,7 +47,7 @@ impl Default for ChordAnalysisConfig {
             chord_sample_cleanest: false,
             chord_sample_strike: false,
             collapse_extensions: true,
-            split_threshold: 0.0,
+            split_threshold: 0.35,
         }
     }
 }

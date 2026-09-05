@@ -15,6 +15,7 @@ pub struct BeatAlignedNote {
     pub prev_beat_time: f32,
     pub next_beat_time: f32,
     pub beat_duration_sec: f32,
+    pub is_rearticulation: bool,
 }
 
 impl BeatAlignedNote {
@@ -120,6 +121,8 @@ pub struct NoteEvent {
     pub velocity: u8,
     /// Optional source channel for multi-part tracks.
     pub channel: Option<u8>,
+    /// True if this note was explicitly split from the previous note by the onset head.
+    pub is_rearticulation: bool,
 }
 
 impl NoteEvent {

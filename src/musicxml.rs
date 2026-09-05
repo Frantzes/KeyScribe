@@ -1,4 +1,4 @@
-﻿//! MusicXML sheet-music generation, shared between the desktop app and the CLI.
+//! MusicXML sheet-music generation, shared between the desktop app and the CLI.
 //!
 //! This module is deliberately free of any egui/UI dependency so the exact same
 //! engraving logic can be driven from a headless binary.
@@ -61,7 +61,7 @@ pub struct SheetEngravingConfig {
 impl Default for SheetEngravingConfig {
     fn default() -> Self {
         Self {
-            _allow_triplets: !SHEET_SWING_BIAS,
+            _allow_triplets: true,
             is_lead_sheet: true,
             single_staff: false,
         }
@@ -649,9 +649,9 @@ pub fn extract_melody_skyline(notes: &[NoteEvent], outlier_semitones: u8) -> Vec
     let modal_pitch = (0..128)
         .max_by(|a, b| pitch_mass[*a].partial_cmp(&pitch_mass[*b]).unwrap_or(std::cmp::Ordering::Equal))
         .unwrap_or(69) as i32;
-    let band_half = 9i32;
-    let register_lo = (modal_pitch - band_half).clamp(40, 60) as u8;
-    let register_hi = (modal_pitch + band_half).clamp(72, 96) as u8;
+    let band_half = 16i32;
+    let register_lo = (modal_pitch - band_half).clamp(36, 60) as u8;
+    let register_hi = (modal_pitch + band_half).clamp(72, 100) as u8;
 
     let register_penalty = |p: u8| -> f32 {
         if p < register_lo {
@@ -839,6 +839,7 @@ pub fn extract_melody_skyline(notes: &[NoteEvent], outlier_semitones: u8) -> Vec
                             end_time: batch_time,
                             velocity: last_melody_vel,
                             channel: None,
+                            is_rearticulation: false,
                         });
                     }
                 }
@@ -856,6 +857,7 @@ pub fn extract_melody_skyline(notes: &[NoteEvent], outlier_semitones: u8) -> Vec
                     end_time: batch_time,
                     velocity: last_melody_vel,
                     channel: None,
+                    is_rearticulation: true,
                 });
                 segment_start = batch_time;
             }
@@ -874,6 +876,7 @@ pub fn extract_melody_skyline(notes: &[NoteEvent], outlier_semitones: u8) -> Vec
                 end_time: end_t,
                 velocity: last_melody_vel,
                 channel: None,
+                is_rearticulation: false,
             });
         }
     }
@@ -1026,7 +1029,7 @@ pub fn merge_adjacent_notes_with_gap(notes: &mut Vec<NoteEvent>, gap_sec: f32) {
     while i + 1 < notes.len() {
         let a = &notes[i];
         let b = &notes[i + 1];
-        if a.pitch == b.pitch && b.start_time - a.end_time < merge_gap {
+        if a.pitch == b.pitch && b.start_time - a.end_time < merge_gap && !b.is_rearticulation {
             let end = a.end_time.max(b.end_time);
             let vel = a.velocity.max(b.velocity);
             notes[i].end_time = end;
