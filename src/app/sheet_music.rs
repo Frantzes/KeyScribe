@@ -8,8 +8,9 @@ use crate::leadsheet::{
     cross_validate_beat_sources, debug_chord_notes_to_json, detect_chord_changes_per_bar,
     generate_lead_sheet_enhanced, generate_lead_sheet_enhanced_with_timeline,
     generate_lead_sheet_foundation, generate_lead_sheet_with_tempo_map,
-    quantize_notes_with_rhythm_map, tempo_map_from_beats, BeatTrackConfig, CrossValidatedBeats,
-    LeadSheetFoundation, LeadSheetPresetConfig, NoteEvent, STEM_GAIN_DB_RANGE,
+    quantize_notes_with_rhythm_map, refine_beat_phase, refine_beat_phase_fixed_bpm, tempo_map_from_beats,
+    validate_downbeat_rotation, BeatTrackConfig, CrossValidatedBeats, LeadSheetFoundation,
+    LeadSheetPresetConfig, NoteEvent, STEM_GAIN_DB_RANGE,
 };
 use crate::musicxml::{
     build_musicxml_document, export_engraved_pdf_with_musescore, extract_melody_heuristic,
@@ -176,7 +177,7 @@ impl KeyScribeApp {
                                                 let cb = ui.checkbox(&mut enabled, cb_label.as_str());
                                                 if conf < 0.08 {
                                                     cb.clone().on_hover_text(
-                                                        "Low stem energy â€” may not contain meaningful audio for visualization",
+                                                        "Low stem energy — may not contain meaningful audio for visualization",
                                                     );
                                                 }
                                                 if cb.changed() {
@@ -735,13 +736,13 @@ impl KeyScribeApp {
                                 ui.label(egui::RichText::new("invalid").color(egui::Color32::RED).weak());
                             }
                             if self.manual_bpm.is_some() {
-                                if ui.button("Ã—2").clicked() {
+                                if ui.button("×2").clicked() {
                                     let base = self.manual_bpm.unwrap_or(120.0);
                                     let clamped = (base * 2.0).clamp(30.0, 400.0);
                                     self.manual_bpm = Some(clamped);
                                     self.bpm_input_str = format!("{:.0}", clamped);
                                 }
-                                if ui.button("Ã·2").clicked() {
+                                if ui.button("÷2").clicked() {
                                     let base = self.manual_bpm.unwrap_or(120.0);
                                     let clamped = (base / 2.0).clamp(30.0, 400.0);
                                     self.manual_bpm = Some(clamped);
@@ -791,7 +792,7 @@ impl KeyScribeApp {
                                 if self.melody_heuristic {
                                     ui.add(
                                         egui::Slider::new(&mut self.melody_outlier_semitones, 3u8..=24u8)
-                                            .text("Ïƒ"),
+                                            .text("σ"),
                                     ).on_hover_text("Outlier threshold: melody jumps larger than this many semitones from the rolling median are suppressed. Lower = smoother line, higher = allows more leaps");
                                 }
                             }
@@ -982,6 +983,7 @@ impl KeyScribeApp {
             full_mix,
             sample_rate,
             manual_bpm: self.manual_bpm,
+            swing_override: self.manual_swing,
             chord_skip: self.chord_skip,
             chord_notes,
             chord_timeline,
@@ -1058,27 +1060,21 @@ impl KeyScribeApp {
             crate::leadsheet::detect_beats_from_notes(&note_events).map(CrossValidatedBeats::from)
         });
 
+        // Mirror the CLI pipeline (`generate_sheet_inner` in headless.rs) so the
+        // GUI benefits from the same measured improvements: lock a manual BPM to
+        // a phase-refined grid (encoder padding otherwise displaces every note
+        // by a 16th at bebop tempos), and refine + validate the ML beat grid
+        // against the melody notes (16-step phase sweep, elastic per-measure
+        // recalibration, downbeat-rotation guard).
         let beat_track = if let Some(manual_bpm) = job.manual_bpm {
-            let beat_duration = 60.0 / manual_bpm.clamp(30.0, 400.0);
-            let duration = job.source_duration;
-            let total_sec = duration.max(10.0) + 2.0;
-            let mut beats: Vec<f32> = Vec::new();
-            let mut t = 0.0f32;
-            while t <= total_sec + 1e-3 {
-                beats.push(t);
-                t += beat_duration;
-            }
-            let downbeats: Vec<f32> = beats.iter().step_by(4).copied().collect();
-            Some(CrossValidatedBeats {
-                beats,
-                downbeats,
-                beats_per_bar: 4,
-                bpm: manual_bpm,
-                confidence: 1.0,
-                source_count: 1,
-            })
+            let syn = crate::headless::synthetic_beat_grid(manual_bpm, job.source_duration);
+            Some(refine_beat_phase_fixed_bpm(&note_events, &syn))
+        } else if let Some(mut refined) = beat_track {
+            refined = refine_beat_phase(&note_events, &refined);
+            validate_downbeat_rotation(&note_events, &mut refined, 0.25);
+            Some(refined)
         } else {
-            beat_track
+            None
         };
 
         let mut config = LeadSheetPresetConfig::default();
@@ -1089,6 +1085,15 @@ impl KeyScribeApp {
         // and eighth notes, which destroyed rhythmic accuracy.
         config.quantization.min_duration_beats = 0.25;
         config.chord_analysis.skip = job.chord_skip;
+        // Match the CLI defaults (`SheetOptions` in headless.rs, as measured
+        // by `keyscribe-cli eval-corpus`): collapse jazz extensions to 7ths,
+        // one chord per bar (half-bar split off), learned quantizer with the
+        // rhythm-coarsening pass, plus the swing feel from the config modal
+        // (previously selected but never applied).
+        config.chord_analysis.collapse_extensions = true;
+        config.chord_analysis.split_threshold = 0.0;
+        config.rhythm_coarsen.enabled = true;
+        config.swing_override = job.swing_override;
         let mut foundation = None;
 
         if let Some(bt) = beat_track.as_ref() {
@@ -1306,7 +1311,7 @@ impl KeyScribeApp {
         }
     }
 
-    /// Runs in a background thread: MusicXML â†’ verovioxide â†’ raw RGBA pages + note positions
+    /// Runs in a background thread: MusicXML → verovioxide → raw RGBA pages + note positions
     fn run_render_background(
         job: &SheetRenderJob,
         dpi_scale: f32,
@@ -1443,7 +1448,7 @@ impl KeyScribeApp {
                 });
                 return all_events;
             }
-            // Analysis not ready yet â€” return empty instead of using wrong data
+            // Analysis not ready yet — return empty instead of using wrong data
             return Vec::new();
         }
         // "Full Mix" mode: use combined timeline if available, else all enabled stems
@@ -1500,7 +1505,7 @@ impl KeyScribeApp {
         // (per-stem and full-mix) produce identical results. The previous
         // method version filtered short notes during extraction (before
         // merge), which dropped notes that could have been merged into
-        // longer ones â€” producing different results from the static version.
+        // longer ones — producing different results from the static version.
         let mut next_id: u32 = 1;
         Self::extract_events_from_timeline_data(
             &self.note_timeline,

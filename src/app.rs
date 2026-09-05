@@ -1273,6 +1273,7 @@ struct SheetPreviewJob {
     full_mix: Option<Vec<f32>>,
     sample_rate: u32,
     manual_bpm: Option<f32>,
+    swing_override: Option<crate::leadsheet::types::SwingStyle>,
     chord_skip: bool,
     chord_notes: Option<Vec<crate::leadsheet::NoteEvent>>,
     /// Probability timelines for harmonic (timeline-based) chord detection.
