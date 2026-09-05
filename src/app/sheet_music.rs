@@ -239,10 +239,13 @@ impl KeyScribeApp {
                         let popup_id = ui.make_persistent_id("listen_selector_area");
                         let mut pos = listen_resp.rect.left_bottom();
                         pos.y += 4.0;
-                        let popup_width = 370.0;
+                        // Estimate only for keeping the popup on-screen; the popup
+                        // itself hugs its content (no forced min width) so there is
+                        // no dead space on the right of the dB values.
+                        let popup_estimate_w = 360.0;
                         let screen_right = ui.ctx().screen_rect().right();
-                        if pos.x + popup_width > screen_right - 8.0 {
-                            pos.x = (screen_right - popup_width - 8.0).max(8.0);
+                        if pos.x + popup_estimate_w > screen_right - 8.0 {
+                            pos.x = (screen_right - popup_estimate_w - 8.0).max(8.0);
                         }
 
                         egui::Area::new(popup_id)
@@ -250,7 +253,6 @@ impl KeyScribeApp {
                             .fixed_pos(pos)
                             .show(ui.ctx(), |ui| {
                                 egui::Frame::popup(ui.style()).show(ui, |ui| {
-                                    ui.set_min_width(popup_width);
                                     ui.vertical(|ui| {
                                         ui.label("Toggle audio playback & stem volumes");
                                         ui.horizontal(|ui| {
@@ -295,6 +297,10 @@ impl KeyScribeApp {
                                         ui.add_space(UI_VSPACE_TIGHT);
 
                                         let mut stem_changed = false;
+                                        // User-chosen accent fills the rail from center to the
+                                        // handle (same role as `selection.bg_fill` for the
+                                        // general volume slider in the media controls).
+                                        let accent = self.highlight_color;
 
                                         egui::Grid::new("listen_stems_slider_grid")
                                             .num_columns(2)
@@ -356,20 +362,42 @@ impl KeyScribeApp {
                                                         }
                                                     });
 
-                                                    // Column 2: Volume Slider (perfectly aligned across rows)
+                                                    // Column 2: bipolar volume slider + fixed-width dB
+                                                    // label. The rail has a fixed width so every row
+                                                    // aligns and the track is always visible (the old
+                                                    // `add_sized([180, ..], Slider::show_value(true))`
+                                                    // squeezed the rail down to just the handle).
                                                     let mut vol = self
                                                         .stem_volumes
                                                         .get(label.as_ref())
                                                         .copied()
                                                         .unwrap_or(0.0);
-                                                    let slider = egui::Slider::new(
-                                                        &mut vol,
-                                                        -STEM_GAIN_DB_RANGE..=STEM_GAIN_DB_RANGE,
-                                                    )
-                                                    .suffix(" dB")
-                                                    .show_value(true);
-                                                    let slider_resp = ui.add_sized([180.0, ui.spacing().interact_size.y], slider);
-                                                    if slider_resp.changed() {
+                                                    let mut vol_changed = false;
+                                                    ui.horizontal(|ui| {
+                                                        ui.spacing_mut().item_spacing.x = 6.0;
+                                                        let slider_id =
+                                                            ui.make_persistent_id(("listen_db", i));
+                                                        vol_changed |= bipolar_db_slider(
+                                                            ui,
+                                                            slider_id,
+                                                            &mut vol,
+                                                            accent,
+                                                        );
+                                                        let row_h =
+                                                            ui.spacing().interact_size.y.max(18.0);
+                                                        ui.add_sized(
+                                                            [64.0, row_h],
+                                                            egui::Label::new(
+                                                                egui::RichText::new(format!(
+                                                                    "{:+.1} dB",
+                                                                    vol
+                                                                ))
+                                                                .monospace()
+                                                                .size(12.0),
+                                                            ),
+                                                        );
+                                                    });
+                                                    if vol_changed {
                                                         self.stem_volumes.insert(label.to_string(), vol);
                                                         if let Some(hash) = &self.loaded_audio_hash {
                                                             self.file_stem_volumes.insert(hash.clone(), self.stem_volumes.clone());
@@ -2074,4 +2102,129 @@ fn draw_scrollable_engraved_preview(
                 }
             }
         });
+}
+
+/// Bipolar dB slider with a fixed-width rail.
+///
+/// Paints the track itself (like the general volume slider in the media
+/// controls) and fills from the center detent to the handle with the
+/// user-chosen accent color, so the direction and amount of the offset are
+/// visible. Returns true when the value changed.
+fn bipolar_db_slider(
+    ui: &mut egui::Ui,
+    id: egui::Id,
+    vol: &mut f32,
+    accent: egui::Color32,
+) -> bool {
+    const RAIL_W: f32 = 140.0;
+    const RAIL_H: f32 = 6.0;
+    const HANDLE_R: f32 = 7.0;
+    const SNAP_DB: f32 = 0.25;
+
+    let min = -STEM_GAIN_DB_RANGE;
+    let max = STEM_GAIN_DB_RANGE;
+    *vol = vol.clamp(min, max);
+
+    let row_h = ui.spacing().interact_size.y.max(18.0);
+    let (rect, mut resp) = ui.push_id(id, |ui| {
+        ui.allocate_exact_size(egui::vec2(RAIL_W, row_h), egui::Sense::click_and_drag())
+    }).inner;
+    resp = resp.on_hover_text(format!(
+        "{:+.1} dB — drag to adjust, double-click resets to 0 dB",
+        *vol
+    ));
+
+    // Rail background follows the themed weak fill, like the media-controls
+    // volume slider does (hover/active variants included).
+    let visuals = ui.visuals();
+    let rail_bg = if resp.is_pointer_button_down_on() || resp.has_focus() {
+        visuals.widgets.active.weak_bg_fill
+    } else if resp.hovered() {
+        visuals.widgets.hovered.weak_bg_fill
+    } else {
+        visuals.widgets.inactive.weak_bg_fill
+    };
+    let rail = egui::Rect::from_center_size(rect.center(), egui::vec2(RAIL_W, RAIL_H));
+    ui.painter()
+        .rect_filled(rail, RAIL_H * 0.5, rail_bg);
+
+    let frac = (*vol - min) / (max - min).max(f32::EPSILON);
+    let thumb_x = rail.left() + frac.clamp(0.0, 1.0) * rail.width();
+    let center_x = rail.center().x;
+
+    // Center detent tick.
+    ui.painter().line_segment(
+        [
+            egui::pos2(center_x, rail.top() - 2.0),
+            egui::pos2(center_x, rail.bottom() + 2.0),
+        ],
+        egui::Stroke::new(1.5, ui.visuals().weak_text_color()),
+    );
+
+    // Accent fill from center to handle.
+    if vol.abs() > 0.001 {
+        let (left, right) = if thumb_x >= center_x {
+            (center_x, thumb_x)
+        } else {
+            (thumb_x, center_x)
+        };
+        let fill = egui::Rect::from_min_max(
+            egui::pos2(left, rail.top()),
+            egui::pos2(right, rail.bottom()),
+        );
+        ui.painter().rect_filled(fill, RAIL_H * 0.5, accent);
+    }
+
+    // Handle in the standard dark-gray widget fill, like the other sliders.
+    let thumb_center = egui::pos2(thumb_x, rect.center().y);
+    let (handle_fill, handle_stroke) = if resp.is_pointer_button_down_on()
+        || resp.has_focus()
+    {
+        (
+            visuals.widgets.active.bg_fill,
+            visuals.widgets.active.fg_stroke,
+        )
+    } else if resp.hovered() {
+        (
+            visuals.widgets.hovered.bg_fill,
+            visuals.widgets.hovered.fg_stroke,
+        )
+    } else {
+        (
+            visuals.widgets.inactive.bg_fill,
+            visuals.widgets.inactive.fg_stroke,
+        )
+    };
+    ui.painter()
+        .circle_filled(thumb_center, HANDLE_R, handle_fill);
+    ui.painter()
+        .circle_stroke(thumb_center, HANDLE_R, handle_stroke);
+
+    // Interaction: click/drag maps pointer x to dB, with a center snap.
+    let mut changed = false;
+    if resp.double_clicked() {
+        if *vol != 0.0 {
+            *vol = 0.0;
+            changed = true;
+        }
+    } else if resp.dragged() || resp.clicked() {
+        if let Some(pos) = resp.interact_pointer_pos() {
+            let x = pos.x.clamp(rail.left(), rail.right());
+            let f = (x - rail.left()) / rail.width().max(f32::EPSILON);
+            let mut next = min + f * (max - min);
+            if next.abs() < SNAP_DB {
+                next = 0.0;
+            }
+            let next = (next.clamp(min, max) * 10.0).round() / 10.0;
+            if next != *vol {
+                *vol = next;
+                changed = true;
+            }
+        }
+    }
+    if changed {
+        resp.mark_changed();
+        ui.ctx().request_repaint();
+    }
+    changed || resp.changed()
 }
