@@ -54,7 +54,7 @@ mod update;
 mod video_player;
 use media_controls::{draw_media_controls, media_controls_height_for_width, setting_toggle_row};
 
-const STATE_FILE_NAME: &str = ".keyscribe_state.json";
+pub(super) const STATE_FILE_NAME: &str = ".keyscribe_state.json";
 const LEGACY_STATE_FILE_NAME: &str = ".transcriber_state.json";
 const MAX_STATE_FILE_BYTES: u64 = 256 * 1024;
 const PROBABILITY_UPDATE_INTERVAL: Duration = Duration::from_millis(16);
@@ -240,6 +240,7 @@ fn assign_stem_colors(stems: &[crate::leadsheet::SeparatedStem]) -> Vec<egui::Co
             StemType::Guitar => egui::Color32::from_rgb(56, 204, 142),
             StemType::Drums => egui::Color32::from_rgb(160, 160, 160),
             StemType::Other => egui::Color32::from_rgb(238, 190, 73),
+            StemType::Instrumental => egui::Color32::from_rgb(238, 190, 73),
             StemType::Custom(_) => egui::Color32::from_rgb(220, 160, 220),
         })
         .collect()
@@ -347,6 +348,13 @@ struct PersistedState {
     /// resume from where the user left off when reopening a file.
     #[serde(default)]
     file_positions: std::collections::HashMap<String, f32>,
+    /// Per-file stem volumes (keyed by file hash -> stem name -> volume dB offset)
+    #[serde(default)]
+    file_stem_volumes: std::collections::HashMap<String, std::collections::HashMap<String, f32>>,
+    #[serde(default)]
+    pub mvsep_api_key: Option<String>,
+    #[serde(default)]
+    pub selected_separation_model_name: Option<String>,
 }
 
 impl Default for PersistedState {
@@ -384,6 +392,9 @@ impl Default for PersistedState {
             auto_separate: default_auto_separate(),
             file_markers: std::collections::HashMap::new(),
             file_positions: std::collections::HashMap::new(),
+            file_stem_volumes: std::collections::HashMap::new(),
+            mvsep_api_key: None,
+            selected_separation_model_name: Some(crate::mvsep::DEFAULT_MVSEP_MODEL_NAME.to_string()),
         }
     }
 }
@@ -462,7 +473,21 @@ fn app_data_dir() -> PathBuf {
         }
     }
 
-    app_portable_base_dir()
+    let exe_dir = app_portable_base_dir();
+    let is_in_target_dir = std::env::current_exe()
+        .ok()
+        .map(|p| p.to_string_lossy().contains("target"))
+        .unwrap_or(false);
+
+    if !is_in_target_dir && exe_dir.join(STATE_FILE_NAME).exists() {
+        return exe_dir;
+    }
+
+    if let Some(project_dirs) = app_project_dirs() {
+        return project_dirs.data_local_dir().to_path_buf();
+    }
+
+    exe_dir
 }
 
 pub(crate) fn app_cache_base_dir() -> PathBuf {
@@ -860,7 +885,25 @@ fn legacy_state_file_path() -> PathBuf {
 }
 
 fn load_persisted_state() -> PersistedState {
-    for path in [state_file_path(), legacy_state_file_path()] {
+    let mut search_paths = vec![
+        state_file_path(),
+        legacy_state_file_path(),
+    ];
+    if let Some(pd) = app_project_dirs() {
+        search_paths.push(pd.data_local_dir().join(STATE_FILE_NAME));
+        search_paths.push(pd.data_local_dir().join(LEGACY_STATE_FILE_NAME));
+    }
+    let portable = app_portable_base_dir();
+    search_paths.push(portable.join(STATE_FILE_NAME));
+    search_paths.push(portable.join(LEGACY_STATE_FILE_NAME));
+    if let Ok(cwd) = std::env::current_dir() {
+        search_paths.push(cwd.join(STATE_FILE_NAME));
+        search_paths.push(cwd.join(LEGACY_STATE_FILE_NAME));
+        search_paths.push(cwd.join("target").join("release").join(STATE_FILE_NAME));
+        search_paths.push(cwd.join("target").join("debug").join(STATE_FILE_NAME));
+    }
+
+    for path in search_paths {
         let Ok(meta) = fs::metadata(&path) else {
             continue;
         };
@@ -888,13 +931,19 @@ pub struct KeyScribeApp {
     processed_playback_samples: Arc<Vec<f32>>,
     processed_playback_channels: u16,
     separated_stems: Option<Vec<crate::leadsheet::SeparatedStem>>,
+    loaded_stems_model_name: Option<String>,
     selected_separation_model_name: Option<String>,
+    mvsep_api_key: String,
+    mvsep_api_key_visible: bool,
+    mvsep_verify_message: Option<String>,
+    show_mvsep_api_key_modal: bool,
     enabled_listening_indices: std::collections::BTreeSet<usize>,
     enabled_stem_indices: std::collections::BTreeSet<usize>,
     pending_listening_indices: std::collections::BTreeSet<usize>,
     pending_stem_indices: std::collections::BTreeSet<usize>,
     show_visualize_selector: bool,
     show_listen_selector: bool,
+    show_separation_model_dropdown: bool,
     waveform: Vec<[f64; 2]>,
     waveform_version: u64,
     loop_waveform_cache_version: u64,
@@ -1049,6 +1098,12 @@ pub struct KeyScribeApp {
     file_markers: std::collections::HashMap<String, Vec<MarkerData>>,
     /// Per-file playback positions (keyed by file hash) for resume-on-reopen.
     file_positions: std::collections::HashMap<String, f32>,
+    /// Per-file stem volumes (keyed by file hash -> stem name -> dB offset).
+    file_stem_volumes: std::collections::HashMap<String, std::collections::HashMap<String, f32>>,
+    /// Current stem volume offsets in dB (keyed by stem name).
+    stem_volumes: std::collections::HashMap<String, f32>,
+    /// Pending stem volume offsets being edited in the listening selector.
+    pending_stem_volumes: std::collections::HashMap<String, f32>,
     /// When set, the playhead will jump to this position once the audio
     /// hash is known and the per-file position map has been checked.
     pending_restore_position: Option<f32>,
@@ -1058,6 +1113,7 @@ pub struct KeyScribeApp {
     marker_edit_index: Option<usize>,
     marker_edit_str: String,
     streaming_stretch: Option<StreamingStretchState>,
+    last_listen_sync_at: Option<Instant>,
 }
 
 struct StreamingStretchState {
@@ -1077,6 +1133,7 @@ struct StemPlaybackCache {
     channels: u16,
     sample_rate: u32,
     listening_key: Vec<usize>,
+    listening_volumes: Vec<f32>,
     processed_speed: f32,
     processed_pitch: f32,
 }
@@ -1286,13 +1343,27 @@ impl KeyScribeApp {
             processed_playback_samples: Arc::new(Vec::new()),
             processed_playback_channels: 1,
             separated_stems: None,
-            selected_separation_model_name: None,
+            loaded_stems_model_name: None,
+            selected_separation_model_name: persisted
+                .selected_separation_model_name
+                .clone()
+                .or_else(|| Some(crate::mvsep::DEFAULT_MVSEP_MODEL_NAME.to_string())),
+            mvsep_api_key: persisted
+                .mvsep_api_key
+                .clone()
+                .filter(|k| !k.trim().is_empty())
+                .or_else(crate::mvsep::find_mvsep_api_key)
+                .unwrap_or_default(),
+            mvsep_api_key_visible: false,
+            mvsep_verify_message: None,
+            show_mvsep_api_key_modal: false,
             enabled_listening_indices: std::collections::BTreeSet::new(),
             enabled_stem_indices: std::collections::BTreeSet::new(),
             pending_listening_indices: std::collections::BTreeSet::new(),
             pending_stem_indices: std::collections::BTreeSet::new(),
             show_visualize_selector: false,
             show_listen_selector: false,
+            show_separation_model_dropdown: false,
             waveform: Vec::new(),
             waveform_version: 0,
             loop_waveform_cache_version: u64::MAX,
@@ -1455,6 +1526,9 @@ impl KeyScribeApp {
             export_full_mix_midi: false,
             file_markers: persisted.file_markers,
             file_positions: persisted.file_positions,
+            file_stem_volumes: persisted.file_stem_volumes,
+            stem_volumes: std::collections::HashMap::new(),
+            pending_stem_volumes: std::collections::HashMap::new(),
             pending_restore_position: None,
             dragging_marker: None,
             context_menu_marker_idx: None,
@@ -1462,6 +1536,7 @@ impl KeyScribeApp {
             marker_edit_index: None,
             marker_edit_str: String::new(),
             streaming_stretch: None,
+            last_listen_sync_at: None,
         };
 
         // Apply tuned pipeline parameters (written by `keyscribe-cli tune`) by

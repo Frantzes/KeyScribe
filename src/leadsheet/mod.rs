@@ -24,8 +24,9 @@ pub use bpm::{detect_bpm, BpmDetectionConfig, TempoEstimate};
 pub use chord::{debug_chord_notes_to_json, detect_chord_changes, detect_chord_changes_per_bar, ChordAnalysisConfig};
 pub use harmony::{compute_bar_profiles, detect_chords_from_timeline, estimate_key, TimelineChordInput};
 pub use instrument_separation::{
-    blend_for_chords, blend_interleaved_stems, extract_melodic_audio, InstrumentSeparator,
-    SeparatedStem, SeparationConfig, StemType,
+    blend_for_chords, blend_interleaved_stems, blend_interleaved_stems_with_gains,
+    extract_melodic_audio, load_stems_from_dir, InstrumentSeparator, SeparatedStem, SeparationConfig, StemType,
+    STEM_GAIN_DB_RANGE,
 };
 pub use joint_tracker::{
     collapse_to_tempo_segments, collapse_to_time_signature_segments, extract_downbeats_from_path,

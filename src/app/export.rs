@@ -12,6 +12,14 @@ impl KeyScribeApp {
                 .resizable(false)
                 .open(&mut stems_open)
                 .show(ctx, |ui| {
+                    let current_model = self.current_separation_model_name();
+                    if self.separated_stems.is_none() || self.loaded_stems_model_name.as_deref() != Some(&current_model) {
+                        let _ = self.load_stems_for_model(&current_model);
+                    }
+                    let model_display = self.separation_model_display_name(&current_model);
+                    ui.label(egui::RichText::new(format!("Model: {model_display}")).strong());
+                    ui.add_space(4.0);
+
                     self.draw_export_stem_selection(ui);
                     ui.add_space(8.0);
                     if ui.button("Select Destination & Export").clicked() {
@@ -85,7 +93,13 @@ impl KeyScribeApp {
         }
     }
 
-    fn execute_export_stems(&self, dest_folder: &Path) {
+    fn execute_export_stems(&mut self, dest_folder: &Path) {
+        let current_model = self.current_separation_model_name();
+        if self.separated_stems.is_none() || self.loaded_stems_model_name.as_deref() != Some(&current_model) {
+            let _ = self.load_stems_for_model(&current_model);
+        }
+
+        let mut exported_count = 0;
         if let Some(stems) = &self.separated_stems {
             for stem in stems {
                 if self.export_selected_stems.contains(&stem.stem_type) {
@@ -97,13 +111,28 @@ impl KeyScribeApp {
                         bits_per_sample: 32,
                         sample_format: hound::SampleFormat::Float,
                     };
-                    if let Ok(mut writer) = hound::WavWriter::create(path, spec) {
-                        for &s in stem.samples_interleaved.iter() {
-                            let _ = writer.write_sample(s);
+                    match hound::WavWriter::create(&path, spec) {
+                        Ok(mut writer) => {
+                            for &s in stem.samples_interleaved.iter() {
+                                let _ = writer.write_sample(s);
+                            }
+                            if let Err(e) = writer.finalize() {
+                                self.last_error = Some(format!("Failed to finalize WAV {:?}: {e}", path));
+                            } else {
+                                exported_count += 1;
+                            }
+                        }
+                        Err(e) => {
+                            self.last_error = Some(format!("Failed to create WAV file {:?}: {e}", path));
                         }
                     }
                 }
             }
+        }
+
+        if exported_count > 0 {
+            self.cache_status_message = Some(format!("Exported {exported_count} stem(s) to {:?}", dest_folder));
+            self.cache_status_message_at = Some(std::time::Instant::now());
         }
     }
 

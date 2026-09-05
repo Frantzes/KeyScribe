@@ -8,15 +8,17 @@ pub struct SeparationConfig {
     pub song_hash: Option<String>,
     pub source_path: Option<PathBuf>,
     pub cache_dir: Option<PathBuf>,
+    pub mvsep_api_key: Option<String>,
 }
 
 impl Default for SeparationConfig {
     fn default() -> Self {
         Self {
-            model_name: "htdemucs_6s".to_string(),
+            model_name: crate::mvsep::DEFAULT_MVSEP_MODEL_NAME.to_string(),
             song_hash: None,
             source_path: None,
             cache_dir: None,
+            mvsep_api_key: None,
         }
     }
 }
@@ -29,6 +31,7 @@ pub enum StemType {
     Piano,
     Guitar,
     Other,
+    Instrumental,
     Custom(String),
 }
 
@@ -50,10 +53,11 @@ impl StemType {
             StemType::Piano
         } else if lower.contains("guitar") {
             StemType::Guitar
+        } else if lower.contains("instrumental") || lower == "instrum" {
+            StemType::Instrumental
         } else if lower.contains("other")
             || lower.contains("backing")
             || lower.contains("accomp")
-            || lower.contains("instrumental")
             || lower.contains("pad")
             || lower.contains("strings")
             || lower.contains("synth")
@@ -73,13 +77,18 @@ impl StemType {
             StemType::Piano => Cow::Borrowed("Piano"),
             StemType::Guitar => Cow::Borrowed("Guitar"),
             StemType::Other => Cow::Borrowed("Other"),
+            StemType::Instrumental => Cow::Borrowed("Instrumental"),
             StemType::Custom(label) => Cow::Borrowed(label.as_str()),
         }
     }
 
     pub fn is_melodic(&self) -> bool {
         match self {
-            StemType::Vocals | StemType::Other | StemType::Piano | StemType::Guitar => true,
+            StemType::Vocals
+            | StemType::Other
+            | StemType::Piano
+            | StemType::Guitar
+            | StemType::Instrumental => true,
             StemType::Bass | StemType::Drums => false,
             StemType::Custom(label) => {
                 let lower = label.to_ascii_lowercase();
@@ -127,7 +136,7 @@ impl InstrumentSeparator {
                 .map_or(false, |v| v == CACHE_VERSION);
 
         if cache_valid {
-            let stems = self.load_stems_from_dir(&stem_cache_root)?;
+            let stems = load_stems_from_dir(&stem_cache_root)?;
             if !stems.is_empty() {
                 println!("[DEBUG] Loaded stems from cache: {:?}", stem_cache_root);
                 if let Some(ref cb) = progress_callback {
@@ -152,6 +161,48 @@ impl InstrumentSeparator {
         });
         if let Some(cb) = progress_cb {
             cb(0.02); // "Initializing model..."
+        }
+
+        // Run MVSep Cloud separation if an MVSep model was selected.
+        if self.config.model_name.starts_with("mvsep") {
+            let sep_type = crate::mvsep::parse_mvsep_model_id(&self.config.model_name)
+                .unwrap_or(crate::mvsep::DEFAULT_MVSEP_MODEL_ID);
+
+            let api_key = self
+                .config
+                .mvsep_api_key
+                .clone()
+                .or_else(crate::mvsep::find_mvsep_api_key)
+                .ok_or_else(|| {
+                    anyhow!(
+                        "MVSep API key is required. Please set your API key in Settings -> Audio Processing (get one at https://mvsep.com/en/full_api)."
+                    )
+                })?;
+
+            let mvsep_cb = progress_callback.as_ref().map(|cb| {
+                let cb: &dyn Fn(f32) = cb.as_ref();
+                move |p: f32, _msg: &str| {
+                    cb(p);
+                }
+            });
+            let mvsep_cb_ref = mvsep_cb.as_ref().map(|f| f as &dyn Fn(f32, &str));
+
+            crate::mvsep::separate_audio_file(
+                &api_key,
+                source_path,
+                sep_type,
+                &stem_cache_root,
+                mvsep_cb_ref,
+            )?;
+
+            let stems = load_stems_from_dir(&stem_cache_root)?;
+            if stems.is_empty() {
+                return Err(anyhow!("No stems were downloaded from MVSep"));
+            }
+            if let Some(ref cb) = progress_callback {
+                cb(1.0);
+            }
+            return Ok(stems);
         }
 
         // Run Demucs entirely in Rust via the precompiled ONNX model.
@@ -193,12 +244,17 @@ impl InstrumentSeparator {
 
         Ok(stems)
     }
+}
 
-    fn load_stems_from_dir(&self, dir: &Path) -> Result<Vec<SeparatedStem>> {
-        let mut stems = Vec::new();
-        if !dir.exists() {
-            return Ok(stems);
-        }
+pub fn load_stems_from_dir(dir: &Path) -> Result<Vec<SeparatedStem>> {
+    let mut stems = Vec::new();
+    if !dir.exists() {
+        return Ok(stems);
+    }
+
+        let mut entries = Vec::new();
+        let mut has_other = false;
+        let mut has_specific_stems = false;
 
         for entry in std::fs::read_dir(dir)? {
             let entry = entry?;
@@ -207,19 +263,47 @@ impl InstrumentSeparator {
                 .extension()
                 .and_then(|s| s.to_str())
                 .map(|s| s.to_ascii_lowercase());
-            if matches!(ext.as_deref(), Some("mp3") | Some("wav")) {
-                let stem_name = path.file_stem().and_then(|s| s.to_str()).unwrap_or("unknown");
-                let audio = crate::audio_io::load_audio_file(&path)?;
-
-                stems.push(SeparatedStem {
-                    stem_type: StemType::from_label(stem_name),
-                    samples_mono: Arc::new(audio.samples_mono.to_vec()),
-                    samples_interleaved: Arc::new(audio.samples_interleaved.to_vec()),
-                    channels: audio.channels,
-                    sample_rate: audio.sample_rate,
-                    confidence: 0.9,
-                });
+            if matches!(
+                ext.as_deref(),
+                Some("mp3") | Some("wav") | Some("flac") | Some("m4a") | Some("aac") | Some("ogg")
+            ) {
+                let stem_name = path
+                    .file_stem()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or("unknown")
+                    .to_ascii_lowercase();
+                if stem_name == "other" {
+                    has_other = true;
+                }
+                if matches!(stem_name.as_str(), "bass" | "drums" | "piano" | "guitar") {
+                    has_specific_stems = true;
+                }
+                entries.push((stem_name, path));
             }
+        }
+
+        for (stem_name, path) in entries {
+            // If individual stems (like other, bass, drums, etc.) are present,
+            // "instrum" is a composite backing track generated by MVSep for karaoke,
+            // NOT an independent stem. Skip it to avoid duplicating "Other" or doubling volume.
+            if (stem_name == "instrum" || stem_name == "instrumental")
+                && (has_other || has_specific_stems)
+            {
+                // Also clean up redundant file so it doesn't take up disk space
+                let _ = std::fs::remove_file(&path);
+                continue;
+            }
+
+            let audio = crate::audio_io::load_audio_file(&path)?;
+
+            stems.push(SeparatedStem {
+                stem_type: StemType::from_label(&stem_name),
+                samples_mono: Arc::new(audio.samples_mono.to_vec()),
+                samples_interleaved: Arc::new(audio.samples_interleaved.to_vec()),
+                channels: audio.channels,
+                sample_rate: audio.sample_rate,
+                confidence: 0.9,
+            });
         }
 
         // Sort stems for consistent UI order
@@ -230,12 +314,12 @@ impl InstrumentSeparator {
             StemType::Vocals => 3,
             StemType::Piano => 4,
             StemType::Guitar => 5,
-            _ => 6,
+            StemType::Instrumental => 6,
+            _ => 7,
         });
 
         Ok(stems)
     }
-}
 
 use std::sync::Arc;
 
@@ -308,36 +392,58 @@ pub fn blend_for_chords(stems: &[SeparatedStem]) -> Arc<Vec<f32>> {
     Arc::new(blend)
 }
 
-pub fn blend_interleaved_stems(stems: &[SeparatedStem]) -> (Arc<Vec<f32>>, u16) {
+/// Maximum decibel gain adjustment range for stem playback (gain ranges from -STEM_GAIN_DB_RANGE to +STEM_GAIN_DB_RANGE).
+pub const STEM_GAIN_DB_RANGE: f32 = 10.0;
+
+pub fn blend_interleaved_stems_with_gains(
+    stems: &[SeparatedStem],
+    linear_gains: &[f32],
+) -> (Arc<Vec<f32>>, u16) {
     if stems.is_empty() {
         return (Arc::new(Vec::new()), 1);
     }
 
     if stems.len() == 1 {
-        return (Arc::clone(&stems[0].samples_interleaved), stems[0].channels);
+        let gain = linear_gains.first().copied().unwrap_or(1.0);
+        if (gain - 1.0).abs() < 1e-4 {
+            return (Arc::clone(&stems[0].samples_interleaved), stems[0].channels);
+        }
+        let mut scaled: Vec<f32> = stems[0].samples_interleaved.iter().map(|&s| s * gain).collect();
+        let max_val = scaled.iter().copied().fold(0.0f32, |a, b| a.max(b.abs()));
+        if max_val > 1.0 {
+            let scale = 1.0 / max_val;
+            for sample in scaled.iter_mut() {
+                *sample *= scale;
+            }
+        }
+        return (Arc::new(scaled), stems[0].channels);
     }
 
     let channels = stems.iter().map(|s| s.channels).max().unwrap_or(1);
-    let total_frames = stems.iter().map(|s| s.samples_interleaved.len() / s.channels as usize).max().unwrap_or(0);
-    
+    let total_frames = stems
+        .iter()
+        .map(|s| s.samples_interleaved.len() / s.channels as usize)
+        .max()
+        .unwrap_or(0);
+
     let mut blend = vec![0.0f32; total_frames * channels as usize];
-    for stem in stems {
+    for (stem, &gain) in stems.iter().zip(linear_gains.iter().chain(std::iter::repeat(&1.0))) {
         let stem_frames = stem.samples_interleaved.len() / stem.channels as usize;
         let frames_to_copy = stem_frames.min(total_frames);
-        
+
         if stem.channels == channels {
             for i in 0..frames_to_copy * channels as usize {
-                blend[i] += stem.samples_interleaved[i];
+                blend[i] += stem.samples_interleaved[i] * gain;
             }
         } else if stem.channels == 1 && channels == 2 {
             for f in 0..frames_to_copy {
-                let s = stem.samples_interleaved[f];
+                let s = stem.samples_interleaved[f] * gain;
                 blend[f * 2] += s;
                 blend[f * 2 + 1] += s;
             }
         } else {
             for f in 0..frames_to_copy {
-                let s = stem.samples_mono[f];
+                let s = stem.samples_mono[f] * gain;
                 for ch in 0..channels as usize {
                     blend[f * channels as usize + ch] += s;
                 }
@@ -345,8 +451,6 @@ pub fn blend_interleaved_stems(stems: &[SeparatedStem]) -> (Arc<Vec<f32>>, u16) 
         }
     }
 
-    // Sum stems at their natural mix level (no division by count).
-    // The sum of all Demucs stems approximates the original mix.
     // Normalize to [-1, 1] to prevent clipping from summed peaks.
     let max_val = blend.iter().copied().fold(0.0f32, |a, b| a.max(b.abs()));
     if max_val > 1.0 {
@@ -357,3 +461,80 @@ pub fn blend_interleaved_stems(stems: &[SeparatedStem]) -> (Arc<Vec<f32>>, u16) 
     }
     (Arc::new(blend), channels)
 }
+
+pub fn blend_interleaved_stems(stems: &[SeparatedStem]) -> (Arc<Vec<f32>>, u16) {
+    if stems.is_empty() {
+        return (Arc::new(Vec::new()), 1);
+    }
+
+    if stems.len() == 1 {
+        return (Arc::clone(&stems[0].samples_interleaved), stems[0].channels);
+    }
+
+    let unity_gains = vec![1.0f32; stems.len()];
+    blend_interleaved_stems_with_gains(stems, &unity_gains)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn dummy_stem(samples: Vec<f32>, stem_type: StemType) -> SeparatedStem {
+        SeparatedStem {
+            stem_type,
+            samples_mono: Arc::new(samples.clone()),
+            samples_interleaved: Arc::new(samples),
+            channels: 1,
+            sample_rate: 44100,
+            confidence: 1.0,
+        }
+    }
+
+    #[test]
+    fn test_stem_gain_constant() {
+        assert_eq!(STEM_GAIN_DB_RANGE, 10.0);
+    }
+
+    #[test]
+    fn test_single_stem_with_gain() {
+        let stem = dummy_stem(vec![0.1, 0.2, -0.1], StemType::Vocals);
+        let stems = vec![stem];
+
+        // Unity gain
+        let (res_unity, _) = blend_interleaved_stems_with_gains(&stems, &[1.0]);
+        assert_eq!(res_unity.as_slice(), &[0.1, 0.2, -0.1]);
+
+        // 2x gain
+        let (res_boost, _) = blend_interleaved_stems_with_gains(&stems, &[2.0]);
+        assert_eq!(res_boost.as_slice(), &[0.2, 0.4, -0.2]);
+    }
+
+    #[test]
+    fn test_multi_stem_with_gains() {
+        let stem1 = dummy_stem(vec![0.1, 0.1], StemType::Vocals);
+        let stem2 = dummy_stem(vec![0.2, 0.2], StemType::Bass);
+        let stems = vec![stem1, stem2];
+
+        // 1x and 0.5x
+        let (res, _) = blend_interleaved_stems_with_gains(&stems, &[1.0, 0.5]);
+        // stem1: 0.1 * 1.0 = 0.1
+        // stem2: 0.2 * 0.5 = 0.1
+        // sum = 0.2
+        assert!((res[0] - 0.2).abs() < 1e-5);
+        assert!((res[1] - 0.2).abs() < 1e-5);
+    }
+
+    #[test]
+    fn test_stem_type_instrumental_and_other_separation() {
+        assert_eq!(StemType::from_label("instrum"), StemType::Instrumental);
+        assert_eq!(StemType::from_label("instrumental"), StemType::Instrumental);
+        assert_eq!(StemType::from_label("other"), StemType::Other);
+        assert_eq!(StemType::from_label("vocals"), StemType::Vocals);
+
+        assert_eq!(StemType::Instrumental.display_name(), "Instrumental");
+        assert_eq!(StemType::Other.display_name(), "Other");
+        assert_ne!(StemType::Instrumental, StemType::Other);
+    }
+}
+
+

@@ -24,6 +24,8 @@ target
 #.idea/
 .transcriber_state.json
 .transcriber_cache/
+.env
+*.env
 
 # Headless CLI test-loop artifacts
 out/

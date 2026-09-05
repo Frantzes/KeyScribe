@@ -172,11 +172,19 @@ impl KeyScribeApp {
             self.loop_playback_enabled = false;
             self.drag_select_anchor_sec = None;
 
+            if let Some(hash) = &self.loaded_audio_hash {
+                if !self.stem_volumes.is_empty() {
+                    self.file_stem_volumes.insert(hash.clone(), self.stem_volumes.clone());
+                }
+            }
+
             // Clear all stem state from previous song
             self.saved_visualize_stem_indices = None;
             self.saved_listen_stem_indices = None;
             self.pending_stem_indices.clear();
             self.pending_listening_indices.clear();
+            self.stem_volumes.clear();
+            self.pending_stem_volumes.clear();
             self.show_visualize_selector = false;
             self.show_listen_selector = false;
             self.melody_stem_indices.clear();
@@ -190,6 +198,7 @@ impl KeyScribeApp {
         }
         // Clear all stem state from previous song
         self.separated_stems = None;
+        self.loaded_stems_model_name = None;
         self.stem_analyses.clear();
         self.stem_colors.clear();
         self.stem_analysis_rx = None;
@@ -253,6 +262,12 @@ impl KeyScribeApp {
                             self.pending_restore_position = Some(saved);
                         }
                     }
+                    if let Some(saved_vols) = self.file_stem_volumes.get(hash) {
+                        self.stem_volumes = saved_vols.clone();
+                    } else {
+                        self.stem_volumes.clear();
+                    }
+                    self.pending_stem_volumes = self.stem_volumes.clone();
                 }
 
                 // Apply the pending restore position now that the hash is

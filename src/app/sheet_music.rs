@@ -1,4 +1,4 @@
-﻿use std::collections::HashMap;
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::process::Command;
 use std::sync::mpsc::TryRecvError;
@@ -9,7 +9,7 @@ use crate::leadsheet::{
     generate_lead_sheet_enhanced, generate_lead_sheet_enhanced_with_timeline,
     generate_lead_sheet_foundation, generate_lead_sheet_with_tempo_map,
     quantize_notes_with_rhythm_map, tempo_map_from_beats, BeatTrackConfig, CrossValidatedBeats,
-    LeadSheetFoundation, LeadSheetPresetConfig, NoteEvent,
+    LeadSheetFoundation, LeadSheetPresetConfig, NoteEvent, STEM_GAIN_DB_RANGE,
 };
 use crate::musicxml::{
     build_musicxml_document, export_engraved_pdf_with_musescore, extract_melody_heuristic,
@@ -232,7 +232,6 @@ impl KeyScribeApp {
                         self.show_listen_selector = !self.show_listen_selector;
                         if self.show_listen_selector {
                             self.show_visualize_selector = false;
-                            self.pending_listening_indices = self.enabled_listening_indices.clone();
                         }
                     }
 
@@ -240,84 +239,180 @@ impl KeyScribeApp {
                         let popup_id = ui.make_persistent_id("listen_selector_area");
                         let mut pos = listen_resp.rect.left_bottom();
                         pos.y += 4.0;
+                        let popup_width = 370.0;
+                        let screen_right = ui.ctx().screen_rect().right();
+                        if pos.x + popup_width > screen_right - 8.0 {
+                            pos.x = (screen_right - popup_width - 8.0).max(8.0);
+                        }
 
                         egui::Area::new(popup_id)
                             .order(egui::Order::Foreground)
                             .fixed_pos(pos)
                             .show(ui.ctx(), |ui| {
                                 egui::Frame::popup(ui.style()).show(ui, |ui| {
-                                    ui.set_min_width(180.0);
+                                    ui.set_min_width(popup_width);
                                     ui.vertical(|ui| {
-                                        ui.label("Toggle audio playback");
+                                        ui.label("Toggle audio playback & stem volumes");
                                         ui.horizontal(|ui| {
                                             if ui.button("Original Mix").clicked() {
-                                                self.pending_listening_indices.clear();
+                                                self.enabled_listening_indices.clear();
+                                                self.stem_playback_cache = None;
+                                                self.maybe_restart_playback_for_listen_sync();
                                             }
                                             if ui.button("All").clicked() {
-                                                self.pending_listening_indices = (0..stems.len()).collect();
+                                                self.enabled_listening_indices = (0..stems.len()).collect();
+                                                self.stem_playback_cache = None;
+                                                let live = self.sync_all_stem_gains_live();
+                                                if !live {
+                                                    self.maybe_restart_playback_for_listen_sync();
+                                                }
                                             }
                                             if ui.button("None").clicked() {
-                                                self.pending_listening_indices.clear();
+                                                self.enabled_listening_indices.clear();
+                                                self.stem_playback_cache = None;
+                                                let live = self.sync_all_stem_gains_live();
+                                                if !live {
+                                                    self.maybe_restart_playback_for_listen_sync();
+                                                }
+                                            }
+                                            if ui.button("Reset Volumes").clicked() {
+                                                for stem in stems.iter() {
+                                                    self.stem_volumes.insert(
+                                                        stem.stem_type.display_name().to_string(),
+                                                        0.0,
+                                                    );
+                                                }
+                                                if let Some(hash) = &self.loaded_audio_hash {
+                                                    self.file_stem_volumes.insert(hash.clone(), self.stem_volumes.clone());
+                                                }
+                                                self.stem_playback_cache = None;
+                                                let live = self.sync_all_stem_gains_live();
+                                                if !live {
+                                                    self.maybe_restart_playback_for_listen_sync();
+                                                }
                                             }
                                         });
                                         ui.add_space(UI_VSPACE_TIGHT);
 
-                                        for (i, stem) in stems.iter().enumerate() {
-                                            let mut enabled = self.pending_listening_indices.contains(&i);
-                                            let label = stem.stem_type.display_name();
-                                            let stem_color = self
-                                                .stem_colors
-                                                .get(i)
-                                                .copied()
-                                                .unwrap_or(self.highlight_color);
-                                            let conf = stem.confidence;
-                                            let conf_label = if conf < 0.03 {
-                                                " (inactive)"
-                                            } else if conf < 0.08 {
-                                                " (low)"
-                                            } else {
-                                                ""
-                                            };
-                                            ui.horizontal(|ui| {
-                                                let (dot_rect, _) = ui.allocate_exact_size(
-                                                    egui::vec2(10.0, 10.0),
-                                                    egui::Sense::hover(),
-                                                );
-                                                ui.painter()
-                                                    .circle_filled(dot_rect.center(), 4.0, stem_color);
-                                                let cb_label = format!("{}{}", label, conf_label);
-                                                let cb = ui.checkbox(&mut enabled, cb_label.as_str());
-                                                if conf < 0.08 {
-                                                    cb.clone().on_hover_text(
-                                                        "Low stem energy â€” may not contain meaningful audio",
-                                                    );
-                                                }
-                                                if cb.changed() {
-                                                    if enabled {
-                                                        self.pending_listening_indices.insert(i);
+                                        let mut stem_changed = false;
+
+                                        egui::Grid::new("listen_stems_slider_grid")
+                                            .num_columns(2)
+                                            .spacing([12.0, 6.0])
+                                            .show(ui, |ui| {
+                                                for (i, stem) in stems.iter().enumerate() {
+                                                    let mut enabled = self.enabled_listening_indices.contains(&i);
+                                                    let label = stem.stem_type.display_name();
+                                                    let stem_color = self
+                                                        .stem_colors
+                                                        .get(i)
+                                                        .copied()
+                                                        .unwrap_or(self.highlight_color);
+                                                    let conf = stem.confidence;
+                                                    let conf_label = if conf < 0.03 {
+                                                        " (inactive)"
+                                                    } else if conf < 0.08 {
+                                                        " (low)"
                                                     } else {
-                                                        self.pending_listening_indices.remove(&i);
+                                                        ""
+                                                    };
+
+                                                    // Column 1: Dot + Checkbox
+                                                    ui.horizontal(|ui| {
+                                                        let (dot_rect, _) = ui.allocate_exact_size(
+                                                            egui::vec2(10.0, 10.0),
+                                                            egui::Sense::hover(),
+                                                        );
+                                                        ui.painter()
+                                                            .circle_filled(dot_rect.center(), 4.0, stem_color);
+                                                        let cb_label = format!("{}{}", label, conf_label);
+                                                        let cb = ui.checkbox(&mut enabled, cb_label.as_str());
+                                                        if conf < 0.08 {
+                                                            cb.clone().on_hover_text(
+                                                                "Low stem energy — may not contain meaningful audio",
+                                                            );
+                                                        }
+                                                        if cb.changed() {
+                                                            let mut live_synced = false;
+                                                            if enabled {
+                                                                self.enabled_listening_indices.insert(i);
+                                                                let vol = self
+                                                                    .stem_volumes
+                                                                    .get(label.as_ref())
+                                                                    .copied()
+                                                                    .unwrap_or(0.0);
+                                                                let linear_gain = 10.0f32.powf(vol / 20.0);
+                                                                live_synced = self.sync_stem_gain_live(label.as_ref(), linear_gain);
+                                                            } else {
+                                                                self.enabled_listening_indices.remove(&i);
+                                                                if !self.enabled_listening_indices.is_empty() {
+                                                                    live_synced = self.sync_stem_gain_live(label.as_ref(), 0.0);
+                                                                }
+                                                            }
+                                                            self.stem_playback_cache = None;
+                                                            if !live_synced {
+                                                                stem_changed = true;
+                                                            }
+                                                        }
+                                                    });
+
+                                                    // Column 2: Volume Slider (perfectly aligned across rows)
+                                                    let mut vol = self
+                                                        .stem_volumes
+                                                        .get(label.as_ref())
+                                                        .copied()
+                                                        .unwrap_or(0.0);
+                                                    let slider = egui::Slider::new(
+                                                        &mut vol,
+                                                        -STEM_GAIN_DB_RANGE..=STEM_GAIN_DB_RANGE,
+                                                    )
+                                                    .suffix(" dB")
+                                                    .show_value(true);
+                                                    let slider_resp = ui.add_sized([180.0, ui.spacing().interact_size.y], slider);
+                                                    if slider_resp.changed() {
+                                                        self.stem_volumes.insert(label.to_string(), vol);
+                                                        if let Some(hash) = &self.loaded_audio_hash {
+                                                            self.file_stem_volumes.insert(hash.clone(), self.stem_volumes.clone());
+                                                        }
+                                                        if !enabled {
+                                                            self.enabled_listening_indices.insert(i);
+                                                        }
+                                                        let linear_gain = 10.0f32.powf(vol / 20.0);
+                                                        let live_synced = self.sync_stem_gain_live(label.as_ref(), linear_gain);
+                                                        self.stem_playback_cache = None;
+                                                        if !live_synced {
+                                                            stem_changed = true;
+                                                        }
                                                     }
+                                                    ui.end_row();
                                                 }
                                             });
+
+                                        if stem_changed {
+                                            if let Some(hash) = &self.loaded_audio_hash {
+                                                self.file_stem_volumes.insert(hash.clone(), self.stem_volumes.clone());
+                                            }
+                                            self.stem_playback_cache = None;
+                                            let now = Instant::now();
+                                            let should_restart = match self.last_listen_sync_at {
+                                                Some(last) => now.duration_since(last) >= Duration::from_millis(60),
+                                                None => true,
+                                            };
+                                            if should_restart {
+                                                self.maybe_restart_playback_for_listen_sync();
+                                                self.last_listen_sync_at = Some(now);
+                                            }
+                                        }
+
+                                        let pointer_down = ui.input(|i| i.pointer.primary_down());
+                                        if !pointer_down && self.last_listen_sync_at.is_some() {
+                                            self.maybe_restart_playback_for_listen_sync();
+                                            self.last_listen_sync_at = None;
                                         }
 
                                         ui.add_space(UI_VSPACE_TIGHT);
-                                        let changed = self.pending_listening_indices != self.enabled_listening_indices;
                                         ui.horizontal(|ui| {
-                                            if ui.add_enabled(changed, egui::Button::new("Apply Changes")).clicked() {
-                                                let normalize_to_original_mix =
-                                                    self.pending_listening_indices.len() == stems.len();
-                                                if normalize_to_original_mix {
-                                                    self.enabled_listening_indices.clear();
-                                                } else {
-                                                    self.enabled_listening_indices =
-                                                        self.pending_listening_indices.clone();
-                                                }
-                                                self.maybe_restart_playback_for_listen_sync();
-                                                self.show_listen_selector = false;
-                                            }
-                                            if ui.button("Cancel").clicked() {
+                                            if ui.button("Close").clicked() {
                                                 self.show_listen_selector = false;
                                             }
                                         });

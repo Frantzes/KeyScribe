@@ -443,7 +443,7 @@ impl KeyScribeApp {
         } else if let Some(source_pos) = handoff_pos {
             if let Some(loop_end) = handoff_loop_end {
                 if loop_end - source_pos > LOOP_MIN_DURATION_SEC {
-                    self.play_range(source_pos, Some(loop_end));
+                    self.play_range(source_pos, None);
                 } else {
                     self.play_from_selected();
                 }

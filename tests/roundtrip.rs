@@ -21,10 +21,10 @@ fn temp_path(ext: &str) -> std::path::PathBuf {
 #[test]
 fn midi_write_parse_roundtrip_preserves_notes() {
     let notes = vec![
-        NoteEvent { id: 0, pitch: 60, start_time: 0.0, end_time: 0.5, velocity: 100, channel: None },
-        NoteEvent { id: 1, pitch: 62, start_time: 0.6, end_time: 1.2, velocity: 90, channel: None },
-        NoteEvent { id: 2, pitch: 64, start_time: 1.2, end_time: 1.6, velocity: 80, channel: None },
-        NoteEvent { id: 3, pitch: 67, start_time: 2.0, end_time: 2.5, velocity: 110, channel: None },
+        NoteEvent { id: 0, pitch: 60, start_time: 0.0, end_time: 0.5, velocity: 100, channel: None, is_rearticulation: false },
+        NoteEvent { id: 1, pitch: 62, start_time: 0.6, end_time: 1.2, velocity: 90, channel: None, is_rearticulation: false },
+        NoteEvent { id: 2, pitch: 64, start_time: 1.2, end_time: 1.6, velocity: 80, channel: None, is_rearticulation: false },
+        NoteEvent { id: 3, pitch: 67, start_time: 2.0, end_time: 2.5, velocity: 110, channel: None, is_rearticulation: false },
     ];
 
     let path = temp_path("mid");

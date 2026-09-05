@@ -11,6 +11,7 @@ pub mod inference;
 pub mod leadsheet;
 pub mod midi;
 pub mod musicxml;
+pub mod mvsep;
 pub mod pipeline;
 pub mod preprocessing;
 pub mod ring_buffer;

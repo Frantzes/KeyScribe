@@ -401,14 +401,7 @@ pub(super) fn draw_media_controls(
                                 )
                                 .clicked()
                                 {
-                                    app.loop_enabled = !app.loop_enabled;
-                                    if !app.loop_enabled {
-                                        app.loop_selection = None;
-                                        app.loop_playback_enabled = false;
-                                        if app.is_playing() {
-                                            app.play_from_selected();
-                                        }
-                                    }
+                                    app.toggle_loop();
                                 }
 
                                 draw_loop_inputs(ui, app);
@@ -545,14 +538,7 @@ pub(super) fn draw_media_controls(
                                                 )
                                                 .clicked()
                                                 {
-                                                    app.loop_enabled = !app.loop_enabled;
-                                                    if !app.loop_enabled {
-                                                        app.loop_selection = None;
-                                                        app.loop_playback_enabled = false;
-                                                        if app.is_playing() {
-                                                            app.play_from_selected();
-                                                        }
-                                                    }
+                                                    app.toggle_loop();
                                                 }
 
                                                 if app.loop_enabled {
@@ -688,7 +674,7 @@ fn draw_loop_inputs(ui: &mut egui::Ui, app: &mut KeyScribeApp) {
             let pos = app.current_position_sec();
             if pos < new_start || pos >= new_end {
                 app.selected_time_sec = new_start;
-                app.play_range(new_start, Some(new_end));
+                app.play_range(new_start, None);
             }
         }
     }

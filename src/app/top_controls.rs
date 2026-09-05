@@ -161,6 +161,7 @@ impl KeyScribeApp {
         }
     }
 
+    #[allow(dead_code)]
     pub(super) fn selected_separation_model_path(&self) -> Option<std::path::PathBuf> {
         let options = Self::available_separation_models();
         if options.is_empty() {
@@ -196,6 +197,69 @@ impl KeyScribeApp {
         }
 
         options.first().map(|option| option.path.clone())
+    }
+
+    pub(super) fn current_separation_model_name(&self) -> String {
+        if let Some(ref name) = self.selected_separation_model_name {
+            return name.clone();
+        }
+        crate::mvsep::DEFAULT_MVSEP_MODEL_NAME.to_string()
+    }
+
+    pub(crate) fn separation_model_display_name(&self, model_name: &str) -> String {
+        if let Some(m) = crate::mvsep::get_mvsep_model_by_name(model_name) {
+            m.display_name.to_string()
+        } else if let Some(opt) = Self::available_separation_models().iter().find(|o| o.stem_name().as_deref() == Some(model_name)) {
+            opt.label.clone()
+        } else {
+            model_name.to_string()
+        }
+    }
+
+    pub(super) fn select_separation_model(&mut self, model_name: String) {
+        if self.selected_separation_model_name.as_deref() == Some(&model_name)
+            && self.loaded_stems_model_name.as_deref() == Some(&model_name)
+        {
+            return;
+        }
+
+        self.selected_separation_model_name = Some(model_name.clone());
+
+        // Attempt to immediately load stems from cache if this model was previously separated
+        if !self.load_stems_for_model(&model_name) {
+            self.separated_stems = None;
+            self.loaded_stems_model_name = None;
+            self.enabled_listening_indices.clear();
+            self.enabled_stem_indices.clear();
+            self.export_selected_stems.clear();
+            self.refresh_note_timeline_from_selected_stems();
+        }
+    }
+
+    pub(super) fn draw_separation_model_options(&mut self, ui: &mut egui::Ui) {
+        let current_model = self.current_separation_model_name();
+        ui.label(egui::RichText::new("MVSep Cloud Models (High Quality)").strong());
+        for model in crate::mvsep::MVSEP_MODELS {
+            let is_sel = current_model == model.technical_name;
+            if ui.selectable_label(is_sel, model.display_name).clicked() {
+                self.select_separation_model(model.technical_name.to_string());
+                self.show_separation_model_dropdown = false;
+            }
+        }
+
+        let local_models = Self::available_separation_models();
+        if !local_models.is_empty() {
+            ui.separator();
+            ui.label(egui::RichText::new("Local Models (ONNX)").strong());
+            for option in &local_models {
+                let stem = option.stem_name().unwrap_or_default();
+                let is_sel = current_model == stem;
+                if ui.selectable_label(is_sel, &option.label).clicked() {
+                    self.select_separation_model(stem);
+                    self.show_separation_model_dropdown = false;
+                }
+            }
+        }
     }
 
     pub(super) fn draw_audio_settings_menu(&mut self, ui: &mut egui::Ui) {
@@ -296,47 +360,96 @@ impl KeyScribeApp {
 
         Self::draw_toolbar_separator(ui);
 
-        ui.label("Separation Model");
-        let models = Self::available_separation_models();
-        for option in &models {
-            let is_sel = self
-                .selected_separation_model_name
-                .as_ref()
-                .map(|name| option.stem_name().as_deref() == Some(name.as_str()))
-                .unwrap_or(false);
-            if ui.selectable_label(is_sel, option.label.as_str()).clicked() {
-                if let Some(stem) = option.stem_name() {
-                    self.selected_separation_model_name = Some(stem);
-                }
-                self.separated_stems = None;
-                self.enabled_listening_indices.clear();
-                self.enabled_stem_indices.clear();
-                self.refresh_note_timeline_from_selected_stems();
-            }
+        let current_model = self.current_separation_model_name();
+        let current_display = self.separation_model_display_name(&current_model);
+
+        ui.label(egui::RichText::new("Separation Model").strong());
+        let dropdown_icon = if self.show_separation_model_dropdown { "⏶" } else { "⏷" };
+        let btn_text = format!("{current_display}  {dropdown_icon}");
+        let btn = egui::Button::new(btn_text).min_size(egui::vec2(280.0, 0.0));
+        if ui.add(btn).clicked() {
+            self.show_separation_model_dropdown = !self.show_separation_model_dropdown;
         }
 
-        Self::draw_toolbar_separator(ui);
+        if self.show_separation_model_dropdown {
+            egui::Frame::group(ui.style()).show(ui, |ui| {
+                ui.set_min_width(280.0);
+                egui::ScrollArea::vertical()
+                    .max_height(240.0)
+                    .show(ui, |ui| {
+                        self.draw_separation_model_options(ui);
+                    });
+            });
+        }
 
-        ui.horizontal(|ui| {
-            if self.is_separating {
-                ui.add_enabled(false, egui::Button::new("Separating..."));
-            } else if ui.button("Run Separation").clicked() {
-                self.run_instrument_separation();
+        if current_model.starts_with("mvsep") {
+            ui.add_space(4.0);
+            ui.label(egui::RichText::new("MVSep API Key").strong());
+            ui.horizontal(|ui| {
+                let response = ui.add(
+                    egui::TextEdit::singleline(&mut self.mvsep_api_key)
+                        .password(!self.mvsep_api_key_visible)
+                        .hint_text("Enter MVSep API key...")
+                        .desired_width(180.0),
+                );
+                if response.changed() || response.lost_focus() {
+                    self.mvsep_verify_message = None;
+                    self.save_state_to_disk();
+                }
+
+                let toggle_icon = if self.mvsep_api_key_visible { "Hide" } else { "Show" };
+                if ui.small_button(toggle_icon).clicked() {
+                    self.mvsep_api_key_visible = !self.mvsep_api_key_visible;
+                }
+
+                if ui.small_button("Verify").clicked() {
+                    let key = self.mvsep_api_key.trim();
+                    if key.is_empty() {
+                        self.mvsep_verify_message = Some("Key is empty".to_string());
+                    } else {
+                        match crate::mvsep::verify_api_key(key) {
+                            Ok(user) => {
+                                let name = user.name.or(user.email).unwrap_or_else(|| "User".to_string());
+                                self.mvsep_verify_message = Some(format!("Valid: {name}"));
+                                self.save_state_to_disk();
+                            }
+                            Err(e) => {
+                                self.mvsep_verify_message = Some(format!("Invalid: {e}"));
+                            }
+                        }
+                    }
+                }
+
+                if ui.small_button("Help").on_hover_text("What is MVSep & how to get an API key").clicked() {
+                    self.show_mvsep_api_key_modal = true;
+                }
+            });
+
+            if let Some(ref msg) = self.mvsep_verify_message {
+                let color = if msg.starts_with("Valid") {
+                    egui::Color32::from_rgb(50, 200, 80)
+                } else {
+                    egui::Color32::from_rgb(230, 80, 80)
+                };
+                ui.colored_label(color, msg);
             }
-        });
+
+            ui.horizontal(|ui| {
+                ui.label("Generate an API key at:");
+                ui.hyperlink_to("mvsep.com/en/full_api", "https://mvsep.com/en/full_api");
+            });
+        }
     }
 
     /// Check whether a valid stem separation cache exists for the currently
     /// loaded song and selected model. Mirrors the cache validation logic in
     /// `InstrumentSeparator::separate` (version + path).
+    #[allow(dead_code)]
     pub(super) fn stem_cache_exists_for_current_song(&self) -> bool {
         let Some(song_hash) = &self.loaded_audio_hash else {
             return false;
         };
-        let model_name = self
-            .selected_separation_model_path()
-            .and_then(|p| p.file_stem().map(|s| s.to_string_lossy().to_string()))
-            .unwrap_or_else(|| "htdemucs_6s".to_string());
+        let model_name = self.current_separation_model_name();
 
         const STEM_CACHE_VERSION: u32 = 3;
         let stem_cache_root = app_cache_base_dir()
@@ -366,10 +479,37 @@ impl KeyScribeApp {
             return;
         };
 
-        let model_name = self
-            .selected_separation_model_path()
-            .and_then(|p| p.file_stem().map(|s| s.to_string_lossy().to_string()))
-            .unwrap_or_else(|| "htdemucs_6s".to_string());
+        let model_name = self.current_separation_model_name();
+
+        if model_name.starts_with("mvsep") {
+            let key = if !self.mvsep_api_key.trim().is_empty() {
+                Some(self.mvsep_api_key.trim().to_string())
+            } else {
+                crate::mvsep::find_mvsep_api_key()
+            };
+            if key.is_none() {
+                self.last_error = Some(
+                    "MVSep API key required. Please enter your API key in Settings -> Audio Processing (get one at https://mvsep.com/en/full_api)."
+                        .to_string(),
+                );
+                self.show_mvsep_api_key_modal = true;
+                return;
+            }
+
+            // Client-side duration pre-check against MVSep hard 100-minute maximum
+            if let Some(ref raw) = self.audio_raw {
+                if raw.sample_rate > 0 && !raw.samples_mono.is_empty() {
+                    let dur_sec = raw.samples_mono.len() as f32 / raw.sample_rate as f32;
+                    if dur_sec > 6000.0 {
+                        self.last_error = Some(format!(
+                            "Audio file duration ({:.1} min) exceeds MVSep maximum limit of 100 minutes.",
+                            dur_sec / 60.0
+                        ));
+                        return;
+                    }
+                }
+            }
+        }
 
         let canonical_path = loaded_path.canonicalize().unwrap_or_else(|_| loaded_path.clone());
         let config = crate::leadsheet::SeparationConfig {
@@ -377,6 +517,11 @@ impl KeyScribeApp {
             song_hash: Some(song_hash.clone()),
             source_path: Some(canonical_path),
             cache_dir: Some(app_cache_base_dir()),
+            mvsep_api_key: if !self.mvsep_api_key.trim().is_empty() {
+                Some(self.mvsep_api_key.trim().to_string())
+            } else {
+                crate::mvsep::find_mvsep_api_key()
+            },
         };
 
         self.last_error = None;
@@ -641,6 +786,10 @@ impl KeyScribeApp {
             ui.menu_button("Export", |ui| {
                 ui.set_min_width(Self::responsive_menu_min_width(ui));
                 
+                let current_model = self.current_separation_model_name();
+                if self.separated_stems.is_none() || self.loaded_stems_model_name.as_deref() != Some(&current_model) {
+                    let _ = self.load_stems_for_model(&current_model);
+                }
                 let has_stems = self.separated_stems.is_some();
                 let can_export_midi = has_stems || !self.note_timeline.is_empty();
                 if ui.add_enabled(has_stems, egui::Button::new("Export Stems...")).clicked() {
@@ -661,8 +810,6 @@ impl KeyScribeApp {
                 }
             });
 
-            // Separation model selector — placed directly in the menu bar
-            // (not inside Settings) to avoid egui's nested-popup click issue.
             ui.menu_button("Settings", |ui| {
                 ui.set_min_width(Self::responsive_menu_min_width(ui));
                 self.draw_audio_settings_menu(ui);
@@ -814,6 +961,159 @@ impl KeyScribeApp {
             keep_open = false;
         }
         self.show_shortcuts_help_modal = keep_open;
+    }
+
+    fn draw_mvsep_api_key_modal(&mut self, ctx: &egui::Context) {
+        if !self.show_mvsep_api_key_modal {
+            return;
+        }
+
+        let mut keep_open = self.show_mvsep_api_key_modal;
+        let mut close_requested = false;
+        let mut run_separation_requested = false;
+
+        egui::Window::new("MVSep Cloud Stem Separation — API Key")
+            .id(egui::Id::new("mvsep_api_key_modal"))
+            .open(&mut keep_open)
+            .default_width(520.0)
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
+            .show(ctx, |ui| {
+                ui.label(
+                    egui::RichText::new("What is MVSep?")
+                        .strong()
+                        .size(15.0),
+                );
+                ui.add_space(3.0);
+                ui.label(
+                    "MVSep (Music Voice Separation) is a cloud AI service providing top-tier audio source \
+                     separation models (such as BS Roformer and Ensemble algorithms). It processes separation \
+                     on dedicated cloud GPUs, isolating Vocals, Bass, Drums, Guitar, Piano, and Other stems \
+                     with studio-grade quality.",
+                );
+
+                ui.add_space(10.0);
+                ui.label(
+                    egui::RichText::new("How to get a Free API Key:")
+                        .strong()
+                        .size(15.0),
+                );
+                ui.add_space(3.0);
+                ui.label("1. Create a free account or sign in at mvsep.com.");
+                ui.label("2. Open your API dashboard at mvsep.com/en/full_api to view or generate your personal API token.");
+                ui.label("3. Copy the token and paste it into the field below.");
+                ui.add_space(4.0);
+                ui.horizontal(|ui| {
+                    ui.label("Direct link:");
+                    ui.hyperlink_to("mvsep.com/en/full_api ↗", "https://mvsep.com/en/full_api");
+                });
+
+                ui.add_space(10.0);
+                ui.label(
+                    egui::RichText::new("API Limits (per MVSep specification):")
+                        .strong()
+                        .size(13.0),
+                );
+                ui.add_space(2.0);
+                ui.label("• Free accounts: max 10 minutes audio length, 100 MB file size, 1 concurrent job.");
+                ui.label("• Premium accounts: max 100 minutes audio length, 1000 MB file size, unlimited jobs.");
+
+                ui.add_space(12.0);
+                ui.separator();
+                ui.add_space(6.0);
+
+                ui.label(egui::RichText::new("Enter MVSep API Key / Token:").strong());
+                ui.horizontal(|ui| {
+                    let mut input = self.mvsep_api_key.clone();
+                    let resp = ui.add(
+                        egui::TextEdit::singleline(&mut input)
+                            .password(!self.mvsep_api_key_visible)
+                            .hint_text("Paste your MVSep API token here...")
+                            .desired_width(320.0),
+                    );
+                    if resp.changed() || resp.lost_focus() {
+                        self.mvsep_api_key = input;
+                        self.mvsep_verify_message = None;
+                        self.save_state_to_disk();
+                    }
+
+                    let toggle_icon = if self.mvsep_api_key_visible { "Hide" } else { "Show" };
+                    if ui.small_button(toggle_icon).clicked() {
+                        self.mvsep_api_key_visible = !self.mvsep_api_key_visible;
+                    }
+                });
+
+                ui.add_space(4.0);
+                ui.horizontal(|ui| {
+                    if ui.button("Verify Token").clicked() {
+                        let key = self.mvsep_api_key.trim().to_string();
+                        if key.is_empty() {
+                            self.mvsep_verify_message = Some("Key is empty".to_string());
+                        } else {
+                            match crate::mvsep::verify_api_key(&key) {
+                                Ok(user) => {
+                                    let name = user.name.or(user.email).unwrap_or_else(|| "User".to_string());
+                                    self.mvsep_verify_message = Some(format!("Valid: {name}"));
+                                    self.save_state_to_disk();
+                                }
+                                Err(e) => {
+                                    self.mvsep_verify_message = Some(format!("Invalid: {e}"));
+                                }
+                            }
+                        }
+                    }
+
+                    if let Some(ref msg) = self.mvsep_verify_message {
+                        let color = if msg.starts_with("Valid") {
+                            egui::Color32::from_rgb(50, 200, 80)
+                        } else {
+                            egui::Color32::from_rgb(230, 80, 80)
+                        };
+                        ui.colored_label(color, msg);
+                    }
+                });
+
+                ui.add_space(14.0);
+                ui.separator();
+                ui.add_space(6.0);
+
+                ui.horizontal(|ui| {
+                    if ui.button("Save & Close").clicked() {
+                        self.mvsep_api_key = self.mvsep_api_key.trim().to_string();
+                        self.save_state_to_disk();
+                        if let Some(ref err) = self.last_error {
+                            if crate::mvsep::is_invalid_token_error(err) {
+                                self.last_error = None;
+                            }
+                        }
+                        close_requested = true;
+                    }
+
+                    if self.loaded_path.is_some() && !self.is_separating {
+                        if ui.button("Save & Separate Stems").clicked() {
+                            self.mvsep_api_key = self.mvsep_api_key.trim().to_string();
+                            self.save_state_to_disk();
+                            self.last_error = None;
+                            close_requested = true;
+                            run_separation_requested = true;
+                        }
+                    }
+
+                    if ui.button("Cancel").clicked() {
+                        close_requested = true;
+                    }
+                });
+            });
+
+        if close_requested {
+            keep_open = false;
+        }
+        self.show_mvsep_api_key_modal = keep_open;
+
+        if run_separation_requested {
+            self.run_instrument_separation();
+        }
     }
 
     pub(super) fn top_bar_slider_with_input(
@@ -1434,5 +1734,6 @@ impl KeyScribeApp {
         });
 
         self.draw_keyboard_shortcuts_modal(ctx);
+        self.draw_mvsep_api_key_modal(ctx);
     }
 }

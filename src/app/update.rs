@@ -37,14 +37,7 @@ impl eframe::App for KeyScribeApp {
             }
         }
         if l_pressed {
-            self.loop_enabled = !self.loop_enabled;
-            if !self.loop_enabled {
-                self.loop_selection = None;
-                self.loop_playback_enabled = false;
-                if self.is_playing() {
-                    self.play_from_selected();
-                }
-            }
+            self.toggle_loop();
         }
         if left_pressed {
             if ctrl_held && self.shift_loop_by_seconds(-1.0) {
@@ -114,14 +107,12 @@ impl eframe::App for KeyScribeApp {
             && !self.is_separating
             && !self.separation_attempted
         {
-            let duration = self.source_duration() as f64;
-            let cache_exists = self.stem_cache_exists_for_current_song();
-
-            if cache_exists {
-                // Cached stems exist — load them instantly regardless of the
-                // auto_separate setting.
-                self.run_instrument_separation();
+            let current_model = self.current_separation_model_name();
+            if self.load_stems_for_model(&current_model) {
+                // Cached stems exist — loaded instantly from cache!
+                self.separation_attempted = true;
             } else if self.auto_separate {
+                let duration = self.source_duration() as f64;
                 if duration > super::AUTO_SEPARATE_MAX_DURATION_SEC {
                     self.separation_attempted = true;
                     self.cache_status_message = Some("Stem separation is manual for this source since it is longer than 10 minutes.".to_string());
@@ -728,49 +719,53 @@ impl eframe::App for KeyScribeApp {
                                     highlight.b().saturating_add(18),
                                 );
 
-                                if let Some((a, b)) = self.loop_selection {
-                                    let start = a.min(b) as f64;
-                                    let end = a.max(b) as f64;
+                                if self.loop_enabled {
+                                    if let Some((a, b)) = self.loop_selection {
+                                        let start = a.min(b) as f64;
+                                        let end = a.max(b) as f64;
 
-                                    let highlight = Polygon::new(PlotPoints::from(vec![
-                                        [start, -1.05],
-                                        [end, -1.05],
-                                        [end, 1.05],
-                                        [start, 1.05],
-                                    ]))
-                                    .fill_color(loop_bg)
-                                    .stroke(egui::Stroke::new(1.0, loop_edge));
-                                    plot_ui.polygon(highlight);
+                                        let highlight = Polygon::new(PlotPoints::from(vec![
+                                            [start, -1.05],
+                                            [end, -1.05],
+                                            [end, 1.05],
+                                            [start, 1.05],
+                                        ]))
+                                        .fill_color(loop_bg)
+                                        .stroke(egui::Stroke::new(1.0, loop_edge));
+                                        plot_ui.polygon(highlight);
+                                    }
                                 }
 
-                                if let Some((a, b)) = self.loop_selection {
-                                    let start = a.min(b);
-                                    let end = a.max(b);
-                                    self.refresh_loop_waveform_cache(start, end);
+                                if self.loop_enabled && self.loop_selection.is_some() {
+                                    if let Some((a, b)) = self.loop_selection {
+                                        let start = a.min(b);
+                                        let end = a.max(b);
+                                        self.refresh_loop_waveform_cache(start, end);
 
-                                    if !self.loop_waveform_cache_pre.is_empty() {
-                                        plot_ui.line(
-                                            Line::new(PlotPoints::from_iter(
-                                                self.loop_waveform_cache_pre.iter().copied(),
-                                            ))
-                                            .color(loop_wave_dim),
-                                        );
-                                    }
-                                    if !self.loop_waveform_cache_mid.is_empty() {
-                                        plot_ui.line(
-                                            Line::new(PlotPoints::from_iter(
-                                                self.loop_waveform_cache_mid.iter().copied(),
-                                            ))
-                                            .color(loop_wave_active),
-                                        );
-                                    }
-                                    if !self.loop_waveform_cache_post.is_empty() {
-                                        plot_ui.line(
-                                            Line::new(PlotPoints::from_iter(
-                                                self.loop_waveform_cache_post.iter().copied(),
-                                            ))
-                                            .color(loop_wave_dim),
-                                        );
+                                        if !self.loop_waveform_cache_pre.is_empty() {
+                                            plot_ui.line(
+                                                Line::new(PlotPoints::from_iter(
+                                                    self.loop_waveform_cache_pre.iter().copied(),
+                                                ))
+                                                .color(loop_wave_dim),
+                                            );
+                                        }
+                                        if !self.loop_waveform_cache_mid.is_empty() {
+                                            plot_ui.line(
+                                                Line::new(PlotPoints::from_iter(
+                                                    self.loop_waveform_cache_mid.iter().copied(),
+                                                ))
+                                                .color(loop_wave_active),
+                                            );
+                                        }
+                                        if !self.loop_waveform_cache_post.is_empty() {
+                                            plot_ui.line(
+                                                Line::new(PlotPoints::from_iter(
+                                                    self.loop_waveform_cache_post.iter().copied(),
+                                                ))
+                                                .color(loop_wave_dim),
+                                            );
+                                        }
                                     }
                                 } else {
                                     let line = Line::new(PlotPoints::from_iter(
@@ -825,11 +820,13 @@ impl eframe::App for KeyScribeApp {
                                     }
                                 }
 
-                                if let Some((a, b)) = self.loop_selection {
-                                    let start = a.min(b);
-                                    let end = a.max(b);
-                                    plot_ui.vline(VLine::new(start as f64).color(loop_edge));
-                                    plot_ui.vline(VLine::new(end as f64).color(loop_edge));
+                                if self.loop_enabled {
+                                    if let Some((a, b)) = self.loop_selection {
+                                        let start = a.min(b);
+                                        let end = a.max(b);
+                                        plot_ui.vline(VLine::new(start as f64).color(loop_edge));
+                                        plot_ui.vline(VLine::new(end as f64).color(loop_edge));
+                                    }
                                 }
 
                                 // Keep Y scale fixed and clamp X so navigation stays within audio bounds.
@@ -1018,7 +1015,7 @@ impl eframe::App for KeyScribeApp {
                                             self.selected_time_sec = start;
                                             self.loop_enabled = true;
                                             self.loop_playback_enabled = true;
-                                            self.play_range(start, Some(end));
+                                            self.play_range(start, None);
                                         }
                                     }
                                     self.drag_select_anchor_sec = None;
@@ -1256,6 +1253,14 @@ impl eframe::App for KeyScribeApp {
             self.save_state_to_disk();
             self.last_state_save_at = Instant::now();
         }
+    }
+
+    fn save(&mut self, _storage: &mut dyn eframe::Storage) {
+        self.save_state_to_disk();
+    }
+
+    fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
+        self.save_state_to_disk();
     }
 }
 

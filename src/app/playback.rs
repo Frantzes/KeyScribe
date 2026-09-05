@@ -250,66 +250,10 @@ impl KeyScribeApp {
 
     /// Get stem playback source for the current listen selection and speed/pitch.
     /// Caches the blended mix and optional speed/pitch transform to avoid per-seek DSP.
+    #[allow(dead_code)]
     fn stem_playback_source(&mut self) -> Option<(Arc<Vec<f32>>, u16, u32)> {
-        let stems = self.separated_stems.as_ref()?;
-        if stems.is_empty() {
-            return None;
-        }
-        let sample_rate = stems.first().map(|s| s.sample_rate)?;
+        self.stem_playback_source_raw()?;
         let speed = self.speed.clamp(0.25, 4.0);
-
-        let current_key: Vec<usize> = self.enabled_listening_indices.iter().copied().collect();
-
-        // Rebuild cache if stale
-        let rebuild = match &self.stem_playback_cache {
-            Some(cache) => cache.listening_key != current_key || cache.sample_rate != sample_rate,
-            None => true,
-        };
-        if rebuild {
-            let (blended, channels, src_sample_rate) = if current_key.is_empty() {
-                if let Some(audio) = &self.audio_raw {
-                    (Arc::clone(&audio.samples_interleaved), audio.channels, audio.sample_rate)
-                } else {
-                    let (b, c) = crate::leadsheet::blend_interleaved_stems(stems.as_slice());
-                    (b, c, sample_rate)
-                }
-            } else if current_key.len() == 1 {
-                if let Some(s) = current_key.first().and_then(|idx| stems.get(*idx)) {
-                    (Arc::clone(&s.samples_interleaved), s.channels, s.sample_rate)
-                } else {
-                    let (b, c) = crate::leadsheet::blend_interleaved_stems(stems.as_slice());
-                    (b, c, sample_rate)
-                }
-            } else {
-                let enabled_stems: Vec<crate::leadsheet::SeparatedStem> = current_key
-                    .iter()
-                    .filter_map(|idx| stems.get(*idx).cloned())
-                    .collect();
-                let sr = enabled_stems.first().map(|s| s.sample_rate).unwrap_or(sample_rate);
-                let (b, c) = crate::leadsheet::blend_interleaved_stems(enabled_stems.as_slice());
-                (b, c, sr)
-            };
-
-            let blended = if !current_key.is_empty() {
-                loudness_match_to_source(
-                    blended,
-                    self.audio_raw.as_ref().map(|a| a.samples_interleaved.as_slice()),
-                )
-            } else {
-                blended
-            };
-
-            self.stem_playback_cache = Some(StemPlaybackCache {
-                samples: blended,
-                processed_samples: None,
-                channels,
-                sample_rate: src_sample_rate,
-                listening_key: current_key,
-                processed_speed: 1.0,
-                processed_pitch: 0.0,
-            });
-        }
-
         let cache = self.stem_playback_cache.as_mut()?;
         if cache.samples.is_empty() {
             return None;
@@ -377,14 +321,34 @@ impl KeyScribeApp {
         // Identity: play raw samples directly
         let playback_rate = self.playback_rate();
 
-        // Stem path: reuse cached mix
-        if self.separated_stems.is_some() {
-            if let Some((samples, ch, sr)) = self.stem_playback_source() {
+        // Stem path: live multi-stem playback when any stem is selected
+        if let Some(stems) = &self.separated_stems {
+            if !self.enabled_listening_indices.is_empty() {
+                let sample_rate = stems.first().map(|s| s.sample_rate).unwrap_or(raw.sample_rate);
+                let stem_inputs: Vec<(String, Arc<Vec<f32>>, u16, f32)> = stems
+                    .iter()
+                    .enumerate()
+                    .map(|(i, s)| {
+                        let label = s.stem_type.display_name().to_string();
+                        let enabled = self.enabled_listening_indices.contains(&i);
+                        let vol_db = self
+                            .stem_volumes
+                            .get(label.as_str())
+                            .copied()
+                            .unwrap_or(0.0);
+                        let initial_gain = if enabled {
+                            10.0f32.powf(vol_db / 20.0)
+                        } else {
+                            0.0
+                        };
+                        (label, Arc::clone(&s.samples_interleaved), s.channels, initial_gain)
+                    })
+                    .collect();
+
                 if let Some(engine) = &mut self.engine {
-                    if let Err(err) = engine.play_arc_range(
-                        samples,
-                        ch,
-                        sr,
+                    if let Err(err) = engine.play_stems_range(
+                        stem_inputs,
+                        sample_rate,
                         self.selected_time_sec,
                         None,
                         playback_rate,
@@ -400,17 +364,21 @@ impl KeyScribeApp {
                     self.last_error = Some("Audio engine unavailable on this machine".to_string());
                     self.live_stream_playback = false;
                 }
+                return;
             }
-            return;
         }
 
         // Non-stem path: reference existing data to avoid 100MB+ clone
         let pos = self.selected_time_sec;
         let sr = raw.sample_rate;
-        let ch = self.processed_playback_channels;
+        let (play_samples, ch) = if self.is_audio_loading && !self.processed_playback_samples.is_empty() {
+            (Arc::clone(&self.processed_playback_samples), self.processed_playback_channels)
+        } else {
+            (Arc::clone(&raw.samples_interleaved), raw.channels)
+        };
         if let Some(engine) = &mut self.engine {
             if let Err(err) = engine.play_arc_range(
-                Arc::clone(&self.processed_playback_samples),
+                play_samples,
                 ch,
                 sr,
                 pos,
@@ -456,10 +424,21 @@ impl KeyScribeApp {
         self.selected_time_sec = (self.selected_time_sec + delta_sec).clamp(new_start, new_end);
 
         if self.is_playing() {
-            self.play_range(self.selected_time_sec, Some(new_end));
+            self.play_range(self.selected_time_sec, None);
         }
 
         true
+    }
+
+    pub(super) fn toggle_loop(&mut self) {
+        self.loop_enabled = !self.loop_enabled;
+        if self.loop_enabled {
+            if self.loop_selection.is_some() {
+                self.loop_playback_enabled = true;
+            }
+        } else {
+            self.loop_playback_enabled = false;
+        }
     }
 
     pub(super) fn skip_by_seconds(&mut self, delta_sec: f32) {
@@ -492,7 +471,7 @@ impl KeyScribeApp {
                     let end = a.max(b);
                     if end - start > LOOP_MIN_DURATION_SEC {
                         self.loop_playback_enabled = true;
-                        self.play_range(self.selected_time_sec, Some(end));
+                        self.play_range(self.selected_time_sec, None);
                         return;
                     }
                 }
@@ -529,13 +508,38 @@ impl KeyScribeApp {
         // Identity: play raw samples directly
         let playback_rate = self.playback_rate();
 
-        // Stem path: reuse cached mix
-        if self.separated_stems.is_some() {
-            if let Some((samples, ch, sr)) = self.stem_playback_source() {
+        // Stem path: live multi-stem playback when any stem is selected
+        if let Some(stems) = &self.separated_stems {
+            if !self.enabled_listening_indices.is_empty() {
+                let sample_rate = stems.first().map(|s| s.sample_rate).unwrap_or(raw.sample_rate);
+                let stem_inputs: Vec<(String, Arc<Vec<f32>>, u16, f32)> = stems
+                    .iter()
+                    .enumerate()
+                    .map(|(i, s)| {
+                        let label = s.stem_type.display_name().to_string();
+                        let enabled = self.enabled_listening_indices.contains(&i);
+                        let vol_db = self
+                            .stem_volumes
+                            .get(label.as_str())
+                            .copied()
+                            .unwrap_or(0.0);
+                        let initial_gain = if enabled {
+                            10.0f32.powf(vol_db / 20.0)
+                        } else {
+                            0.0
+                        };
+                        (label, Arc::clone(&s.samples_interleaved), s.channels, initial_gain)
+                    })
+                    .collect();
+
                 if let Some(engine) = &mut self.engine {
-                    if let Err(err) =
-                        engine.play_arc_range(samples, ch, sr, start_sec, end_sec, playback_rate)
-                    {
+                    if let Err(err) = engine.play_stems_range(
+                        stem_inputs,
+                        sample_rate,
+                        start_sec,
+                        end_sec,
+                        playback_rate,
+                    ) {
                         self.last_error = Some(format!("Playback error: {err}"));
                         self.playing_preview_buffer = false;
                         self.live_stream_playback = false;
@@ -543,16 +547,19 @@ impl KeyScribeApp {
                         self.playing_preview_buffer = false;
                         self.live_stream_playback = false;
                     }
+                } else {
+                    self.last_error = Some("Audio engine unavailable on this machine".to_string());
+                    self.live_stream_playback = false;
                 }
+                return;
             }
-            return;
         }
 
         let sr = raw.sample_rate;
-        let (play_samples, ch) = if self.processed_playback_samples.is_empty() {
-            (Arc::clone(&raw.samples_interleaved), raw.channels)
-        } else {
+        let (play_samples, ch) = if self.is_audio_loading && !self.processed_playback_samples.is_empty() {
             (Arc::clone(&self.processed_playback_samples), self.processed_playback_channels)
+        } else {
+            (Arc::clone(&raw.samples_interleaved), raw.channels)
         };
         
         if let Some(engine) = &mut self.engine {
@@ -586,7 +593,7 @@ impl KeyScribeApp {
                 if end - start > LOOP_MIN_DURATION_SEC {
                     self.loop_playback_enabled = true;
                     self.selected_time_sec = start;
-                    self.play_range(start, Some(end));
+                    self.play_range(start, None);
                     return;
                 }
             }
@@ -639,18 +646,52 @@ impl KeyScribeApp {
         }
     }
 
+    pub(super) fn sync_stem_gain_live(&self, label: &str, linear_gain: f32) -> bool {
+        self.engine
+            .as_ref()
+            .map(|e| e.update_stem_gain(label, linear_gain))
+            .unwrap_or(false)
+    }
+
+    pub(super) fn sync_all_stem_gains_live(&self) -> bool {
+        let Some(stems) = &self.separated_stems else {
+            return false;
+        };
+        let Some(engine) = &self.engine else {
+            return false;
+        };
+        if !engine.has_active_stem_mixer() {
+            return false;
+        }
+
+        let mut gains = Vec::new();
+        for (i, s) in stems.iter().enumerate() {
+            let label = s.stem_type.display_name();
+            let enabled = self.enabled_listening_indices.contains(&i);
+            let vol_db = self
+                .stem_volumes
+                .get(label.as_ref())
+                .copied()
+                .unwrap_or(0.0);
+            let gain = if enabled {
+                10.0f32.powf(vol_db / 20.0)
+            } else {
+                0.0
+            };
+            gains.push((label, gain));
+        }
+
+        let pairs: Vec<(&str, f32)> = gains.iter().map(|(l, g)| (l.as_ref(), *g)).collect();
+        engine.set_all_stem_gains(&pairs)
+    }
+
     pub(super) fn maybe_restart_playback_for_listen_sync(&mut self) {
         if !self.is_playing() {
             return;
         }
 
-        if self.loop_enabled {
-            if let Some((a, b)) = self.loop_selection {
-                self.play_range(self.selected_time_sec, Some(b.max(a)));
-                return;
-            }
-        }
-        self.play_from_selected();
+        let current_pos = self.current_position_sec();
+        self.play_range(current_pos, None);
     }
 
     pub(super) fn stop(&mut self) {
@@ -829,9 +870,22 @@ impl KeyScribeApp {
         }
         let sample_rate = stems.first().map(|s| s.sample_rate)?;
         let current_key: Vec<usize> = self.enabled_listening_indices.iter().copied().collect();
+        let current_volumes: Vec<f32> = current_key
+            .iter()
+            .map(|&idx| {
+                stems
+                    .get(idx)
+                    .and_then(|s| self.stem_volumes.get(s.stem_type.display_name().as_ref()).copied())
+                    .unwrap_or(0.0)
+            })
+            .collect();
 
         let rebuild = match &self.stem_playback_cache {
-            Some(cache) => cache.listening_key != current_key || cache.sample_rate != sample_rate,
+            Some(cache) => {
+                cache.listening_key != current_key
+                    || cache.listening_volumes != current_volumes
+                    || cache.sample_rate != sample_rate
+            }
             None => true,
         };
         if rebuild {
@@ -842,30 +896,58 @@ impl KeyScribeApp {
                     let (b, c) = crate::leadsheet::blend_interleaved_stems(stems.as_slice());
                     (b, c, sample_rate)
                 }
-            } else if current_key.len() == 1 {
-                if let Some(s) = current_key.first().and_then(|idx| stems.get(*idx)) {
-                    (Arc::clone(&s.samples_interleaved), s.channels, s.sample_rate)
-                } else {
-                    let (b, c) = crate::leadsheet::blend_interleaved_stems(stems.as_slice());
-                    (b, c, sample_rate)
-                }
             } else {
                 let enabled_stems: Vec<crate::leadsheet::SeparatedStem> = current_key
                     .iter()
                     .filter_map(|idx| stems.get(*idx).cloned())
                     .collect();
                 let sr = enabled_stems.first().map(|s| s.sample_rate).unwrap_or(sample_rate);
-                let (b, c) = crate::leadsheet::blend_interleaved_stems(enabled_stems.as_slice());
-                (b, c, sr)
-            };
+                let linear_gains: Vec<f32> = current_volumes
+                    .iter()
+                    .map(|&db| 10.0f32.powf(db / 20.0))
+                    .collect();
 
-            let blended = if !current_key.is_empty() {
-                loudness_match_to_source(
-                    blended,
-                    self.audio_raw.as_ref().map(|a| a.samples_interleaved.as_slice()),
-                )
-            } else {
-                blended
+                let (b, c) = if enabled_stems.len() == 1 {
+                    let s = &enabled_stems[0];
+                    let g = linear_gains.first().copied().unwrap_or(1.0);
+                    let matched = loudness_match_to_source(
+                        Arc::clone(&s.samples_interleaved),
+                        self.audio_raw.as_ref().map(|a| a.samples_interleaved.as_slice()),
+                    );
+                    if (g - 1.0).abs() < 1e-4 {
+                        (matched, s.channels)
+                    } else {
+                        let mut scaled: Vec<f32> = matched.iter().map(|&x| x * g).collect();
+                        let max_val = scaled.iter().copied().fold(0.0f32, |a, b| a.max(b.abs()));
+                        if max_val > 1.0 {
+                            let threshold = 0.9;
+                            for x in scaled.iter_mut() {
+                                *x = soft_limit(*x, threshold);
+                            }
+                        }
+                        (Arc::new(scaled), s.channels)
+                    }
+                } else {
+                    let (unity_blend, _) =
+                        crate::leadsheet::blend_interleaved_stems(enabled_stems.as_slice());
+                    let src_rms = self
+                        .audio_raw
+                        .as_ref()
+                        .map(|a| rms_interleaved(&a.samples_interleaved))
+                        .unwrap_or(0.0);
+                    let mix_rms = rms_interleaved(&unity_blend);
+                    let loudness_gain = if src_rms > 1e-6 && mix_rms > 1e-6 {
+                        (src_rms / mix_rms).clamp(0.25, 32.0)
+                    } else {
+                        1.0
+                    };
+                    let eff_gains: Vec<f32> = linear_gains.iter().map(|&g| g * loudness_gain).collect();
+                    crate::leadsheet::blend_interleaved_stems_with_gains(
+                        enabled_stems.as_slice(),
+                        &eff_gains,
+                    )
+                };
+                (b, c, sr)
             };
 
             self.stem_playback_cache = Some(StemPlaybackCache {
@@ -874,6 +956,7 @@ impl KeyScribeApp {
                 channels,
                 sample_rate: src_sample_rate,
                 listening_key: current_key,
+                listening_volumes: current_volumes,
                 processed_speed: 1.0,
                 processed_pitch: 0.0,
             });
@@ -902,6 +985,22 @@ impl KeyScribeApp {
                 self.selected_time_sec =
                     clock.position_sec.min(self.timeline_duration_sec());
                 self.update_note_probabilities(false);
+
+                if self.loop_enabled && self.loop_playback_enabled {
+                    if let Some((a, b)) = self.loop_selection {
+                        let start = a.min(b);
+                        let end = a.max(b);
+                        if end - start > LOOP_MIN_DURATION_SEC && self.selected_time_sec >= end {
+                            self.selected_time_sec = start;
+                            if param_render_in_progress {
+                                // Avoid repeatedly canceling/restarting parameter renders while looping.
+                                self.restart_playback_after_processing = true;
+                            } else {
+                                self.play_range(start, None);
+                            }
+                        }
+                    }
+                }
             } else if streaming_active {
                 // Sink ran empty between streaming chunks but more are coming.
                 // Don't restart or clear state — poll_streaming_playback will
@@ -916,7 +1015,7 @@ impl KeyScribeApp {
                             // Avoid repeatedly canceling/restarting parameter renders while looping.
                             self.restart_playback_after_processing = true;
                         } else {
-                            self.play_range(start, Some(end));
+                            self.play_range(start, None);
                         }
                     }
                 }
