@@ -3,7 +3,10 @@ use std::path::PathBuf;
 use std::process::Command;
 use std::sync::mpsc::TryRecvError;
 
+use egui_phosphor::regular::{MUSIC_NOTE, WAVEFORM};
+
 use super::*;
+use crate::ui::widgets::{icon_toggle_button, responsive_icon_button_size};
 use crate::leadsheet::{
     cross_validate_beat_sources, debug_chord_notes_to_json, detect_chord_changes_per_bar,
     generate_lead_sheet_enhanced, generate_lead_sheet_enhanced_with_timeline,
@@ -83,16 +86,59 @@ impl KeyScribeApp {
         best.map(|(_, id)| id)
     }
 
+    /// View switcher row: waveform / sheet-music icon toggles pinned to the
+    /// right. Rendered in its own row above the speed/pitch controls. The
+    /// active view gets the accent fill.
+    ///
+    /// The row height must be bounded explicitly: `with_layout` alone on the
+    /// full-height central panel would vertically center the icons in all
+    /// remaining space and swallow the whole panel height as cursor advance.
+    pub(super) fn draw_view_switcher_row(&mut self, ui: &mut egui::Ui) {
+        let row_h = responsive_icon_button_size(ui);
+        ui.allocate_ui_with_layout(
+            egui::vec2(ui.available_width(), row_h),
+            egui::Layout::right_to_left(egui::Align::Center),
+            |ui| {
+                // right_to_left, so the music note is added first to land on
+                // the right.
+                let active = self.main_content_tab;
+                if icon_toggle_button(
+                    ui,
+                    MUSIC_NOTE,
+                    "Sheet music view (experimental, WIP)",
+                    active == MainContentTab::SheetMusic,
+                    true,
+                    self.highlight_color,
+                )
+                .clicked()
+                {
+                    self.main_content_tab = MainContentTab::SheetMusic;
+                }
+                if icon_toggle_button(
+                    ui,
+                    WAVEFORM,
+                    "Waveform view",
+                    active == MainContentTab::Waveform,
+                    true,
+                    self.highlight_color,
+                )
+                .clicked()
+                {
+                    self.main_content_tab = MainContentTab::Waveform;
+                }
+            },
+        );
+    }
+
     pub(super) fn draw_main_content_tabs(&mut self, ui: &mut egui::Ui) {
         ui.horizontal(|ui| {
-            ui.selectable_value(&mut self.main_content_tab, MainContentTab::Waveform, "Waveform");
-            ui.selectable_value(
-                &mut self.main_content_tab,
-                MainContentTab::SheetMusic,
-                "Sheet Music (Experimental, WIP)",
-            );
-
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            // Bounded row height — same with_layout centering pitfall as the
+            // view switcher row above.
+            let row_h = responsive_icon_button_size(ui);
+            ui.allocate_ui_with_layout(
+                egui::vec2(ui.available_width(), row_h),
+                egui::Layout::right_to_left(egui::Align::Center),
+                |ui| {
                 if let Some(stems) = self.separated_stems.clone() {
                     let is_analyzing = self.stem_analysis_rx.is_some();
                     let analysis_ready = !self.stem_analyses.is_empty();

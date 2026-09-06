@@ -24,11 +24,28 @@ fn channel_label(channels: u16) -> String {
     }
 }
 
-pub(super) fn media_controls_height_for_width(width: f32) -> f32 {
+/// Reserved footer height for a given panel width.
+///
+/// Loop-aware: enabled loop inputs add a wrapped row of time fields, so the
+/// footer grows instead of clipping them. These are ceilings the layout is
+/// designed to fit; if the window gives the footer less room than this (very
+/// short windows), the panel falls back to a scrollable stacked layout so
+/// every control stays reachable.
+pub(super) fn media_controls_height_for_width(width: f32, loop_enabled: bool) -> f32 {
     if width < 560.0 {
-        178.0
+        if loop_enabled {
+            260.0
+        } else {
+            196.0
+        }
     } else if width < 820.0 {
-        154.0
+        if loop_enabled {
+            200.0
+        } else {
+            154.0
+        }
+    } else if loop_enabled {
+        132.0
     } else {
         98.0
     }
@@ -241,7 +258,7 @@ pub(super) fn draw_media_controls(
     } else {
         72.0
     };
-    let preferred_h = media_controls_height_for_width(full_w);
+    let preferred_h = media_controls_height_for_width(full_w, app.loop_enabled);
     let target_h = ui.available_height().max(0.0).min(preferred_h);
     if target_h <= f32::EPSILON {
         return;
@@ -316,8 +333,6 @@ pub(super) fn draw_media_controls(
         egui::Layout::top_down(egui::Align::Center),
         |ui| {
             ui.set_min_height(target_h);
-            let clip_rect = ui.max_rect();
-            ui.set_clip_rect(clip_rect);
             egui::Frame::none()
                 .fill(panel_fill)
                 .rounding(egui::Rounding::same(8.0))
@@ -330,7 +345,19 @@ pub(super) fn draw_media_controls(
                     // Force frame width to match the parent width so centering is stable.
                     ui.set_min_width(inner_w);
                     ui.set_max_width(inner_w);
-                    let content_h = ui.available_height().max(0.0);
+                    // Explicit finite content height (was: unbounded
+                    // available_height) so column centering math stays valid
+                    // inside the scroll area below.
+                    let content_h = (target_h - 2.0 * UI_VSPACE_MEDIUM).max(0.0);
+
+                    // Safety net: if rows wrap beyond the reserved height
+                    // (very narrow windows, huge fonts), scroll instead of
+                    // clipping controls away.
+                    egui::ScrollArea::vertical()
+                        .id_source("media_panel_scroll")
+                        .max_height(content_h)
+                        .show(ui, |ui| {
+                    ui.set_min_width(inner_w);
 
                     if compact_layout {
                         ui.vertical(|ui| {
@@ -511,42 +538,39 @@ pub(super) fn draw_media_controls(
                                             }
                                         }
 
-                                        ui.allocate_ui_with_layout(
-                                            egui::vec2(side_w + 150.0, play_row_height),
-                                            egui::Layout::left_to_right(egui::Align::Center),
-                                            |ui| {
-                                                if icon_button(
-                                                    ui,
-                                                    FAST_FORWARD,
-                                                    "Skip Forward 5s",
-                                                    analysis_ready,
-                                                )
-                                                .clicked()
-                                                {
-                                                    app.skip_by_seconds(SEEK_STEP_SEC);
-                                                }
+                                        // Fast-forward + loop are added directly to the row so
+                                        // they share the exact same alignment as the play
+                                        // button (nested centered slots offset them).
+                                        if icon_button(
+                                            ui,
+                                            FAST_FORWARD,
+                                            "Skip Forward 5s",
+                                            analysis_ready,
+                                        )
+                                        .clicked()
+                                        {
+                                            app.skip_by_seconds(SEEK_STEP_SEC);
+                                        }
 
-                                                ui.add_space(14.0);
+                                        ui.add_space(14.0);
 
-                                                if icon_toggle_button(
-                                                    ui,
-                                                    REPEAT,
-                                                    "Loop Selection",
-                                                    app.loop_enabled,
-                                                    analysis_ready,
-                                                    app.highlight_color,
-                                                )
-                                                .clicked()
-                                                {
-                                                    app.toggle_loop();
-                                                }
+                                        if icon_toggle_button(
+                                            ui,
+                                            REPEAT,
+                                            "Loop Selection",
+                                            app.loop_enabled,
+                                            analysis_ready,
+                                            app.highlight_color,
+                                        )
+                                        .clicked()
+                                        {
+                                            app.toggle_loop();
+                                        }
 
-                                                if app.loop_enabled {
-                                                    ui.add_space(8.0);
-                                                    draw_loop_inputs(ui, app);
-                                                }
-                                            },
-                                        );
+                                        if app.loop_enabled {
+                                            ui.add_space(8.0);
+                                            draw_loop_inputs(ui, app);
+                                        }
                                     });
                                 },
                             );
@@ -570,6 +594,7 @@ pub(super) fn draw_media_controls(
                             );
                         });
                     }
+                        });
                 });
         },
     );
@@ -579,6 +604,10 @@ fn draw_loop_inputs(ui: &mut egui::Ui, app: &mut KeyScribeApp) {
     if !app.loop_enabled {
         return;
     }
+
+    // Wrap so the time fields stay reachable on narrow panels instead of
+    // overflowing (and getting clipped) past the panel edge.
+    ui.horizontal_wrapped(|ui| {
     
     let (start, end) = app.loop_selection.unwrap_or((0.0, 0.0));
     
@@ -593,41 +622,71 @@ fn draw_loop_inputs(ui: &mut egui::Ui, app: &mut KeyScribeApp) {
     }
 
     ui.spacing_mut().item_spacing.x = 4.0;
-    
+
+    // Fixed widget height matching the transport buttons so the whole row
+    // stays on one visual line (mixed auto heights drifted apart).
+    let widget_h = ui.spacing().interact_size.y.clamp(30.0, 42.0);
+
     let mut new_start = start;
     let mut new_end = end;
     let mut changed = false;
 
     let duration = app.timeline_duration_sec();
 
-    if ui.push_id("start_minus", |ui| ui.add(egui::Button::new(egui::RichText::new(MINUS).font(icon_font_id(14.0))))).inner.on_hover_text("Subtract 1 second from loop start").clicked() {
+    let small_step_button = |ui: &mut egui::Ui, id: &str, icon: &str, tooltip: &str| {
+        ui.push_id(id, |ui| {
+            ui.add_sized(
+                [widget_h, widget_h],
+                egui::Button::new(egui::RichText::new(icon).font(icon_font_id(14.0))),
+            )
+        })
+        .inner
+        .on_hover_text(tooltip)
+        .clicked()
+    };
+
+    if small_step_button(ui, "start_minus", MINUS, "Subtract 1 second from loop start") {
         new_start = (start - 1.0).max(0.0);
         changed = true;
     }
-    let start_resp = ui.add(
+    let start_resp = ui.add_sized(
+        [58.0, widget_h],
         egui::TextEdit::singleline(&mut app.loop_start_input_str)
             .id(start_id)
-            .desired_width(50.0)
-            .margin(egui::vec2(4.0, 2.0))
+            .margin(egui::vec2(4.0, 2.0)),
     );
-    if ui.push_id("start_plus", |ui| ui.add(egui::Button::new(egui::RichText::new(PLUS).font(icon_font_id(14.0))))).inner.on_hover_text("Add 1 second to loop start").clicked() {
+    if small_step_button(ui, "start_plus", PLUS, "Add 1 second to loop start") {
         new_start = (start + 1.0).min(end - 0.1);
         changed = true;
     }
 
-    ui.label("\u{2014}");
+    ui.allocate_ui_with_layout(
+        egui::vec2(12.0, widget_h),
+        egui::Layout::top_down(egui::Align::Center),
+        |ui| {
+            let (rect, _) =
+                ui.allocate_exact_size(egui::vec2(12.0, widget_h), egui::Sense::hover());
+            ui.painter().text(
+                rect.center(),
+                egui::Align2::CENTER_CENTER,
+                "\u{2014}",
+                egui::TextStyle::Body.resolve(ui.style()),
+                ui.visuals().text_color(),
+            );
+        },
+    );
 
-    if ui.push_id("end_minus", |ui| ui.add(egui::Button::new(egui::RichText::new(MINUS).font(icon_font_id(14.0))))).inner.on_hover_text("Subtract 1 second from loop end").clicked() {
+    if small_step_button(ui, "end_minus", MINUS, "Subtract 1 second from loop end") {
         new_end = (end - 1.0).max(start + 0.1);
         changed = true;
     }
-    let end_resp = ui.add(
+    let end_resp = ui.add_sized(
+        [58.0, widget_h],
         egui::TextEdit::singleline(&mut app.loop_end_input_str)
             .id(end_id)
-            .desired_width(50.0)
-            .margin(egui::vec2(4.0, 2.0))
+            .margin(egui::vec2(4.0, 2.0)),
     );
-    if ui.push_id("end_plus", |ui| ui.add(egui::Button::new(egui::RichText::new(PLUS).font(icon_font_id(14.0))))).inner.on_hover_text("Add 1 second to loop end").clicked() {
+    if small_step_button(ui, "end_plus", PLUS, "Add 1 second to loop end") {
         new_end = (end + 1.0).min(duration);
         changed = true;
     }
@@ -678,4 +737,5 @@ fn draw_loop_inputs(ui: &mut egui::Ui, app: &mut KeyScribeApp) {
             }
         }
     }
+    });
 }

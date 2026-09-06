@@ -1204,18 +1204,6 @@ impl KeyScribeApp {
 
                         let label_color = ui.visuals().text_color();
                         let label_font = egui::TextStyle::Body.resolve(ui.style());
-                        let measured_label_width = ui
-                            .fonts(|fonts| {
-                                fonts
-                                    .layout_no_wrap(
-                                        label.to_owned(),
-                                        label_font.clone(),
-                                        label_color,
-                                    )
-                                    .size()
-                                    .x
-                            })
-                            .max(56.0);
 
                         let mut draw_controls = |ui: &mut egui::Ui| {
                             let controls_row_width = ui.available_width().max(0.0);
@@ -1339,7 +1327,15 @@ impl KeyScribeApp {
                         };
 
                         if compact_layout {
-                            ui.label(egui::RichText::new(label).color(label_color));
+                            // Single-line truncated label: every box keeps the
+                            // same height so the slider rails below line up
+                            // even when labels would wrap differently.
+                            ui.add(
+                                egui::Label::new(
+                                    egui::RichText::new(label).color(label_color),
+                                )
+                                .truncate(true),
+                            );
                             draw_controls(ui);
                         } else {
                             let row_width = ui.available_width().max(0.0);
@@ -1347,8 +1343,12 @@ impl KeyScribeApp {
                                 egui::vec2(row_width, row_height),
                                 egui::Layout::left_to_right(egui::Align::Center),
                                 |ui| {
-                                    let max_label_width = (ui.available_width() * 0.45).max(56.0);
-                                    let label_width = measured_label_width.min(max_label_width);
+                                    // Fixed label zone (not measured per box):
+                                    // all four boxes start their controls at
+                                    // the same x so rails line up across boxes.
+                                    let max_label_width =
+                                        (ui.available_width() * 0.45).max(56.0);
+                                    let label_width = max_label_width;
                                     let (label_rect, _) = ui.allocate_exact_size(
                                         egui::vec2(label_width, row_height),
                                         egui::Sense::hover(),

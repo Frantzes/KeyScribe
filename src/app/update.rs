@@ -414,7 +414,9 @@ impl eframe::App for KeyScribeApp {
                             let col_w = ((trio_w - trio_gap * 3.0).max(0.0)) / 4.0;
                             ui.allocate_ui_with_layout(
                                 egui::vec2(trio_w, slider_row_h),
-                                egui::Layout::left_to_right(egui::Align::Center),
+                                // Cross Min (top-aligned): egui's cross-Center layout
+                                // shifts each subsequent item downward (staircase).
+                                egui::Layout::left_to_right(egui::Align::Min),
                                 |ui| {
                                     ui.spacing_mut().item_spacing.x = trio_gap;
 
@@ -587,6 +589,13 @@ impl eframe::App for KeyScribeApp {
                 let default_stack_spacing_y = ui.spacing().item_spacing.y;
                 ui.spacing_mut().item_spacing.y = 0.0;
 
+                let default_stack_spacing_y = ui.spacing().item_spacing.y;
+                ui.spacing_mut().item_spacing.y = 0.0;
+
+                // View switcher icons in their own row, right-aligned above
+                // the speed/pitch controls.
+                self.draw_view_switcher_row(ui);
+
                 ui.scope(|ui| {
                     ui.spacing_mut().item_spacing.y = default_stack_spacing_y.min(UI_VSPACE_TIGHT);
                     self.draw_speed_pitch_controls(ui);
@@ -604,10 +613,6 @@ impl eframe::App for KeyScribeApp {
                         {
                             self.run_instrument_separation();
                         }
-
-                        if self.separated_stems.is_some() {
-                            ui.label(egui::RichText::new("Stem audio is loaded. Use the waveform tab controls to preview or enable instruments.").weak());
-                        }
                     });
                 }
 
@@ -619,7 +624,7 @@ impl eframe::App for KeyScribeApp {
                 // Absolute layout stability: calculate exact rects for content and footer
                 let full_avail_h = ui.available_height().max(0.0);
                 let full_avail_w = ui.available_width();
-                let media_h = media_controls_height_for_width(full_avail_w);
+                let media_h = media_controls_height_for_width(full_avail_w, self.loop_enabled);
                 let gap = waveform_visual_gap;
                 let footer_total_h = media_h + gap * 2.0;
                 let content_h = (full_avail_h - footer_total_h).max(0.0);
