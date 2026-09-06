@@ -154,6 +154,13 @@ pub fn detect_output_format(file_path: &Path) -> (&'static str, &'static str) {
 
 /// Retrieve the MVSep API key from environment variables or local .env files.
 /// Never logs or displays the raw key to avoid security leaks.
+///
+/// Lookup order:
+/// 1. `MVSEP_API_KEY` process environment variable.
+/// 2. User-local `.env` managed by the app (see [`user_dotenv_path`]) — the
+///    primary store for keys entered in Settings; lives outside the repo.
+/// 3. `.env` in the current working directory (dev convenience).
+/// 4. `.env` next to the executable (portable installs).
 pub fn find_mvsep_api_key() -> Option<String> {
     // 1. Process environment variable
     if let Ok(key) = std::env::var("MVSEP_API_KEY") {
@@ -163,41 +170,105 @@ pub fn find_mvsep_api_key() -> Option<String> {
         }
     }
 
+    // 2-4. Local .env files (user store first, then CWD, then exe dir).
+    let mut search_dirs: Vec<PathBuf> = Vec::new();
+    if let Some(user_env) = user_dotenv_path() {
+        if let Some(parent) = user_env.parent() {
+            search_dirs.push(parent.to_path_buf());
+        }
+    }
     // 2. Search for a local .env file in current working directory and exe parent directory
-    let search_dirs = [
-        std::env::current_dir().ok(),
-        std::env::current_exe()
-            .ok()
-            .and_then(|p| p.parent().map(|p| p.to_path_buf())),
-    ];
+    search_dirs.push(std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
+    if let Some(exe_parent) = std::env::current_exe()
+        .ok()
+        .and_then(|p| p.parent().map(|p| p.to_path_buf()))
+    {
+        search_dirs.push(exe_parent);
+    }
 
-    for dir in search_dirs.into_iter().flatten() {
+    for dir in search_dirs {
         let env_path = dir.join(".env");
         if env_path.is_file() {
-            if let Ok(contents) = std::fs::read_to_string(&env_path) {
-                for line in contents.lines() {
-                    let line = line.trim();
-                    if line.starts_with('#') || line.is_empty() {
-                        continue;
-                    }
-                    if let Some((k, v)) = line.split_once('=') {
-                        if k.trim() == "MVSEP_API_KEY" {
-                            let key = v
-                                .trim()
-                                .trim_matches('"')
-                                .trim_matches('\'')
-                                .to_string();
-                            if !key.is_empty() {
-                                return Some(key);
-                            }
-                        }
-                    }
-                }
+            if let Some(key) = parse_dotenv_api_key(&env_path) {
+                return Some(key);
             }
         }
     }
 
     None
+}
+
+/// Parse `MVSEP_API_KEY` out of a dotenv file. Returns `None` when absent.
+fn parse_dotenv_api_key(env_path: &Path) -> Option<String> {
+    let contents = std::fs::read_to_string(env_path).ok()?;
+    for line in contents.lines() {
+        let line = line.trim();
+        if line.starts_with('#') || line.is_empty() {
+            continue;
+        }
+        if let Some((k, v)) = line.split_once('=') {
+            if k.trim() == "MVSEP_API_KEY" {
+                let key = v
+                    .trim()
+                    .trim_matches('"')
+                    .trim_matches('\'')
+                    .to_string();
+                if !key.is_empty() {
+                    return Some(key);
+                }
+            }
+        }
+    }
+    None
+}
+
+/// Path of the user-local `.env` file managed by the app.
+///
+/// Always under the OS user-data dir (`~/.local/share/KeyScribe/.env` on
+/// Linux), never next to the executable (read-only in AppImage/Flatpak) and
+/// never inside the repo, so keys cannot be committed by accident.
+pub fn user_dotenv_path() -> Option<PathBuf> {
+    directories::ProjectDirs::from("com", "Frantzes", "KeyScribe")
+        .map(|d| d.data_local_dir().join(".env"))
+}
+
+/// Persist the MVSep API key to the user-local `.env` file, preserving any
+/// other variables already present. The file is created with `0600`
+/// permissions on Unix. An empty key removes our entry instead.
+pub fn save_mvsep_api_key_to_dotenv(key: &str) -> Result<()> {
+    let path = user_dotenv_path().ok_or_else(|| anyhow!("Could not locate user data directory"))?;
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("Failed to create {}", parent.display()))?;
+    }
+
+    let key = key.trim();
+    let mut lines: Vec<String> = Vec::new();
+    if path.is_file() {
+        let contents = std::fs::read_to_string(&path)
+            .with_context(|| format!("Failed to read {}", path.display()))?;
+        for line in contents.lines() {
+            let trimmed = line.trim();
+            let is_ours = !trimmed.starts_with('#')
+                && trimmed.split_once('=').map(|(k, _)| k.trim()) == Some("MVSEP_API_KEY");
+            if !is_ours {
+                lines.push(line.to_string());
+            }
+        }
+    }
+    if !key.is_empty() {
+        lines.push(format!("MVSEP_API_KEY={key}"));
+    }
+
+    std::fs::write(&path, lines.join("\n") + if lines.is_empty() { "" } else { "\n" })
+        .with_context(|| format!("Failed to write {}", path.display()))?;
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
+    }
+    Ok(())
 }
 
 /// User profile info returned by MVSep
@@ -304,6 +375,58 @@ pub struct MvsepStatusResponse {
     pub data: Option<MvsepStatusData>,
     pub error: Option<String>,
     pub message: Option<String>,
+}
+
+/// Maximum bytes accepted for a single downloaded stem (matches the 1000 MB
+/// client-side upload cap). Guards against disk-fill from a misbehaving or
+/// compromised server.
+pub const MAX_STEM_DOWNLOAD_BYTES: u64 = 1000 * 1024 * 1024;
+
+/// Hosts stem files may be downloaded from. A compromised server could
+/// otherwise redirect downloads (and the resulting file writes) anywhere.
+fn stem_url_host_allowed(url: &reqwest::Url) -> bool {
+    if url.scheme() != "https" {
+        return false;
+    }
+    let host = url.host_str().unwrap_or_default().to_ascii_lowercase();
+    if host == "mvsep.com" || host.ends_with(".mvsep.com") {
+        return true;
+    }
+    // Escape hatch for legit CDN moves (documented in the rejection error).
+    if let Ok(extra) = std::env::var("MVSEP_EXTRA_DOWNLOAD_HOSTS") {
+        for h in extra.split(',') {
+            let h = h.trim().trim_start_matches('.').to_ascii_lowercase();
+            if !h.is_empty() && (host == h || host.ends_with(&format!(".{h}"))) {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// Build a safe stem filename from a server-provided stem type.
+///
+/// Only `[a-z0-9_-]` survive; anything else (including `/`, `\` and `..`
+/// path-traversal sequences) is stripped, with a positional fallback when
+/// nothing remains. The extension must come from the fixed set chosen by the
+/// caller, never from the server.
+fn sanitize_stem_filename(stem_type: &str, ext: &str, index: usize) -> String {
+    let mut clean = stem_type.trim().to_lowercase().replace(' ', "_");
+    for ext_to_strip in &[".wav", ".mp3", ".flac", ".m4a", ".aac", ".ogg"] {
+        if clean.ends_with(ext_to_strip) {
+            clean.truncate(clean.len() - ext_to_strip.len());
+        }
+    }
+    let safe: String = clean
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric() || *c == '-' || *c == '_')
+        .collect();
+    let stem = if safe.is_empty() {
+        format!("stem_{index}")
+    } else {
+        safe
+    };
+    format!("{stem}.{ext}")
 }
 
 /// Check if an error message indicates an invalid token, missing token, or unauthorized error
@@ -628,11 +751,19 @@ pub fn separate_audio_file(
     let mut downloaded_paths = Vec::new();
 
     for (idx, file) in filtered_stem_files.iter().enumerate() {
-        let mut clean_type = file.stem_type.trim().to_lowercase().replace(' ', "_");
-        for ext_to_strip in &[".wav", ".mp3", ".flac", ".m4a", ".aac", ".ogg"] {
-            if clean_type.ends_with(ext_to_strip) {
-                clean_type = clean_type[..clean_type.len() - ext_to_strip.len()].to_string();
-            }
+        // Validate the download URL before touching the network: HTTPS only,
+        // MVSep hosts only. A compromised server must not redirect downloads
+        // (or the resulting file writes) to arbitrary hosts.
+        let stem_url = reqwest::Url::parse(&file.url).with_context(|| {
+            format!("MVSep returned an invalid stem URL for '{}'", file.stem_type)
+        })?;
+        if !stem_url_host_allowed(&stem_url) {
+            return Err(anyhow!(
+                "MVSep returned a stem URL outside the trusted hosts for '{}': {} \
+                 (expected https://mvsep.com/…; allow more via MVSEP_EXTRA_DOWNLOAD_HOSTS)",
+                file.stem_type,
+                stem_url.host_str().unwrap_or("?"),
+            ));
         }
 
         let url_path = file.url.split('?').next().unwrap_or(&file.url);
@@ -647,8 +778,16 @@ pub fn separate_audio_file(
         } else {
             expected_ext
         };
-        let stem_filename = format!("{clean_type}.{ext}");
+        // Server-provided stem types are untrusted: sanitize so the filename
+        // cannot escape output_dir (no `/`, `\`, `..` survive).
+        let stem_filename = sanitize_stem_filename(&file.stem_type, ext, idx);
         let stem_path = output_dir.join(&stem_filename);
+        if !stem_path.starts_with(output_dir) {
+            return Err(anyhow!(
+                "Refusing to write stem '{}' outside the output directory",
+                file.stem_type
+            ));
+        }
 
         if let Some(cb) = progress_cb {
             let progress = 0.70 + 0.28 * (idx as f32 / total_stems.max(1) as f32);
@@ -661,8 +800,8 @@ pub fn separate_audio_file(
             cb(progress, &msg);
         }
 
-        let file_resp = client
-            .get(&file.url)
+        let mut file_resp = client
+            .get(stem_url)
             .send()
             .with_context(|| format!("Failed to download stem file from {}", file.url))?;
 
@@ -674,12 +813,59 @@ pub fn separate_audio_file(
             ));
         }
 
-        let bytes = file_resp
-            .bytes()
-            .with_context(|| format!("Failed to read stem bytes for '{}'", file.stem_type))?;
-
-        std::fs::write(&stem_path, &bytes)
-            .with_context(|| format!("Failed to write stem file to {:?}", stem_path))?;
+        // Stream to disk with a hard cap instead of buffering the whole
+        // response in RAM: a misbehaving server must not fill memory/disk.
+        if let Some(len) = file_resp.content_length() {
+            if len > MAX_STEM_DOWNLOAD_BYTES {
+                return Err(anyhow!(
+                    "Stem '{}' exceeds the {} MB download limit (server claims {} bytes)",
+                    file.stem_type,
+                    MAX_STEM_DOWNLOAD_BYTES / (1024 * 1024),
+                    len,
+                ));
+            }
+        }
+        let mut out_file = std::fs::File::create(&stem_path)
+            .with_context(|| format!("Failed to create stem file at {:?}", stem_path))?;
+        // Stream to disk through a byte-counting writer instead of
+        // buffering the whole response in RAM: a misbehaving server must
+        // not exhaust memory or disk.
+        struct CappedWriter<W: std::io::Write> {
+            inner: W,
+            written: u64,
+            cap: u64,
+        }
+        impl<W: std::io::Write> std::io::Write for CappedWriter<W> {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                let n = self.inner.write(buf)?;
+                self.written += n as u64;
+                if self.written > self.cap {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::QuotaExceeded,
+                        "download size cap exceeded",
+                    ));
+                }
+                Ok(n)
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                self.inner.flush()
+            }
+        }
+        let mut capped = CappedWriter {
+            inner: &mut out_file,
+            written: 0,
+            cap: MAX_STEM_DOWNLOAD_BYTES,
+        };
+        if let Err(e) = file_resp.copy_to(&mut capped) {
+            drop(out_file);
+            let _ = std::fs::remove_file(&stem_path);
+            return Err(anyhow!(
+                "Failed to download stem '{}' ({}; limit {} MB)",
+                file.stem_type,
+                e,
+                MAX_STEM_DOWNLOAD_BYTES / (1024 * 1024),
+            ));
+        }
 
         downloaded_paths.push(stem_path);
     }
@@ -828,6 +1014,38 @@ mod tests {
         assert!(format_mvsep_error("Duration exceeds limit").contains("Free accounts are limited to 10 minutes"));
         assert!(format_mvsep_error("File size is too large").contains("Free accounts are limited to 100 MB"));
         assert!(format_mvsep_error("Too many concurrent jobs").contains("Free accounts allow only 1 concurrent"));
+    }
+
+    #[test]
+    fn test_sanitize_stem_filename() {
+        assert_eq!(sanitize_stem_filename("Vocals", "wav", 0), "vocals.wav");
+        assert_eq!(sanitize_stem_filename("Lead Back Vocals", "mp3", 1), "lead_back_vocals.mp3");
+        assert_eq!(sanitize_stem_filename("other.wav", "wav", 2), "other.wav");
+        // Path traversal attempts are neutralized.
+        assert_eq!(sanitize_stem_filename("../../evil", "wav", 0), "evil.wav");
+        assert_eq!(sanitize_stem_filename("a/b\\c", "wav", 1), "abc.wav");
+        assert_eq!(sanitize_stem_filename("...", "wav", 2), "stem_2.wav");
+        assert_eq!(sanitize_stem_filename("", "wav", 3), "stem_3.wav");
+        assert_eq!(sanitize_stem_filename("!!!", "flac", 4), "stem_4.flac");
+    }
+
+    #[test]
+    fn test_stem_url_host_allowed() {
+        let ok = reqwest::Url::parse("https://mvsep.com/storage/vocals.wav").unwrap();
+        assert!(stem_url_host_allowed(&ok));
+        let sub = reqwest::Url::parse("https://cdn.mvsep.com/x.wav").unwrap();
+        assert!(stem_url_host_allowed(&sub));
+        // Wrong scheme, lookalike hosts, and internal targets are rejected.
+        for bad in [
+            "http://mvsep.com/x.wav",
+            "https://mvsep.com.evil.com/x.wav",
+            "https://evil-mvsep.com/x.wav",
+            "https://169.254.169.254/latest/meta-data/",
+            "https://example.com/x.wav",
+        ] {
+            let url = reqwest::Url::parse(bad).unwrap();
+            assert!(!stem_url_host_allowed(&url), "{bad} should be rejected");
+        }
     }
 }
 

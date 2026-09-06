@@ -948,10 +948,22 @@ impl KeyScribeApp {
             file_markers: self.file_markers.clone(),
             file_positions,
             file_stem_volumes,
-            mvsep_api_key: if self.mvsep_api_key.trim().is_empty() {
-                None
-            } else {
-                Some(self.mvsep_api_key.trim().to_string())
+            // The API key lives in the user-local `.env` file (see
+            // `mvsep::save_mvsep_api_key_to_dotenv`), not in the JSON state:
+            // the state file is portable/shared, the key must stay local.
+            // A successful `.env` write clears the JSON field (one-way
+            // migration for keys saved by older versions); clearing the
+            // settings field removes the `.env` entry too.
+            mvsep_api_key: {
+                let trimmed = self.mvsep_api_key.trim();
+                if trimmed.is_empty() {
+                    let _ = crate::mvsep::save_mvsep_api_key_to_dotenv("");
+                    None
+                } else if crate::mvsep::save_mvsep_api_key_to_dotenv(trimmed).is_ok() {
+                    None
+                } else {
+                    Some(trimmed.to_string())
+                }
             },
             selected_separation_model_name: self.selected_separation_model_name.clone(),
         };

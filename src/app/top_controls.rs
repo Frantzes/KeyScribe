@@ -60,6 +60,58 @@ impl SeparationModelOption {
 }
 
 impl KeyScribeApp {
+    /// Start MVSep key verification on a worker thread. The 15s network
+    /// call must never run on the UI thread (it froze the app and triggered
+    /// the desktop's "not responding" dialog on slow networks).
+    fn start_mvsep_verify(&mut self) {
+        let key = self.mvsep_api_key.trim().to_string();
+        if key.is_empty() {
+            self.mvsep_verify_message = Some("Key is empty".to_string());
+            return;
+        }
+        // Drop any stale in-flight verification.
+        self.mvsep_verify_rx = None;
+        let (tx, rx) = std::sync::mpsc::channel();
+        self.mvsep_verify_rx = Some(rx);
+        self.mvsep_verify_message = Some("Verifying…".to_string());
+        std::thread::spawn(move || {
+            let msg = match crate::mvsep::verify_api_key(&key) {
+                Ok(user) => {
+                    let name = user
+                        .name
+                        .or(user.email)
+                        .unwrap_or_else(|| "User".to_string());
+                    format!("Valid: {name}")
+                }
+                Err(e) => format!("Invalid: {e}"),
+            };
+            let _ = tx.send(msg);
+        });
+    }
+
+    /// Collect a finished background verification, if any. Call once per
+    /// frame from every site that shows the verify message.
+    fn poll_mvsep_verify(&mut self) {
+        if let Some(rx) = self.mvsep_verify_rx.take() {
+            match rx.try_recv() {
+                Ok(msg) => {
+                    let valid = msg.starts_with("Valid");
+                    self.mvsep_verify_message = Some(msg);
+                    if valid {
+                        self.save_state_to_disk();
+                    }
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => {
+                    self.mvsep_verify_rx = Some(rx);
+                }
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    self.mvsep_verify_message =
+                        Some("Invalid: verification task ended".to_string());
+                }
+            }
+        }
+    }
+
     fn draw_toolbar_separator(ui: &mut egui::Ui) {
         Self::draw_toolbar_separator_with_bleed(ui, 0.0);
     }
@@ -403,22 +455,9 @@ impl KeyScribeApp {
                 }
 
                 if ui.small_button("Verify").clicked() {
-                    let key = self.mvsep_api_key.trim();
-                    if key.is_empty() {
-                        self.mvsep_verify_message = Some("Key is empty".to_string());
-                    } else {
-                        match crate::mvsep::verify_api_key(key) {
-                            Ok(user) => {
-                                let name = user.name.or(user.email).unwrap_or_else(|| "User".to_string());
-                                self.mvsep_verify_message = Some(format!("Valid: {name}"));
-                                self.save_state_to_disk();
-                            }
-                            Err(e) => {
-                                self.mvsep_verify_message = Some(format!("Invalid: {e}"));
-                            }
-                        }
-                    }
+                    self.start_mvsep_verify();
                 }
+                self.poll_mvsep_verify();
 
                 if ui.small_button("Help").on_hover_text("What is MVSep & how to get an API key").clicked() {
                     self.show_mvsep_api_key_modal = true;
@@ -1047,22 +1086,9 @@ impl KeyScribeApp {
                 ui.add_space(4.0);
                 ui.horizontal(|ui| {
                     if ui.button("Verify Token").clicked() {
-                        let key = self.mvsep_api_key.trim().to_string();
-                        if key.is_empty() {
-                            self.mvsep_verify_message = Some("Key is empty".to_string());
-                        } else {
-                            match crate::mvsep::verify_api_key(&key) {
-                                Ok(user) => {
-                                    let name = user.name.or(user.email).unwrap_or_else(|| "User".to_string());
-                                    self.mvsep_verify_message = Some(format!("Valid: {name}"));
-                                    self.save_state_to_disk();
-                                }
-                                Err(e) => {
-                                    self.mvsep_verify_message = Some(format!("Invalid: {e}"));
-                                }
-                            }
-                        }
+                        self.start_mvsep_verify();
                     }
+                    self.poll_mvsep_verify();
 
                     if let Some(ref msg) = self.mvsep_verify_message {
                         let color = if msg.starts_with("Valid") {
