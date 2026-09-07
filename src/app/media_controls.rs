@@ -14,7 +14,6 @@ use crate::ui::widgets::{
     icon_button, icon_font_id, icon_toggle_button, responsive_icon_button_size,
 };
 
-const VOLUME_SLIDER_MAX_WIDTH: f32 = 280.0;
 
 fn channel_label(channels: u16) -> String {
     match channels.max(1) {
@@ -26,28 +25,22 @@ fn channel_label(channels: u16) -> String {
 
 /// Reserved footer height for a given panel width.
 ///
-/// Loop-aware: enabled loop inputs add a wrapped row of time fields, so the
-/// footer grows instead of clipping them. These are ceilings the layout is
-/// designed to fit; if the window gives the footer less room than this (very
-/// short windows), the panel falls back to a scrollable stacked layout so
-/// every control stays reachable.
-pub(super) fn media_controls_height_for_width(width: f32, loop_enabled: bool) -> f32 {
+/// The loop start/end fields live in a popover under the loop toggle, so the
+/// footer height no longer depends on the loop state. These are ceilings the
+/// layout is designed to fit; if the window gives the footer less room than
+/// this (very short windows), the panel falls back to a scrollable stacked
+/// layout so every control stays reachable.
+/// Widths below this switch the media panel to the compact (stacked) layout.
+pub(super) const MEDIA_COMPACT_MAX_W: f32 = 700.0;
+
+pub(super) fn media_controls_height_for_width(width: f32) -> f32 {
     if width < 560.0 {
-        if loop_enabled {
-            260.0
-        } else {
-            196.0
-        }
-    } else if width < 820.0 {
-        if loop_enabled {
-            200.0
-        } else {
-            154.0
-        }
-    } else if loop_enabled {
-        132.0
+        224.0
+    } else if width < MEDIA_COMPACT_MAX_W {
+        // Album-art row plus one shared transport/volume row plus seek bar.
+        154.0
     } else {
-        98.0
+        120.0
     }
 }
 
@@ -117,63 +110,25 @@ fn draw_track_meta(
     });
 }
 
-fn draw_volume_time_row(
-    ui: &mut egui::Ui,
-    app: &mut KeyScribeApp,
-    time_label: &str,
-    slider_height: f32,
-    icon_size: f32,
-    min_slider_width: f32,
-    _duration: f32,
-) {
-    let time_color = egui::Color32::from_rgb(176, 188, 203);
-    let time_font = egui::TextStyle::Body.resolve(ui.style());
-
-    // Fixed allocation uses the widest possible time-string format so the
-    // volume slider never shifts regardless of duration growth or digit widths.
-    let time_fixed_width = ui.fonts(|f| {
-        f.layout_no_wrap("0:00:00 / 0:00:00".to_owned(), time_font.clone(), time_color)
-            .size()
-            .x
-    });
-    let (_actual_width, time_height) = ui.fonts(|f| {
-        let size = f
-            .layout_no_wrap(time_label.to_owned(), time_font.clone(), time_color)
-            .size();
-        (size.x, size.y)
-    });
-    let row_h = slider_height.max(time_height).max(icon_size + 2.0);
+/// Inline horizontal volume control for the desktop (wide) layout: speaker
+/// icon pinned to the row's right edge with the slider filling the width up
+/// to `max_slider_w`.
+fn draw_volume_slider_row(ui: &mut egui::Ui, app: &mut KeyScribeApp, max_slider_w: f32) {
+    let icon_size: f32 = 17.0;
+    let icon_slot_w = (icon_size + 8.0).max(20.0);
+    let row_h = (icon_size + 12.0).max(22.0);
 
     ui.allocate_ui_with_layout(
         egui::vec2(ui.available_width(), row_h),
         egui::Layout::right_to_left(egui::Align::Center),
         |ui| {
-            ui.spacing_mut().item_spacing.x = 10.0;
-            let spacing_x = ui.spacing().item_spacing.x;
+            ui.spacing_mut().item_spacing.x = 8.0;
 
-            let (time_rect, _) =
-                ui.allocate_exact_size(egui::vec2(time_fixed_width, row_h), egui::Sense::hover());
-            ui.painter().text(
-                time_rect.center(),
-                egui::Align2::CENTER_CENTER,
-                time_label,
-                time_font,
-                time_color,
-            );
-
-            let icon_slot_w = (icon_size + 8.0).max(18.0);
-
-            let max_slider_width = (ui.available_width() - (icon_slot_w + spacing_x))
-                .max(0.0)
-                .min(VOLUME_SLIDER_MAX_WIDTH);
-            let volume_width = if max_slider_width >= min_slider_width {
-                max_slider_width
-            } else {
-                max_slider_width.max(72.0)
-            };
-
-            ui.spacing_mut().slider_width = volume_width;
-            let (rail_fill, rail_fill_hover, rail_fill_active) = if app.dark_mode {
+            // Right_to_left places the first allocation at the right edge, so
+            // the slider is allocated first and the icon ends up on its left.
+            let slider_w = ui.available_width().min(max_slider_w).max(60.0);
+            ui.spacing_mut().slider_width = slider_w;
+            let (rail_fill, rail_hover, rail_active) = if app.dark_mode {
                 (
                     SLIDER_RAIL_BG_DARK,
                     SLIDER_RAIL_BG_HOVER_DARK,
@@ -191,14 +146,14 @@ fn draw_volume_time_row(
                     let visuals = ui.visuals_mut();
                     visuals.slider_trailing_fill = true;
                     visuals.widgets.inactive.bg_fill = rail_fill;
-                    visuals.widgets.hovered.bg_fill = rail_fill_hover;
-                    visuals.widgets.active.bg_fill = rail_fill_active;
+                    visuals.widgets.hovered.bg_fill = rail_hover;
+                    visuals.widgets.active.bg_fill = rail_active;
                     visuals.widgets.inactive.weak_bg_fill = rail_fill;
-                    visuals.widgets.hovered.weak_bg_fill = rail_fill_hover;
-                    visuals.widgets.active.weak_bg_fill = rail_fill_active;
+                    visuals.widgets.hovered.weak_bg_fill = rail_hover;
+                    visuals.widgets.active.weak_bg_fill = rail_active;
 
                     ui.add_sized(
-                        [volume_width, row_h],
+                        [slider_w, row_h],
                         egui::Slider::new(&mut app.playback_volume, 0.0..=1.5).show_value(false),
                     )
                     .changed()
@@ -210,13 +165,13 @@ fn draw_volume_time_row(
                 }
             }
 
+            let (icon_rect, _) =
+                ui.allocate_exact_size(egui::vec2(icon_slot_w, row_h), egui::Sense::hover());
             let vol_icon = if app.playback_volume <= 0.01 {
                 SPEAKER_NONE
             } else {
                 SPEAKER_HIGH
             };
-            let (icon_rect, _) =
-                ui.allocate_exact_size(egui::vec2(icon_slot_w, row_h), egui::Sense::hover());
             ui.painter().text(
                 icon_rect.center(),
                 egui::Align2::CENTER_CENTER,
@@ -226,6 +181,324 @@ fn draw_volume_time_row(
             );
         },
     );
+}
+
+/// Speaker button that opens a vertical volume slider popup above it
+/// (Spotify-style popover). Replaces the always-visible inline slider.
+fn draw_volume_button(ui: &mut egui::Ui, app: &mut KeyScribeApp, icon_size: f32) -> egui::Response {
+    let size = (icon_size + 6.0).max(20.0);
+    let id = ui.make_persistent_id("media_volume_popup");
+    let vol_icon = if app.playback_volume <= 0.01 {
+        SPEAKER_NONE
+    } else {
+        SPEAKER_HIGH
+    };
+    let (rect, resp) = ui.allocate_exact_size(egui::vec2(size, size), egui::Sense::click());
+    if resp.hovered() {
+        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+    }
+    let bg = if resp.hovered() || resp.is_pointer_button_down_on() {
+        ui.visuals().widgets.hovered.bg_fill
+    } else {
+        egui::Color32::TRANSPARENT
+    };
+    ui.painter().rect_filled(rect, 4.0, bg);
+    ui.painter().text(
+        rect.center(),
+        egui::Align2::CENTER_CENTER,
+        vol_icon,
+        icon_font_id(icon_size),
+        ui.visuals().text_color(),
+    );
+    let resp = resp.on_hover_text("Volume");
+    if resp.clicked() {
+        ui.memory_mut(|mem| mem.toggle_popup(id));
+    }
+    if ui.memory(|mem| mem.is_popup_open(id)) {
+        egui::popup::popup_above_or_below_widget(
+            ui,
+            id,
+            &resp,
+            egui::AboveOrBelow::Above,
+            |ui| {
+                ui.set_min_width(40.0);
+                ui.set_min_height(132.0);
+                ui.vertical_centered(|ui| {
+                    draw_vertical_volume_slider(ui, app);
+                    ui.add_space(2.0);
+                    ui.label(
+                        egui::RichText::new(format!(
+                            "{}%",
+                            ((app.playback_volume / 1.5).clamp(0.0, 1.0) * 100.0) as i32
+                        ))
+                        .text_style(egui::TextStyle::Small)
+                        .color(egui::Color32::from_rgb(176, 188, 203)),
+                    );
+                });
+            },
+        );
+    }
+    resp
+}
+
+/// Compact vertical rail slider used inside the volume popup.
+fn draw_vertical_volume_slider(ui: &mut egui::Ui, app: &mut KeyScribeApp) {
+    let (rect, resp) =
+        ui.allocate_exact_size(egui::vec2(20.0, 92.0), egui::Sense::click_and_drag());
+    let rail =
+        egui::Rect::from_center_size(rect.center(), egui::vec2(5.0, rect.height() - 6.0));
+    ui.painter()
+        .rect_filled(rail, rail.width() * 0.5, SLIDER_RAIL_BG_DARK);
+    let frac = (app.playback_volume / 1.5).clamp(0.0, 1.0);
+    let handle_y = rail.bottom() - frac * rail.height();
+    if frac > 0.0 {
+        let fill = egui::Rect::from_min_max(
+            egui::pos2(rail.left(), handle_y),
+            egui::pos2(rail.right(), rail.bottom()),
+        );
+        ui.painter()
+            .rect_filled(fill, rail.width() * 0.5, app.highlight_color);
+    }
+    let handle_fill = if resp.hovered() || resp.is_pointer_button_down_on() {
+        ui.visuals().widgets.hovered.bg_fill
+    } else {
+        ui.visuals().widgets.inactive.bg_fill
+    };
+    ui.painter()
+        .circle_filled(egui::pos2(rect.center().x, handle_y), 6.0, handle_fill);
+    ui.painter().circle_stroke(
+        egui::pos2(rect.center().x, handle_y),
+        6.0,
+        ui.visuals().widgets.inactive.fg_stroke,
+    );
+    if resp.dragged() || resp.clicked() {
+        if let Some(pos) = resp.interact_pointer_pos() {
+            let f = ((rail.bottom() - pos.y) / rail.height().max(1.0)).clamp(0.0, 1.0);
+            app.playback_volume = f * 1.5;
+            if let Some(engine) = &mut app.engine {
+                engine.set_volume(app.playback_volume);
+            }
+        }
+    }
+    resp.on_hover_text("Drag to adjust volume");
+}
+
+/// Spotify-style progress row: thin rail with the elapsed portion in the
+/// accent color, current time left of it and total duration right of it.
+/// Click or drag to move the playhead, like any music player.
+fn draw_seek_bar_row(ui: &mut egui::Ui, app: &mut KeyScribeApp, duration: f32) {
+    let time_color = egui::Color32::from_rgb(176, 188, 203);
+    let time_font = egui::TextStyle::Body.resolve(ui.style());
+    let time_w = ui
+        .fonts(|f| {
+            f.layout_no_wrap("0:00:00".to_owned(), time_font.clone(), time_color)
+                .size()
+                .x
+        })
+        .max(40.0);
+    let row_h = 18.0;
+    let dark = ui.visuals().dark_mode;
+    let (rail_fill, rail_fill_hover, rail_fill_active) = if dark {
+        (
+            SLIDER_RAIL_BG_DARK,
+            SLIDER_RAIL_BG_HOVER_DARK,
+            SLIDER_RAIL_BG_ACTIVE_DARK,
+        )
+    } else {
+        (
+            SLIDER_RAIL_BG_LIGHT,
+            SLIDER_RAIL_BG_HOVER_LIGHT,
+            SLIDER_RAIL_BG_ACTIVE_LIGHT,
+        )
+    };
+    let accent = app.highlight_color;
+    let enabled = duration > 0.0 && app.audio_raw.is_some();
+
+    ui.allocate_ui_with_layout(
+        egui::vec2(ui.available_width(), row_h),
+        egui::Layout::left_to_right(egui::Align::Center),
+        |ui| {
+            ui.spacing_mut().item_spacing.x = 8.0;
+
+            // Slot for the elapsed label, painted after the bar interaction
+            // so it can preview the scrub target.
+            let (cur_rect, _) =
+                ui.allocate_exact_size(egui::vec2(time_w, row_h), egui::Sense::hover());
+
+            let bar_w = (ui.available_width() - time_w - 8.0).max(40.0);
+            let id = ui.make_persistent_id("media_seek_bar");
+            let (rect, mut resp) = ui
+                .push_id(id, |ui| {
+                    ui.allocate_exact_size(
+                        egui::vec2(bar_w, row_h),
+                        if enabled {
+                            egui::Sense::click_and_drag()
+                        } else {
+                            egui::Sense::hover()
+                        },
+                    )
+                })
+                .inner;
+
+            let rail = egui::Rect::from_center_size(rect.center(), egui::vec2(bar_w, 4.0));
+            let bg = if !enabled {
+                rail_fill.gamma_multiply(0.4)
+            } else if resp.is_pointer_button_down_on() {
+                rail_fill_active
+            } else if resp.hovered() {
+                rail_fill_hover
+            } else {
+                rail_fill
+            };
+            ui.painter().rect_filled(rail, rail.height() * 0.5, bg);
+
+            let frac = if duration > 0.0 {
+                (app.selected_time_sec / duration).clamp(0.0, 1.0)
+            } else {
+                0.0
+            };
+            // While pressed, the handle previews the drag target.
+            let handle_frac = if resp.is_pointer_button_down_on() {
+                resp.interact_pointer_pos()
+                    .map(|p| ((p.x - rail.left()) / rail.width().max(1.0)).clamp(0.0, 1.0))
+                    .unwrap_or(frac)
+            } else {
+                frac
+            };
+            if handle_frac > 0.0 {
+                let fill = egui::Rect::from_min_max(
+                    egui::pos2(rail.left(), rail.top()),
+                    egui::pos2(rail.left() + handle_frac * rail.width(), rail.bottom()),
+                );
+                let fill_color = if enabled {
+                    accent
+                } else {
+                    accent.gamma_multiply(0.4)
+                };
+                ui.painter().rect_filled(fill, rail.height() * 0.5, fill_color);
+            }
+            let handle_center =
+                egui::pos2(rail.left() + handle_frac * rail.width(), rect.center().y);
+            let handle_fill = if !enabled {
+                ui.visuals().widgets.inactive.bg_fill.gamma_multiply(0.4)
+            } else if resp.hovered() || resp.is_pointer_button_down_on() {
+                ui.visuals().widgets.hovered.bg_fill
+            } else {
+                ui.visuals().widgets.inactive.bg_fill
+            };
+            ui.painter().circle_filled(handle_center, 5.0, handle_fill);
+            ui.painter().circle_stroke(
+                handle_center,
+                5.0,
+                ui.visuals().widgets.inactive.fg_stroke,
+            );
+
+            if enabled {
+                resp = resp.on_hover_text("Seek — click or drag");
+            } else {
+                resp = resp.on_hover_text("Load a track to seek");
+            }
+
+            // Elapsed time — shows the scrub preview while pressed.
+            let cur_text = if enabled && resp.is_pointer_button_down_on() {
+                resp.interact_pointer_pos()
+                    .map(|p| {
+                        let f = ((p.x - rail.left()) / rail.width().max(1.0))
+                            .clamp(0.0, 1.0);
+                        f * duration
+                    })
+                    .unwrap_or(app.selected_time_sec)
+            } else {
+                app.selected_time_sec
+            };
+            ui.painter().text(
+                cur_rect.center(),
+                egui::Align2::CENTER_CENTER,
+                format_time(cur_text),
+                time_font.clone(),
+                time_color,
+            );
+
+            // Commit seeks on click and on drag release.
+            let playing = app.is_playing();
+            let mut seek_target: Option<f32> = None;
+            if enabled && (resp.clicked() || resp.drag_stopped()) {
+                if let Some(pos) = resp.interact_pointer_pos() {
+                    let f = ((pos.x - rail.left()) / rail.width().max(1.0)).clamp(0.0, 1.0);
+                    seek_target = Some(f * duration);
+                }
+            }
+            if let Some(target) = seek_target {
+                app.request_seek(target);
+                if playing {
+                    app.play_from_selected();
+                }
+            }
+
+            // Total duration pinned to the right edge.
+            let rest_w = ui.available_width().max(time_w);
+            ui.allocate_ui_with_layout(
+                egui::vec2(rest_w, row_h),
+                egui::Layout::right_to_left(egui::Align::Center),
+                |ui| {
+                    let (total_rect, _) = ui.allocate_exact_size(
+                        egui::vec2(time_w, row_h),
+                        egui::Sense::hover(),
+                    );
+                    ui.painter().text(
+                        total_rect.center(),
+                        egui::Align2::CENTER_CENTER,
+                        format_time(duration),
+                        time_font.clone(),
+                        time_color,
+                    );
+                },
+            );
+        },
+    );
+}
+
+/// Spotify-style solid circular play/pause button (white disc in dark mode).
+fn draw_play_button(
+    ui: &mut egui::Ui,
+    _app: &mut KeyScribeApp,
+    is_playing: bool,
+    enabled: bool,
+    button_size: f32,
+) -> egui::Response {
+    ui.push_id("play_pause_circle", |ui| {
+        let (rect, resp) =
+            ui.allocate_exact_size(egui::vec2(button_size, button_size), egui::Sense::click());
+        if resp.hovered() {
+            ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+        }
+        // Disc takes the same gray as the other transport icons; the glyph
+        // takes the panel fill so the pair always contrasts.
+        let fg = ui.visuals().widgets.inactive.fg_stroke.color;
+        let fg_hover = ui.visuals().widgets.hovered.fg_stroke.color;
+        let fill = if !enabled {
+            fg.gamma_multiply(0.35)
+        } else if resp.is_pointer_button_down_on() {
+            fg_hover.gamma_multiply(0.85)
+        } else if resp.hovered() {
+            fg_hover
+        } else {
+            fg
+        };
+        let radius = button_size * 0.5 - 2.0;
+        ui.painter().circle_filled(rect.center(), radius, fill);
+        let icon = if is_playing { PAUSE } else { PLAY };
+        let icon_color = ui.visuals().panel_fill;
+        ui.painter().text(
+            rect.center(),
+            egui::Align2::CENTER_CENTER,
+            icon,
+            icon_font_id((button_size * 0.42).round()),
+            icon_color,
+        );
+        resp.on_hover_text("Play / Pause")
+    })
+    .inner
 }
 
 pub(super) fn setting_toggle_row(ui: &mut egui::Ui, value: &mut bool, label: &str) -> bool {
@@ -252,13 +525,13 @@ pub(super) fn draw_media_controls(
     duration: f32,
 ) {
     let full_w = ui.available_width();
-    let compact_layout = full_w < 820.0;
+    let compact_layout = full_w < MEDIA_COMPACT_MAX_W;
     let art_size = if compact_layout {
         (full_w * 0.09).clamp(48.0, 64.0)
     } else {
         72.0
     };
-    let preferred_h = media_controls_height_for_width(full_w, app.loop_enabled);
+    let preferred_h = media_controls_height_for_width(full_w);
     let target_h = ui.available_height().max(0.0).min(preferred_h);
     if target_h <= f32::EPSILON {
         return;
@@ -322,18 +595,12 @@ pub(super) fn draw_media_controls(
         channel_label(source_channels),
         channel_label(playback_channels)
     );
-    let time_label = format!(
-        "{} / {}",
-        format_time(app.selected_time_sec),
-        format_time(duration)
-    );
-
     ui.allocate_ui_with_layout(
         egui::vec2(full_w, target_h),
         egui::Layout::top_down(egui::Align::Center),
         |ui| {
             ui.set_min_height(target_h);
-            egui::Frame::none()
+            let frame_resp = egui::Frame::none()
                 .fill(panel_fill)
                 .rounding(egui::Rounding::same(8.0))
                 .inner_margin(if compact_layout {
@@ -345,6 +612,12 @@ pub(super) fn draw_media_controls(
                     // Force frame width to match the parent width so centering is stable.
                     ui.set_min_width(inner_w);
                     ui.set_max_width(inner_w);
+                    // The trailing item_spacing egui appends after the last row
+                    // would otherwise grow the frame `full_w + spacing` wide,
+                    // pushing its right edge past the pane and clipping it at
+                    // the window border. All rows below space themselves with
+                    // explicit add_space calls.
+                    ui.spacing_mut().item_spacing.x = 0.0;
                     // Explicit finite content height (was: unbounded
                     // available_height) so column centering math stays valid
                     // inside the scroll area below.
@@ -355,46 +628,114 @@ pub(super) fn draw_media_controls(
                     // clipping controls away.
                     egui::ScrollArea::vertical()
                         .id_source("media_panel_scroll")
+                        // When the scrollbar shows it reserves ~10px and
+                        // widens the frame past the pane, clipping the right
+                        // edge against the window border. Hide it; scrolling
+                        // still works as an overflow safety net.
+                        .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysHidden)
                         .max_height(content_h)
                         .show(ui, |ui| {
                     ui.set_min_width(inner_w);
+                    // Clamp the content width too, so right-pinned widgets
+                    // keep the frame's inner margin instead of touching the
+                    // panel's rounded edge.
+                    ui.set_max_width(inner_w);
 
                     if compact_layout {
                         ui.vertical(|ui| {
-                            ui.horizontal(|ui| {
-                                draw_album_art(ui, app.album_art_texture.as_ref(), art_size);
-                                ui.add_space(8.0);
-
-                                let metadata_width = (ui.available_width() - 4.0).max(0.0);
-                                ui.allocate_ui_with_layout(
-                                    egui::vec2(metadata_width, art_size),
-                                    egui::Layout::top_down(egui::Align::Min),
-                                    |ui| {
-                                        draw_track_meta(
-                                            ui,
-                                            title.as_str(),
-                                            artist.as_str(),
-                                            album.as_str(),
-                                            channel_status.as_str(),
-                                            art_size,
-                                            true,
-                                        );
-                                    },
-                                );
-                            });
+                            // Center artwork + details as one group.
+                            let avail_w = ui.available_width();
+                            let title_size = if title.len() > 30 {
+                                (15.0_f32 * (30.0 / title.len() as f32).max(0.6)).max(12.0)
+                            } else {
+                                15.0
+                            };
+                            let secondary_text = if album.is_empty() {
+                                artist.clone()
+                            } else {
+                                format!("{artist} · {album}")
+                            };
+                            let measure = |text: &str, size: f32| {
+                                ui.fonts(|f| {
+                                    f.layout_no_wrap(
+                                        text.to_owned(),
+                                        egui::FontId::proportional(size),
+                                        egui::Color32::WHITE,
+                                    )
+                                    .size()
+                                    .x
+                                })
+                            };
+                            let meta_w = measure(title.as_str(), title_size)
+                                .max(measure(secondary_text.as_str(), 14.0))
+                                .max(measure(channel_status.as_str(), 12.0))
+                                .min((avail_w - art_size - 12.0).max(60.0))
+                                .max(60.0);
+                            let group_w = art_size + 8.0 + meta_w;
+                            let pad = ((avail_w - group_w) * 0.5).max(0.0);
+                            ui.allocate_ui_with_layout(
+                                egui::vec2(avail_w, art_size),
+                                egui::Layout::left_to_right(egui::Align::Center),
+                                |ui| {
+                                    ui.add_space(pad);
+                                    draw_album_art(
+                                        ui,
+                                        app.album_art_texture.as_ref(),
+                                        art_size,
+                                    );
+                                    ui.add_space(8.0);
+                                    ui.allocate_ui_with_layout(
+                                        egui::vec2(meta_w, art_size),
+                                        egui::Layout::top_down(egui::Align::Min),
+                                        |ui| {
+                                            draw_track_meta(
+                                                ui,
+                                                title.as_str(),
+                                                artist.as_str(),
+                                                album.as_str(),
+                                                channel_status.as_str(),
+                                                art_size,
+                                                true,
+                                            );
+                                        },
+                                    );
+                                },
+                            );
 
                             ui.add_space(UI_VSPACE_MEDIUM);
-                            ui.horizontal_wrapped(|ui| {
-                                if icon_button(ui, REWIND, "Skip Back 5s", analysis_ready).clicked()
-                                {
-                                    app.skip_by_seconds(-SEEK_STEP_SEC);
-                                }
+
+                            let transport_row = |ui: &mut egui::Ui,
+                                                app: &mut KeyScribeApp,
+                                                with_volume: bool,
+                                                side_w: f32| {
+                                // Slot layout: rewind right-aligned in the left
+                                // slot keeps the play button dead-center.
+                                ui.allocate_ui_with_layout(
+                                    egui::vec2(side_w, button_size),
+                                    egui::Layout::right_to_left(egui::Align::Center),
+                                    |ui| {
+                                        if icon_button(
+                                            ui,
+                                            REWIND,
+                                            "Skip Back 5s",
+                                            analysis_ready,
+                                        )
+                                        .clicked()
+                                        {
+                                            app.skip_by_seconds(-SEEK_STEP_SEC);
+                                        }
+                                    },
+                                );
 
                                 let is_playing = app.is_playing();
-                                let play_icon = if is_playing { PAUSE } else { PLAY };
-                                if icon_button(ui, play_icon, "Play / Pause", analysis_ready)
-                                    .clicked()
-                                {
+                                let play_resp = draw_play_button(
+                                    ui,
+                                    app,
+                                    is_playing,
+                                    analysis_ready,
+                                    button_size,
+                                );
+                                if play_resp.clicked() {
                                     let current_pos = app.current_position_sec();
 
                                     if is_playing {
@@ -412,42 +753,97 @@ pub(super) fn draw_media_controls(
                                     }
                                 }
 
+                                ui.allocate_ui_with_layout(
+                                    egui::vec2(side_w, button_size),
+                                    egui::Layout::left_to_right(egui::Align::Center),
+                                    |ui| {
                                 if icon_button(ui, FAST_FORWARD, "Skip Forward 5s", analysis_ready)
                                     .clicked()
                                 {
                                     app.skip_by_seconds(SEEK_STEP_SEC);
                                 }
 
-                                if icon_toggle_button(
+                                ui.add_space(14.0);
+
+                                let loop_popup_id = ui.make_persistent_id("loop_inputs_popup");
+                                let loop_resp = icon_toggle_button(
                                     ui,
                                     REPEAT,
                                     "Loop Selection",
                                     app.loop_enabled,
                                     analysis_ready,
                                     app.highlight_color,
-                                )
-                                .clicked()
-                                {
+                                );
+                                if loop_resp.clicked() {
                                     app.toggle_loop();
+                                    ui.memory_mut(|mem| {
+                                        if app.loop_enabled {
+                                            mem.open_popup(loop_popup_id);
+                                        } else {
+                                            mem.close_popup();
+                                        }
+                                    });
+                                }
+                                if app.loop_enabled {
+                                    egui::popup::popup_below_widget(
+                                        ui,
+                                        loop_popup_id,
+                                        &loop_resp,
+                                        |ui| {
+                                            ui.set_min_width(320.0);
+                                            draw_loop_inputs(ui, app);
+                                        },
+                                    );
                                 }
 
-                                draw_loop_inputs(ui, app);
-                            });
+                                if with_volume {
+                                    let rest_w = ui.available_width().max(22.0);
+                                    ui.allocate_ui_with_layout(
+                                        egui::vec2(rest_w, button_size),
+                                        egui::Layout::right_to_left(egui::Align::Center),
+                                        |ui| {
+                                            draw_volume_button(ui, app, 16.0);
+                                        },
+                                    );
+                                }
+                                    },
+                                );
+                            };
 
-                            ui.add_space(UI_VSPACE_COMPACT);
-                            draw_volume_time_row(
-                                ui,
-                                app,
-                                time_label.as_str(),
-                                (button_size * 0.62).clamp(18.0, 24.0),
-                                16.0,
-                                96.0,
-                                duration,
+                            // Slot layout: equal side slots keep the play
+                            // button dead-center; the volume button rides the
+                            // right edge, dropping to its own centered row
+                            // only when there is no room in the right slot.
+                            let avail_w = ui.available_width();
+                            let side_w = ((avail_w - button_size) * 0.5).max(0.0);
+                            let ff_loop_w = button_size * 2.0 + 14.0;
+                            let volume_btn_w = 22.0_f32;
+                            let volume_inline = side_w >= ff_loop_w + 10.0 + volume_btn_w;
+                            ui.allocate_ui_with_layout(
+                                egui::vec2(avail_w, button_size),
+                                egui::Layout::left_to_right(egui::Align::Center),
+                                |ui| {
+                                    transport_row(ui, app, volume_inline, side_w);
+                                },
                             );
+                            if !volume_inline {
+                                ui.add_space(UI_VSPACE_COMPACT);
+                                let vpad = ((avail_w - volume_btn_w) * 0.5).max(0.0);
+                                ui.allocate_ui_with_layout(
+                                    egui::vec2(avail_w, 26.0),
+                                    egui::Layout::left_to_right(egui::Align::Center),
+                                    |ui| {
+                                        ui.add_space(vpad);
+                                        draw_volume_button(ui, app, 16.0);
+                                    },
+                                );
+                            }
                         });
                     } else {
                         ui.columns(3, |cols| {
-                            cols[0].set_height(content_h);
+                            // Columns leave room for the seek bar row below.
+                            let cols_h = content_h;
+                            cols[0].set_height(cols_h);
                             cols[0].with_layout(
                                 egui::Layout::left_to_right(egui::Align::Center),
                                 |ui| {
@@ -456,8 +852,9 @@ pub(super) fn draw_media_controls(
 
                                     let metadata_width = (ui.available_width() - 6.0).max(0.0);
                                     ui.allocate_ui_with_layout(
-                                        egui::vec2(metadata_width, content_h),
-                                        egui::Layout::top_down(egui::Align::Min),
+                                        egui::vec2(metadata_width, cols_h),
+                                        egui::Layout::top_down(egui::Align::Min)
+                                            .with_main_align(egui::Align::Center),
                                         |ui| {
                                             draw_track_meta(
                                                 ui,
@@ -473,26 +870,41 @@ pub(super) fn draw_media_controls(
                                 },
                             );
 
-                            cols[1].set_height(content_h);
+                            cols[1].set_height(cols_h);
                             cols[1].allocate_ui_with_layout(
-                                egui::vec2(cols[1].available_width(), content_h),
+                                egui::vec2(cols[1].available_width(), cols_h),
                                 egui::Layout::top_down(egui::Align::Center),
                                 |ui| {
                                     let play_w = button_size;
                                     let side_w = ((ui.available_width() - play_w).max(0.0)) * 0.5;
 
                                     let play_row_height = button_size;
-                                    let total_needed_h = play_row_height;
-                                    
-                                    ui.add_space((content_h - total_needed_h).max(0.0) / 2.0);
+                                    // Spotify distributes transport + seek
+                                    // vertically, centered as one group; the
+                                    // seek bar spans wider than the buttons.
+                                    let total_needed_h =
+                                        play_row_height + 10.0 + 18.0;
+
+                                    ui.add_space(((cols_h - total_needed_h) / 2.0).max(0.0));
 
                                     ui.horizontal(|ui| {
-                                        ui.spacing_mut().item_spacing.x = 10.0;
+                                        // Default spacing is zeroed at the frame
+                                        // level and stays zero here: the rewind
+                                        // slot ends exactly at the column center
+                                        // so any extra spacing would push the
+                                        // play disc off-center.
+                                        ui.spacing_mut().item_spacing.x = 0.0;
 
                                         ui.allocate_ui_with_layout(
                                             egui::vec2(side_w, play_row_height),
                                             egui::Layout::right_to_left(egui::Align::Center),
                                             |ui| {
+                                                // Keep a gap to the play button
+                                                // (default item_spacing.x is zeroed
+                                                // at the frame level); right_to_left
+                                                // placement means this shifts the
+                                                // button left, off the slot edge.
+                                                ui.add_space(12.0);
                                                 if icon_button(
                                                     ui,
                                                     REWIND,
@@ -507,15 +919,14 @@ pub(super) fn draw_media_controls(
                                         );
 
                                         let is_playing = app.is_playing();
-                                        let play_icon = if is_playing { PAUSE } else { PLAY };
-                                        if icon_button(
+                                        let play_resp = draw_play_button(
                                             ui,
-                                            play_icon,
-                                            "Play / Pause",
+                                            app,
+                                            is_playing,
                                             analysis_ready,
-                                        )
-                                        .clicked()
-                                        {
+                                            button_size,
+                                        );
+                                        if play_resp.clicked() {
                                             let current_pos = app.current_position_sec();
 
                                             if is_playing {
@@ -538,6 +949,12 @@ pub(super) fn draw_media_controls(
                                             }
                                         }
 
+                                        // Explicit gap to the fast-forward button
+                                        // (default item_spacing.x is zeroed at the
+                                        // frame level); placed after the play button
+                                        // so the play disc stays column-centered.
+                                        ui.add_space(12.0);
+
                                         // Fast-forward + loop are added directly to the row so
                                         // they share the exact same alignment as the play
                                         // button (nested centered slots offset them).
@@ -554,46 +971,62 @@ pub(super) fn draw_media_controls(
 
                                         ui.add_space(14.0);
 
-                                        if icon_toggle_button(
+                                        let loop_popup_id =
+                                            ui.make_persistent_id("loop_inputs_popup");
+                                        let loop_resp = icon_toggle_button(
                                             ui,
                                             REPEAT,
                                             "Loop Selection",
                                             app.loop_enabled,
                                             analysis_ready,
                                             app.highlight_color,
-                                        )
-                                        .clicked()
-                                        {
+                                        );
+                                        if loop_resp.clicked() {
                                             app.toggle_loop();
+                                            ui.memory_mut(|mem| {
+                                                if app.loop_enabled {
+                                                    mem.open_popup(loop_popup_id);
+                                                } else {
+                                                    mem.close_popup();
+                                                }
+                                            });
                                         }
-
                                         if app.loop_enabled {
-                                            ui.add_space(8.0);
-                                            draw_loop_inputs(ui, app);
+                                            egui::popup::popup_below_widget(
+                                                ui,
+                                                loop_popup_id,
+                                                &loop_resp,
+                                                |ui| {
+                                                    ui.set_min_width(320.0);
+                                                    draw_loop_inputs(ui, app);
+                                                },
+                                            );
                                         }
                                     });
+
+                                    ui.add_space(10.0);
+                                    draw_seek_bar_row(ui, app, duration);
                                 },
                             );
 
-                            cols[2].set_height(content_h);
+                            cols[2].set_height(cols_h);
                             cols[2].allocate_ui_with_layout(
-                                egui::vec2(cols[2].available_width(), content_h),
+                                egui::vec2(cols[2].available_width(), cols_h),
                                 egui::Layout::left_to_right(egui::Align::Center),
                                 |ui| {
-                                    let slider_height = (button_size * 0.62).clamp(18.0, 24.0);
-                                    draw_volume_time_row(
-                                        ui,
-                                        app,
-                                        time_label.as_str(),
-                                        slider_height,
-                                        17.0,
-                                        120.0,
-                                        duration,
-                                    );
+                                    // Desktop layout keeps the volume slider
+                                    // permanently visible, right-pinned and
+                                    // vertically centered.
+                                    draw_volume_slider_row(ui, app, 110.0);
                                 },
                             );
                         });
                     }
+
+                            if compact_layout {
+                                ui.add_space(UI_VSPACE_COMPACT);
+                                draw_seek_bar_row(ui, app, duration);
+                            }
                         });
                 });
         },

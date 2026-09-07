@@ -2,15 +2,14 @@ use super::*;
 use crate::theme::{
     SLIDER_RAIL_BG_ACTIVE_DARK, SLIDER_RAIL_BG_ACTIVE_LIGHT, SLIDER_RAIL_BG_DARK,
     SLIDER_RAIL_BG_HOVER_DARK, SLIDER_RAIL_BG_HOVER_LIGHT, SLIDER_RAIL_BG_LIGHT,
-    SLIDER_ROW_BG_DARK, SLIDER_ROW_BG_LIGHT, SLIDER_ROW_STROKE_DARK, SLIDER_ROW_STROKE_LIGHT,
 };
 
 const TOOLBAR_MENU_MIN_WIDTH: f32 = 360.0;
 const SETTINGS_RGB_SLIDER_MAX_WIDTH: f32 = 220.0;
 const CONTROLS_PANEL_HORIZONTAL_PADDING: f32 = 6.0;
 const CONTROLS_PANEL_VERTICAL_PADDING: f32 = UI_VSPACE_COMPACT;
-const SLIDER_PAIR_VERTICAL_SPACING: f32 = UI_VSPACE_TIGHT;
 const SHORTCUTS_MODAL_WIDTH: f32 = 470.0;
+pub(super) const COMPACT_PARAM_LABEL_W: f32 = 46.0;
 
 fn get_dir_size(path: impl AsRef<std::path::Path>) -> std::io::Result<u64> {
     let mut size = 0;
@@ -1162,16 +1161,6 @@ impl KeyScribeApp {
         let compact_layout = slot_width < 420.0;
 
         let dark = ui.visuals().dark_mode;
-        let row_fill = if dark {
-            SLIDER_ROW_BG_DARK
-        } else {
-            SLIDER_ROW_BG_LIGHT
-        };
-        let row_stroke = if dark {
-            SLIDER_ROW_STROKE_DARK
-        } else {
-            SLIDER_ROW_STROKE_LIGHT
-        };
         let rail_fill = if dark {
             SLIDER_RAIL_BG_DARK
         } else {
@@ -1192,11 +1181,9 @@ impl KeyScribeApp {
             egui::vec2(slot_width, 0.0),
             egui::Layout::top_down(egui::Align::Min),
             |ui| {
+                // Frameless: the piano-settings sliders read as one flat row
+                // instead of four floating cards.
                 egui::Frame::none()
-                    .fill(row_fill)
-                    .rounding(egui::Rounding::same(8.0))
-                    .stroke(egui::Stroke::new(1.0, row_stroke))
-                    .outer_margin(egui::Margin::symmetric(1.0, 0.0))
                     .inner_margin(egui::Margin::symmetric(9.0, UI_VSPACE_TIGHT))
                     .show(ui, |ui| {
                         ui.spacing_mut().item_spacing.x = 8.0;
@@ -1220,12 +1207,6 @@ impl KeyScribeApp {
                                         visuals.widgets.inactive.weak_bg_fill = rail_fill;
                                         visuals.widgets.hovered.weak_bg_fill = rail_fill_hover;
                                         visuals.widgets.active.weak_bg_fill = rail_fill_active;
-                                        visuals.widgets.inactive.bg_stroke =
-                                            egui::Stroke::new(1.0, row_stroke);
-                                        visuals.widgets.hovered.bg_stroke =
-                                            egui::Stroke::new(1.0, row_stroke);
-                                        visuals.widgets.active.bg_stroke =
-                                            egui::Stroke::new(1.0, row_stroke);
 
                                         let controls_w = ui.available_width().max(0.0);
                                         let spacing = ui.spacing().item_spacing.x;
@@ -1372,91 +1353,44 @@ impl KeyScribeApp {
         changed
     }
 
-    pub(super) fn draw_speed_pitch_controls(&mut self, ui: &mut egui::Ui) {
-        let mut speed_changed = false;
-        let mut pitch_changed = false;
-        let pair_gap = 12.0;
-        let pair_w = ui.available_width().max(0.0);
-        let stack_controls = pair_w < 560.0;
-        let col_w = ((pair_w - pair_gap).max(0.0)) * 0.5;
-        let slider_row_h =
-            ui.spacing().interact_size.y.clamp(22.0, 30.0) + UI_VSPACE_TIGHT * 2.0 + 2.0;
-        let default_item_spacing_y = ui.spacing().item_spacing.y;
-        ui.spacing_mut().item_spacing.y = default_item_spacing_y.min(SLIDER_PAIR_VERTICAL_SPACING);
-        ui.add_space(UI_VSPACE_COMPACT);
-        if stack_controls {
-            ui.allocate_ui_with_layout(
-                egui::vec2(pair_w, 0.0),
-                egui::Layout::top_down(egui::Align::Center),
-                |ui| {
-                    speed_changed = Self::top_bar_slider_with_input(
-                        ui,
-                        "Speed",
-                        &mut self.speed,
-                        0.5,
-                        2.0,
-                        "x",
-                        0.01,
-                        2,
-                    );
-                    ui.add_space(UI_VSPACE_TIGHT);
-                    pitch_changed = Self::top_bar_slider_with_input(
-                        ui,
-                        "Pitch",
-                        &mut self.pitch_semitones,
-                        -12.0,
-                        12.0,
-                        " st",
-                        0.1,
-                        1,
-                    );
-                },
-            );
-        } else {
-            ui.allocate_ui_with_layout(
-                egui::vec2(pair_w, slider_row_h),
-                egui::Layout::left_to_right(egui::Align::Center),
-                |ui| {
-                    ui.spacing_mut().item_spacing.x = pair_gap;
-
-                    ui.allocate_ui_with_layout(
-                        egui::vec2(col_w, slider_row_h),
-                        egui::Layout::top_down(egui::Align::Center),
-                        |ui| {
-                            speed_changed = Self::top_bar_slider_with_input(
-                                ui,
-                                "Speed",
-                                &mut self.speed,
-                                0.5,
-                                2.0,
-                                "x",
-                                0.01,
-                                2,
-                            );
-                        },
-                    );
-
-                    ui.allocate_ui_with_layout(
-                        egui::vec2(col_w, slider_row_h),
-                        egui::Layout::top_down(egui::Align::Center),
-                        |ui| {
-                            pitch_changed = Self::top_bar_slider_with_input(
-                                ui,
-                                "Pitch",
-                                &mut self.pitch_semitones,
-                                -12.0,
-                                12.0,
-                                " st",
-                                0.1,
-                                1,
-                            );
-                        },
-                    );
-                },
-            );
-        }
-        ui.add_space(UI_VSPACE_COMPACT);
-        ui.spacing_mut().item_spacing.y = default_item_spacing_y;
+    /// Compact Speed + Pitch pair used inside the merged top row: text
+    /// label, fixed-width slider and a small draggable value.
+    /// Double-clicking the value resets to the default.
+    pub(super) fn draw_compact_speed_pitch(
+        &mut self,
+        ui: &mut egui::Ui,
+        slider_w: f32,
+        value_w: f32,
+        row_h: f32,
+    ) {
+        let speed_changed = Self::compact_param_slider(
+            ui,
+            "Speed",
+            &mut self.speed,
+            0.5,
+            2.0,
+            "x",
+            0.01,
+            2,
+            1.0,
+            slider_w,
+            value_w,
+            row_h,
+        );
+        let pitch_changed = Self::compact_param_slider(
+            ui,
+            "Pitch",
+            &mut self.pitch_semitones,
+            -12.0,
+            12.0,
+            " st",
+            0.1,
+            1,
+            0.0,
+            slider_w,
+            value_w,
+            row_h,
+        );
 
         if speed_changed || pitch_changed {
             self.pending_param_change = true;
@@ -1465,6 +1399,104 @@ impl KeyScribeApp {
 
         let pointer_down = ui.input(|i| i.pointer.primary_down());
         self.maybe_commit_pending_param_change(pointer_down);
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn compact_param_slider(
+        ui: &mut egui::Ui,
+        label: &str,
+        value: &mut f32,
+        min: f32,
+        max: f32,
+        suffix: &str,
+        drag_speed: f64,
+        max_decimals: usize,
+        reset_value: f32,
+        slider_w: f32,
+        value_w: f32,
+        row_h: f32,
+    ) -> bool {
+        let mut changed = false;
+        let dark = ui.visuals().dark_mode;
+        let rail_fill = if dark {
+            SLIDER_RAIL_BG_DARK
+        } else {
+            SLIDER_RAIL_BG_LIGHT
+        };
+        let rail_fill_hover = if dark {
+            SLIDER_RAIL_BG_HOVER_DARK
+        } else {
+            SLIDER_RAIL_BG_HOVER_LIGHT
+        };
+        let rail_fill_active = if dark {
+            SLIDER_RAIL_BG_ACTIVE_DARK
+        } else {
+            SLIDER_RAIL_BG_ACTIVE_LIGHT
+        };
+
+        ui.allocate_ui_with_layout(
+            egui::vec2(COMPACT_PARAM_LABEL_W + 8.0 + slider_w + 8.0 + value_w, row_h),
+            egui::Layout::left_to_right(egui::Align::Min),
+            |ui| {
+                ui.spacing_mut().item_spacing.x = 8.0;
+
+                let label_font = egui::TextStyle::Body.resolve(ui.style());
+                let (label_rect, label_resp) = ui.allocate_exact_size(
+                    egui::vec2(COMPACT_PARAM_LABEL_W, row_h),
+                    egui::Sense::hover(),
+                );
+                ui.painter().text(
+                    label_rect.left_center(),
+                    egui::Align2::LEFT_CENTER,
+                    label,
+                    label_font,
+                    ui.visuals().text_color(),
+                );
+                label_resp.on_hover_text(if label == "Speed" {
+                    "Playback Speed (double-click the value to reset)"
+                } else {
+                    "Pitch in semitones (double-click the value to reset)"
+                });
+
+                ui.scope(|ui| {
+                    let visuals = ui.visuals_mut();
+                    visuals.slider_trailing_fill = true;
+                    visuals.widgets.inactive.bg_fill = rail_fill;
+                    visuals.widgets.hovered.bg_fill = rail_fill_hover;
+                    visuals.widgets.active.bg_fill = rail_fill_active;
+                    visuals.widgets.inactive.weak_bg_fill = rail_fill;
+                    visuals.widgets.hovered.weak_bg_fill = rail_fill_hover;
+                    visuals.widgets.active.weak_bg_fill = rail_fill_active;
+                    visuals.widgets.inactive.bg_stroke = egui::Stroke::new(1.0, rail_fill);
+                    visuals.widgets.hovered.bg_stroke = egui::Stroke::new(1.0, rail_fill_hover);
+                    visuals.widgets.active.bg_stroke = egui::Stroke::new(1.0, rail_fill_active);
+
+                    ui.spacing_mut().slider_width = slider_w;
+                    changed |= ui
+                        .add_sized(
+                            [slider_w, row_h],
+                            egui::Slider::new(value, min..=max).show_value(false),
+                        )
+                        .changed();
+                });
+
+                let value_resp = ui.add_sized(
+                    [value_w, row_h],
+                    egui::DragValue::new(value)
+                        .clamp_range(min..=max)
+                        .speed(drag_speed)
+                        .max_decimals(max_decimals)
+                        .suffix(suffix),
+                );
+                changed |= value_resp.changed();
+                if value_resp.double_clicked() {
+                    *value = reset_value;
+                    changed = true;
+                }
+            },
+        );
+
+        changed
     }
 
     pub(super) fn draw_top_controls_panel(&mut self, ctx: &egui::Context) {

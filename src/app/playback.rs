@@ -292,6 +292,8 @@ impl KeyScribeApp {
     }
 
     pub(super) fn play_from_selected(&mut self) {
+        self.pending_seek = Some(self.selected_time_sec);
+        self.pending_seek_age = 0;
         if self.play_preview_at(self.selected_time_sec, None) {
             self.live_stream_playback = false;
             return;
@@ -430,6 +432,17 @@ impl KeyScribeApp {
         true
     }
 
+    /// Jumps the playhead to an absolute position. While the (re)started
+    /// engine ramps up, the UI keeps showing the requested spot instead of
+    /// flickering to the engine's stale clock position.
+    pub(super) fn request_seek(&mut self, target_sec: f32) {
+        if self.audio_raw.is_none() {
+            return;
+        }
+        self.selected_time_sec = target_sec;
+        self.pending_seek = Some(target_sec);
+    }
+
     pub(super) fn toggle_loop(&mut self) {
         self.loop_enabled = !self.loop_enabled;
         if self.loop_enabled {
@@ -481,6 +494,8 @@ impl KeyScribeApp {
     }
 
     pub(super) fn play_range(&mut self, start_sec: f32, end_sec: Option<f32>) {
+        self.pending_seek = Some(start_sec);
+        self.pending_seek_age = 0;
         if self.play_preview_at(start_sec, end_sec) {
             self.live_stream_playback = false;
             return;
@@ -702,6 +717,8 @@ impl KeyScribeApp {
         self.loop_playback_enabled = false;
         self.playing_preview_buffer = false;
         self.live_stream_playback = false;
+        self.pending_seek = None;
+        self.pending_seek_age = 0;
     }
 
     pub(super) fn start_streaming_playback(&mut self, start_pos_sec: f32) {
@@ -982,8 +999,31 @@ impl KeyScribeApp {
             self.master_clock = Some(clock);
 
             if engine.is_playing() {
-                self.selected_time_sec =
-                    clock.position_sec.min(self.timeline_duration_sec());
+                // A seek just (re)started playback: hold the UI position at
+                // the requested spot until the engine clock reaches it, else
+                // the playhead and seek bar flicker for a few frames.
+                let mut suppress_position_sync = false;
+                if let Some(pending) = self.pending_seek {
+                    if (clock.position_sec - pending).abs() <= 0.35 {
+                        self.pending_seek = None;
+                        self.pending_seek_age = 0;
+                    } else {
+                        // Hold at the requested spot while the engine ramps
+                        // up; give up after ~2s so a stale guard can never
+                        // freeze the playhead.
+                        self.pending_seek_age = self.pending_seek_age.saturating_add(1);
+                        if self.pending_seek_age > 120 {
+                            self.pending_seek = None;
+                            self.pending_seek_age = 0;
+                        } else {
+                            suppress_position_sync = true;
+                        }
+                    }
+                }
+                if !suppress_position_sync {
+                    self.selected_time_sec =
+                        clock.position_sec.min(self.timeline_duration_sec());
+                }
                 self.update_note_probabilities(false);
 
                 if self.loop_enabled && self.loop_playback_enabled {
@@ -1001,28 +1041,30 @@ impl KeyScribeApp {
                         }
                     }
                 }
-            } else if streaming_active {
-                // Sink ran empty between streaming chunks but more are coming.
-                // Don't restart or clear state — poll_streaming_playback will
-                // create a new sink when the next chunk arrives.
-            } else if self.loop_enabled && self.loop_playback_enabled {
-                if let Some((a, b)) = self.loop_selection {
-                    let start = a.min(b);
-                    let end = a.max(b);
-                    if end - start > LOOP_MIN_DURATION_SEC {
-                        self.selected_time_sec = start;
-                        if param_render_in_progress {
-                            // Avoid repeatedly canceling/restarting parameter renders while looping.
-                            self.restart_playback_after_processing = true;
-                        } else {
-                            self.play_range(start, None);
+            } else {
+                if streaming_active {
+                    // Sink ran empty between streaming chunks but more are coming.
+                    // Don't restart or clear state — poll_streaming_playback will
+                    // create a new sink when the next chunk arrives.
+                } else if self.loop_enabled && self.loop_playback_enabled {
+                    if let Some((a, b)) = self.loop_selection {
+                        let start = a.min(b);
+                        let end = a.max(b);
+                        if end - start > LOOP_MIN_DURATION_SEC {
+                            self.selected_time_sec = start;
+                            if param_render_in_progress {
+                                // Avoid repeatedly canceling/restarting parameter renders while looping.
+                                self.restart_playback_after_processing = true;
+                            } else {
+                                self.play_range(start, None);
+                            }
                         }
                     }
-                }
-            } else {
-                self.playing_preview_buffer = false;
-                if !engine.has_active_sink() {
-                    self.live_stream_playback = false;
+                } else {
+                    self.playing_preview_buffer = false;
+                    if !engine.has_active_sink() {
+                        self.live_stream_playback = false;
+                    }
                 }
             }
         } else {

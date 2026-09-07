@@ -181,12 +181,11 @@ impl KeyScribeApp {
             // Clear all stem state from previous song
             self.saved_visualize_stem_indices = None;
             self.saved_listen_stem_indices = None;
-            self.pending_stem_indices.clear();
             self.pending_listening_indices.clear();
             self.stem_volumes.clear();
             self.pending_stem_volumes.clear();
-            self.show_visualize_selector = false;
-            self.show_listen_selector = false;
+            self.show_stem_mixer = false;
+            self.stem_mixer_anchor = None;
             self.melody_stem_indices.clear();
             self.chord_stem_indices.clear();
             self.current_chord = None;

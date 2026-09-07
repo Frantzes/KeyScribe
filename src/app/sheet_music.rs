@@ -3,10 +3,25 @@ use std::path::PathBuf;
 use std::process::Command;
 use std::sync::mpsc::TryRecvError;
 
-use egui_phosphor::regular::{MUSIC_NOTE, WAVEFORM};
+use egui_phosphor::regular::{EYE, EYE_SLASH, MUSIC_NOTE, SLIDERS, SPEAKER_HIGH, SPEAKER_LOW, WAVEFORM};
 
 use super::*;
-use crate::ui::widgets::{icon_toggle_button, responsive_icon_button_size};
+use crate::ui::widgets::{icon_button, icon_toggle_button, responsive_icon_button_size};
+
+/// Thin vertical rule used to separate clusters inside a horizontal row.
+fn draw_vertical_separator(ui: &mut egui::Ui, row_h: f32) {
+    let h = (row_h * 0.55).clamp(16.0, 24.0);
+    let (rect, _) = ui.allocate_exact_size(egui::vec2(9.0, row_h), egui::Sense::hover());
+    let center = rect.center();
+    let color = ui.visuals().widgets.noninteractive.bg_stroke.color;
+    ui.painter().line_segment(
+        [
+            egui::pos2(center.x, center.y - h * 0.5),
+            egui::pos2(center.x, center.y + h * 0.5),
+        ],
+        egui::Stroke::new(1.0, color),
+    );
+}
 use crate::leadsheet::{
     cross_validate_beat_sources, debug_chord_notes_to_json, detect_chord_changes_per_bar,
     generate_lead_sheet_enhanced, generate_lead_sheet_enhanced_with_timeline,
@@ -95,410 +110,389 @@ impl KeyScribeApp {
     /// remaining space and swallow the whole panel height as cursor advance.
     pub(super) fn draw_view_switcher_row(&mut self, ui: &mut egui::Ui) {
         let row_h = responsive_icon_button_size(ui);
+        let avail_w = ui.available_width().max(0.0);
+        let stack_pair = avail_w < 560.0;
+        let slider_w = 130.0_f32.min((avail_w * 0.5).max(90.0));
+        let value_w = 54.0;
+
+        if stack_pair {
+            // Too narrow for one row: icons right-aligned, Speed/Pitch on
+            // their own line below.
+            ui.allocate_ui_with_layout(
+                egui::vec2(avail_w, row_h),
+                egui::Layout::right_to_left(egui::Align::Min),
+                |ui| {
+                    self.draw_view_cluster(ui);
+                },
+            );
+            ui.add_space(UI_VSPACE_TIGHT);
+            self.draw_compact_speed_pitch(ui, slider_w, value_w, row_h);
+            return;
+        }
+
+        // Exact widths so the pair sits flush left and the icon cluster
+        // stays flush right (no estimation drift).
+        let control_w = super::top_controls::COMPACT_PARAM_LABEL_W + 8.0 + slider_w + 8.0 + value_w;
+        let pair_w = control_w * 2.0 + 8.0;
+        let pair_w = pair_w.min(avail_w * 0.7);
+
         ui.allocate_ui_with_layout(
-            egui::vec2(ui.available_width(), row_h),
-            egui::Layout::right_to_left(egui::Align::Center),
+            egui::vec2(avail_w, row_h),
+            egui::Layout::left_to_right(egui::Align::Min),
             |ui| {
-                // right_to_left, so the music note is added first to land on
-                // the right.
-                let active = self.main_content_tab;
-                if icon_toggle_button(
-                    ui,
-                    MUSIC_NOTE,
-                    "Sheet music view (experimental, WIP)",
-                    active == MainContentTab::SheetMusic,
-                    true,
-                    self.highlight_color,
-                )
-                .clicked()
-                {
-                    self.main_content_tab = MainContentTab::SheetMusic;
-                }
-                if icon_toggle_button(
-                    ui,
-                    WAVEFORM,
-                    "Waveform view",
-                    active == MainContentTab::Waveform,
-                    true,
-                    self.highlight_color,
-                )
-                .clicked()
-                {
-                    self.main_content_tab = MainContentTab::Waveform;
-                }
+                self.draw_compact_speed_pitch(ui, slider_w, value_w, row_h);
+
+                let rest_w = ui.available_width().max(0.0);
+                ui.allocate_ui_with_layout(
+                    egui::vec2(rest_w, row_h),
+                    egui::Layout::right_to_left(egui::Align::Min),
+                    |ui| {
+                        self.draw_view_cluster(ui);
+                    },
+                );
             },
         );
+
+        if self.show_stem_mixer {
+            if let Some(anchor) = self.stem_mixer_anchor {
+                self.draw_stem_mixer_popup(ui, anchor);
+            }
+        }
     }
 
-    pub(super) fn draw_main_content_tabs(&mut self, ui: &mut egui::Ui) {
-        ui.horizontal(|ui| {
-            // Bounded row height — same with_layout centering pitfall as the
-            // view switcher row above.
-            let row_h = responsive_icon_button_size(ui);
-            ui.allocate_ui_with_layout(
-                egui::vec2(ui.available_width(), row_h),
-                egui::Layout::right_to_left(egui::Align::Center),
-                |ui| {
-                if let Some(stems) = self.separated_stems.clone() {
-                    let is_analyzing = self.stem_analysis_rx.is_some();
-                    let analysis_ready = !self.stem_analyses.is_empty();
+    /// Right-aligned cluster: view toggles + Separate Instruments action.
+    fn draw_view_cluster(&mut self, ui: &mut egui::Ui) {
+        let row_h = responsive_icon_button_size(ui);
+        // right_to_left, so the music note is added first to land on the
+        // right.
+        let active = self.main_content_tab;
+        if icon_toggle_button(
+            ui,
+            MUSIC_NOTE,
+            "Sheet music view (experimental, WIP)",
+            active == MainContentTab::SheetMusic,
+            true,
+            self.highlight_color,
+        )
+        .clicked()
+        {
+            self.main_content_tab = MainContentTab::SheetMusic;
+        }
+        if icon_toggle_button(
+            ui,
+            WAVEFORM,
+            "Waveform view",
+            active == MainContentTab::Waveform,
+            true,
+            self.highlight_color,
+        )
+        .clicked()
+        {
+            self.main_content_tab = MainContentTab::Waveform;
+        }
 
-                    if is_analyzing {
-                        self.show_visualize_selector = false;
-                        self.show_listen_selector = false;
-                    }
+        draw_vertical_separator(ui, row_h);
 
-                    // --- Visualization Selector ---
-                    let visualize_btn_text = if is_analyzing {
-                        "Analyzing stems...".to_string()
-                    } else if self.enabled_stem_indices.is_empty() {
-                        "Visualize: Original Mix".to_string()
-                    } else {
-                        format!(
-                            "Visualize: {} / {}",
-                            self.enabled_stem_indices.len(),
-                            stems.len()
-                        )
-                    };
-                    
-                    let visualize_resp = ui.add_enabled(
-                        !is_analyzing && analysis_ready,
-                        egui::Button::new(visualize_btn_text).min_size(egui::vec2(220.0, 0.0))
-                    );
-                    if visualize_resp.clicked() {
-                        self.show_visualize_selector = !self.show_visualize_selector;
-                        if self.show_visualize_selector {
-                            self.show_listen_selector = false;
-                            self.pending_stem_indices = self.enabled_stem_indices.clone();
-                        }
-                    }
-
-                    if self.show_visualize_selector {
-                        let popup_id = ui.make_persistent_id("visualize_selector_area");
-                        let mut pos = visualize_resp.rect.left_bottom();
-                        pos.y += 4.0;
-
-                        egui::Area::new(popup_id)
-                            .order(egui::Order::Foreground)
-                            .fixed_pos(pos)
-                            .show(ui.ctx(), |ui| {
-                                egui::Frame::popup(ui.style()).show(ui, |ui| {
-                                    ui.set_min_width(220.0);
-                                    ui.vertical(|ui| {
-                                        ui.label("Toggle instrument visualization");
-                                        ui.horizontal(|ui| {
-                                            if ui.button("Original Mix").clicked() {
-                                                self.pending_stem_indices.clear();
-                                            }
-                                            if ui.button("All").clicked() {
-                                                self.pending_stem_indices = (0..stems.len()).collect();
-                                            }
-                                        });
-                                        ui.add_space(UI_VSPACE_TIGHT);
-
-                                        for (i, stem) in stems.iter().enumerate() {
-                                            let mut enabled = self.pending_stem_indices.contains(&i);
-                                            let label = stem.stem_type.display_name();
-                                            let stem_color = self
-                                                .stem_colors
-                                                .get(i)
-                                                .copied()
-                                                .unwrap_or(self.highlight_color);
-                                            let conf = stem.confidence;
-                                            let conf_label = if conf < 0.03 {
-                                                " (inactive)"
-                                            } else if conf < 0.08 {
-                                                " (low)"
-                                            } else {
-                                                ""
-                                            };
-                                            ui.horizontal(|ui| {
-                                                let (dot_rect, _) = ui.allocate_exact_size(
-                                                    egui::vec2(10.0, 10.0),
-                                                    egui::Sense::hover(),
-                                                );
-                                                ui.painter()
-                                                    .circle_filled(dot_rect.center(), 4.0, stem_color);
-                                                let cb_label = format!("{}{}", label, conf_label);
-                                                let cb = ui.checkbox(&mut enabled, cb_label.as_str());
-                                                if conf < 0.08 {
-                                                    cb.clone().on_hover_text(
-                                                        "Low stem energy — may not contain meaningful audio for visualization",
-                                                    );
-                                                }
-                                                if cb.changed() {
-                                                    if enabled {
-                                                        self.pending_stem_indices.insert(i);
-                                                    } else {
-                                                        self.pending_stem_indices.remove(&i);
-                                                    }
-                                                }
-                                            });
-                                        }
-
-                                        ui.add_space(UI_VSPACE_TIGHT);
-                                        let changed = self.pending_stem_indices != self.enabled_stem_indices;
-                                        ui.horizontal(|ui| {
-                                            if ui.add_enabled(changed, egui::Button::new("Apply Changes")).clicked() {
-                                                self.enabled_stem_indices = self.pending_stem_indices.clone();
-                                                self.note_timeline = Arc::new(Vec::new());
-                                                self.note_timeline_step_sec = 0.0;
-                                                self.refresh_note_timeline_from_selected_stems_preserving();
-                                                self.show_visualize_selector = false;
-                                            }
-                                            if ui.button("Cancel").clicked() {
-                                                self.show_visualize_selector = false;
-                                            }
-                                        });
-                                    });
-                                });
-                            });
-                    }
-
-                    ui.add_space(UI_VSPACE_COMPACT);
-
-                    // --- Listening Selector ---
-                    let listen_btn_text = if is_analyzing {
-                        "Analyzing stems...".to_string()
-                    } else {
-                        format!(
-                            "Listen: {}",
-                            if self.enabled_listening_indices.is_empty() { 
-                                "Original Mix".to_string() 
-                            } else { 
-                                format!("{}/{}", self.enabled_listening_indices.len(), stems.len()) 
-                            },
-                        )
-                    };
-
-                    let listen_resp = ui.add_enabled(
-                        !is_analyzing && analysis_ready,
-                        egui::Button::new(listen_btn_text).min_size(egui::vec2(180.0, 0.0))
-                    );
-                    if listen_resp.clicked() {
-                        self.show_listen_selector = !self.show_listen_selector;
-                        if self.show_listen_selector {
-                            self.show_visualize_selector = false;
-                        }
-                    }
-
-                    if self.show_listen_selector {
-                        let popup_id = ui.make_persistent_id("listen_selector_area");
-                        let mut pos = listen_resp.rect.left_bottom();
-                        pos.y += 4.0;
-                        // Estimate only for keeping the popup on-screen; the popup
-                        // itself hugs its content (no forced min width) so there is
-                        // no dead space on the right of the dB values.
-                        let popup_estimate_w = 360.0;
-                        let screen_right = ui.ctx().screen_rect().right();
-                        if pos.x + popup_estimate_w > screen_right - 8.0 {
-                            pos.x = (screen_right - popup_estimate_w - 8.0).max(8.0);
-                        }
-
-                        egui::Area::new(popup_id)
-                            .order(egui::Order::Foreground)
-                            .fixed_pos(pos)
-                            .show(ui.ctx(), |ui| {
-                                egui::Frame::popup(ui.style()).show(ui, |ui| {
-                                    ui.vertical(|ui| {
-                                        ui.label("Toggle audio playback & stem volumes");
-                                        ui.horizontal(|ui| {
-                                            if ui.button("Original Mix").clicked() {
-                                                self.enabled_listening_indices.clear();
-                                                self.stem_playback_cache = None;
-                                                self.maybe_restart_playback_for_listen_sync();
-                                            }
-                                            if ui.button("All").clicked() {
-                                                self.enabled_listening_indices = (0..stems.len()).collect();
-                                                self.stem_playback_cache = None;
-                                                let live = self.sync_all_stem_gains_live();
-                                                if !live {
-                                                    self.maybe_restart_playback_for_listen_sync();
-                                                }
-                                            }
-                                            if ui.button("None").clicked() {
-                                                self.enabled_listening_indices.clear();
-                                                self.stem_playback_cache = None;
-                                                let live = self.sync_all_stem_gains_live();
-                                                if !live {
-                                                    self.maybe_restart_playback_for_listen_sync();
-                                                }
-                                            }
-                                            if ui.button("Reset Volumes").clicked() {
-                                                for stem in stems.iter() {
-                                                    self.stem_volumes.insert(
-                                                        stem.stem_type.display_name().to_string(),
-                                                        0.0,
-                                                    );
-                                                }
-                                                if let Some(hash) = &self.loaded_audio_hash {
-                                                    self.file_stem_volumes.insert(hash.clone(), self.stem_volumes.clone());
-                                                }
-                                                self.stem_playback_cache = None;
-                                                let live = self.sync_all_stem_gains_live();
-                                                if !live {
-                                                    self.maybe_restart_playback_for_listen_sync();
-                                                }
-                                            }
-                                        });
-                                        ui.add_space(UI_VSPACE_TIGHT);
-
-                                        let mut stem_changed = false;
-                                        // User-chosen accent fills the rail from center to the
-                                        // handle (same role as `selection.bg_fill` for the
-                                        // general volume slider in the media controls).
-                                        let accent = self.highlight_color;
-
-                                        egui::Grid::new("listen_stems_slider_grid")
-                                            .num_columns(2)
-                                            .spacing([12.0, 6.0])
-                                            .show(ui, |ui| {
-                                                for (i, stem) in stems.iter().enumerate() {
-                                                    let mut enabled = self.enabled_listening_indices.contains(&i);
-                                                    let label = stem.stem_type.display_name();
-                                                    let stem_color = self
-                                                        .stem_colors
-                                                        .get(i)
-                                                        .copied()
-                                                        .unwrap_or(self.highlight_color);
-                                                    let conf = stem.confidence;
-                                                    let conf_label = if conf < 0.03 {
-                                                        " (inactive)"
-                                                    } else if conf < 0.08 {
-                                                        " (low)"
-                                                    } else {
-                                                        ""
-                                                    };
-
-                                                    // Column 1: Dot + Checkbox
-                                                    ui.horizontal(|ui| {
-                                                        let (dot_rect, _) = ui.allocate_exact_size(
-                                                            egui::vec2(10.0, 10.0),
-                                                            egui::Sense::hover(),
-                                                        );
-                                                        ui.painter()
-                                                            .circle_filled(dot_rect.center(), 4.0, stem_color);
-                                                        let cb_label = format!("{}{}", label, conf_label);
-                                                        let cb = ui.checkbox(&mut enabled, cb_label.as_str());
-                                                        if conf < 0.08 {
-                                                            cb.clone().on_hover_text(
-                                                                "Low stem energy — may not contain meaningful audio",
-                                                            );
-                                                        }
-                                                        if cb.changed() {
-                                                            let mut live_synced = false;
-                                                            if enabled {
-                                                                self.enabled_listening_indices.insert(i);
-                                                                let vol = self
-                                                                    .stem_volumes
-                                                                    .get(label.as_ref())
-                                                                    .copied()
-                                                                    .unwrap_or(0.0);
-                                                                let linear_gain = 10.0f32.powf(vol / 20.0);
-                                                                live_synced = self.sync_stem_gain_live(label.as_ref(), linear_gain);
-                                                            } else {
-                                                                self.enabled_listening_indices.remove(&i);
-                                                                if !self.enabled_listening_indices.is_empty() {
-                                                                    live_synced = self.sync_stem_gain_live(label.as_ref(), 0.0);
-                                                                }
-                                                            }
-                                                            self.stem_playback_cache = None;
-                                                            if !live_synced {
-                                                                stem_changed = true;
-                                                            }
-                                                        }
-                                                    });
-
-                                                    // Column 2: bipolar volume slider + fixed-width dB
-                                                    // label. The rail has a fixed width so every row
-                                                    // aligns and the track is always visible (the old
-                                                    // `add_sized([180, ..], Slider::show_value(true))`
-                                                    // squeezed the rail down to just the handle).
-                                                    let mut vol = self
-                                                        .stem_volumes
-                                                        .get(label.as_ref())
-                                                        .copied()
-                                                        .unwrap_or(0.0);
-                                                    let mut vol_changed = false;
-                                                    ui.horizontal(|ui| {
-                                                        ui.spacing_mut().item_spacing.x = 6.0;
-                                                        let slider_id =
-                                                            ui.make_persistent_id(("listen_db", i));
-                                                        vol_changed |= bipolar_db_slider(
-                                                            ui,
-                                                            slider_id,
-                                                            &mut vol,
-                                                            accent,
-                                                        );
-                                                        let row_h =
-                                                            ui.spacing().interact_size.y.max(18.0);
-                                                        ui.add_sized(
-                                                            [64.0, row_h],
-                                                            egui::Label::new(
-                                                                egui::RichText::new(format!(
-                                                                    "{:+.1} dB",
-                                                                    vol
-                                                                ))
-                                                                .monospace()
-                                                                .size(12.0),
-                                                            ),
-                                                        );
-                                                    });
-                                                    if vol_changed {
-                                                        self.stem_volumes.insert(label.to_string(), vol);
-                                                        if let Some(hash) = &self.loaded_audio_hash {
-                                                            self.file_stem_volumes.insert(hash.clone(), self.stem_volumes.clone());
-                                                        }
-                                                        if !enabled {
-                                                            self.enabled_listening_indices.insert(i);
-                                                        }
-                                                        let linear_gain = 10.0f32.powf(vol / 20.0);
-                                                        let live_synced = self.sync_stem_gain_live(label.as_ref(), linear_gain);
-                                                        self.stem_playback_cache = None;
-                                                        if !live_synced {
-                                                            stem_changed = true;
-                                                        }
-                                                    }
-                                                    ui.end_row();
-                                                }
-                                            });
-
-                                        if stem_changed {
-                                            if let Some(hash) = &self.loaded_audio_hash {
-                                                self.file_stem_volumes.insert(hash.clone(), self.stem_volumes.clone());
-                                            }
-                                            self.stem_playback_cache = None;
-                                            let now = Instant::now();
-                                            let should_restart = match self.last_listen_sync_at {
-                                                Some(last) => now.duration_since(last) >= Duration::from_millis(60),
-                                                None => true,
-                                            };
-                                            if should_restart {
-                                                self.maybe_restart_playback_for_listen_sync();
-                                                self.last_listen_sync_at = Some(now);
-                                            }
-                                        }
-
-                                        let pointer_down = ui.input(|i| i.pointer.primary_down());
-                                        if !pointer_down && self.last_listen_sync_at.is_some() {
-                                            self.maybe_restart_playback_for_listen_sync();
-                                            self.last_listen_sync_at = None;
-                                        }
-
-                                        ui.add_space(UI_VSPACE_TIGHT);
-                                        ui.horizontal(|ui| {
-                                            if ui.button("Close").clicked() {
-                                                self.show_listen_selector = false;
-                                            }
-                                        });
-                                    });
-                                });
-                            });
-                    }
+        if self.separated_stems.is_some() {
+            // Stems loaded: the button toggles the stem mixer popup.
+            let mixer_resp = icon_toggle_button(
+                ui,
+                SLIDERS,
+                "Stem Mixer (listening + piano visibility)",
+                self.show_stem_mixer,
+                true,
+                self.highlight_color,
+            );
+            self.stem_mixer_anchor = Some(mixer_resp.rect);
+            if mixer_resp.clicked() {
+                self.show_stem_mixer = !self.show_stem_mixer;
+            }
+        } else {
+            // No stems yet: the button runs separation, shown under the
+            // same conditions as the old text button.
+            let show_separation = !self.auto_separate
+                || (self.separation_attempted && self.separated_stems.is_none());
+            if show_separation {
+                let can_separate =
+                    self.audio_raw.is_some() && !self.is_blocking_processing();
+                let sep_resp =
+                    icon_button(ui, SLIDERS, "Separate Instruments", can_separate);
+                if sep_resp.clicked() {
+                    self.run_instrument_separation();
                 }
-            });
-        });
+            }
+        }
+        draw_vertical_separator(ui, row_h);
     }
+
+    /// Unified stem mixer popup, anchored under the instant-mix button in
+    /// the view switcher row. Replaces the old "Listen:" and "Visualize:"
+    /// buttons: each stem row has an audible/mute toggle and a piano
+    /// visibility toggle.
+    pub(super) fn draw_stem_mixer_popup(&mut self, ui: &mut egui::Ui, anchor: egui::Rect) {
+        let Some(stems) = self.separated_stems.clone() else {
+            self.show_stem_mixer = false;
+            return;
+        };
+        let is_analyzing = self.stem_analysis_rx.is_some();
+        let analysis_ready = !self.stem_analyses.is_empty();
+        if is_analyzing {
+            self.show_stem_mixer = false;
+        }
+
+        let popup_w = 480.0_f32;
+        let mut pos = egui::pos2(anchor.left(), anchor.bottom() + 4.0);
+        let screen_right = ui.ctx().screen_rect().right();
+        if pos.x + popup_w > screen_right - 8.0 {
+            pos.x = (screen_right - popup_w - 8.0).max(8.0);
+        }
+        let accent = self.highlight_color;
+        let controls_enabled = !is_analyzing && analysis_ready;
+
+        egui::Area::new(ui.make_persistent_id("stem_mixer_popup"))
+            .order(egui::Order::Foreground)
+            .fixed_pos(pos)
+            .show(ui.ctx(), |ui| {
+                egui::Frame::popup(ui.style()).show(ui, |ui| {
+                    ui.set_min_width(popup_w);
+                    ui.vertical(|ui| {
+                        ui.horizontal(|ui| {
+                            ui.label(egui::RichText::new("Stem Mixer").strong());
+                            if is_analyzing || !analysis_ready {
+                                ui.label(
+                                    egui::RichText::new("Analyzing stems...")
+                                        .weak(),
+                                );
+                            }
+                        });
+                        ui.add_space(UI_VSPACE_TIGHT);
+
+                        ui.horizontal(|ui| {
+                            if ui.add_enabled(
+                                controls_enabled,
+                                egui::Button::new("All"),
+                            )
+                            .clicked()
+                            {
+                                self.enabled_listening_indices =
+                                    (0..stems.len()).collect();
+                                self.stem_playback_cache = None;
+                                let live = self.sync_all_stem_gains_live();
+                                if !live {
+                                    self.maybe_restart_playback_for_listen_sync();
+                                }
+                                self.enabled_stem_indices = (0..stems.len()).collect();
+                                self.note_timeline = Arc::new(Vec::new());
+                                self.note_timeline_step_sec = 0.0;
+                                self.refresh_note_timeline_from_selected_stems_preserving();
+                            }
+                            if ui.add_enabled(
+                                controls_enabled,
+                                egui::Button::new("Original Mix"),
+                            )
+                            .clicked()
+                            {
+                                self.enabled_listening_indices.clear();
+                                self.stem_playback_cache = None;
+                                self.maybe_restart_playback_for_listen_sync();
+                                self.enabled_stem_indices.clear();
+                                self.note_timeline = Arc::new(Vec::new());
+                                self.note_timeline_step_sec = 0.0;
+                                self.refresh_note_timeline_from_selected_stems_preserving();
+                            }
+                        });
+                        ui.add_space(UI_VSPACE_TIGHT);
+
+                        egui::Grid::new("stem_mixer_grid")
+                            .num_columns(4)
+                            .spacing([10.0, 6.0])
+                            .show(ui, |ui| {
+                                for (i, stem) in stems.iter().enumerate() {
+                                    let label = stem.stem_type.display_name();
+                                    let stem_color = self
+                                        .stem_colors
+                                        .get(i)
+                                        .copied()
+                                        .unwrap_or(self.highlight_color);
+                                    let conf = stem.confidence;
+                                    let conf_label = if conf < 0.03 {
+                                        " (inactive)"
+                                    } else if conf < 0.08 {
+                                        " (low)"
+                                    } else {
+                                        ""
+                                    };
+
+                                    // Column 1: color dot + stem name.
+                                    ui.horizontal(|ui| {
+                                        let (dot_rect, _) = ui.allocate_exact_size(
+                                            egui::vec2(10.0, 10.0),
+                                            egui::Sense::hover(),
+                                        );
+                                        ui.painter().circle_filled(
+                                            dot_rect.center(),
+                                            4.0,
+                                            stem_color,
+                                        );
+                                        ui.label(format!("{}{}", label, conf_label));
+                                    });
+
+                                    // Column 2: bipolar dB volume slider. Inactive
+                                    // while the stem is muted (which also covers
+                                    // the "Original Mix" preset, where every stem
+                                    // is muted).
+                                    let audible =
+                                        self.enabled_listening_indices.contains(&i);
+                                    let slider_enabled = audible && controls_enabled;
+                                    let mut vol = self
+                                        .stem_volumes
+                                        .get(label.as_ref())
+                                        .copied()
+                                        .unwrap_or(0.0);
+                                    let slider_id = ui
+                                        .make_persistent_id(("stem_mixer_db", i));
+                                    let vol_changed = bipolar_db_slider(
+                                        ui,
+                                        slider_id,
+                                        &mut vol,
+                                        accent,
+                                        slider_enabled,
+                                    );
+                                    let row_h =
+                                        ui.spacing().interact_size.y.max(18.0);
+                                    let db_text = egui::RichText::new(format!(
+                                        "{:+.1} dB",
+                                        vol
+                                    ))
+                                    .monospace()
+                                    .size(12.0);
+                                    let db_text = if slider_enabled {
+                                        db_text
+                                    } else {
+                                        db_text.color(
+                                            ui.visuals()
+                                                .text_color()
+                                                .gamma_multiply(0.4),
+                                        )
+                                    };
+                                    ui.add_sized(
+                                        [64.0, row_h],
+                                        egui::Label::new(db_text),
+                                    );
+                                    if vol_changed {
+                                        self.stem_volumes
+                                            .insert(label.to_string(), vol);
+                                        if let Some(hash) = &self.loaded_audio_hash {
+                                            self.file_stem_volumes.insert(
+                                                hash.clone(),
+                                                self.stem_volumes.clone(),
+                                            );
+                                        }
+                                        if !self
+                                            .enabled_listening_indices
+                                            .contains(&i)
+                                        {
+                                            self.enabled_listening_indices.insert(i);
+                                        }
+                                        let linear_gain = 10.0f32.powf(vol / 20.0);
+                                        let live_synced = self.sync_stem_gain_live(
+                                            label.as_ref(),
+                                            linear_gain,
+                                        );
+                                        self.stem_playback_cache = None;
+                                        if !live_synced {
+                                            self.maybe_restart_playback_for_listen_sync();
+                                        }
+                                    }
+
+                                    // Column 3: audible / mute toggle.
+                                    let mute_icon = if audible {
+                                        SPEAKER_HIGH
+                                    } else {
+                                        SPEAKER_LOW
+                                    };
+                                    let mute_resp = icon_toggle_button(
+                                        ui,
+                                        mute_icon,
+                                        if audible {
+                                            "Audible in playback — click to mute"
+                                        } else {
+                                            "Muted — click to unmute"
+                                        },
+                                        audible,
+                                        controls_enabled,
+                                        accent,
+                                    );
+                                    if mute_resp.clicked() {
+                                        let mut live_synced = false;
+                                        if audible {
+                                            self.enabled_listening_indices.remove(&i);
+                                            if !self.enabled_listening_indices.is_empty() {
+                                                live_synced = self.sync_stem_gain_live(
+                                                    label.as_ref(),
+                                                    0.0,
+                                                );
+                                            }
+                                        } else {
+                                            self.enabled_listening_indices.insert(i);
+                                            let vol = self
+                                                .stem_volumes
+                                                .get(label.as_ref())
+                                                .copied()
+                                                .unwrap_or(0.0);
+                                            let linear_gain = 10.0f32.powf(vol / 20.0);
+                                            live_synced = self.sync_stem_gain_live(
+                                                label.as_ref(),
+                                                linear_gain,
+                                            );
+                                        }
+                                        self.stem_playback_cache = None;
+                                        if !live_synced {
+                                            self.maybe_restart_playback_for_listen_sync();
+                                        }
+                                    }
+
+                                    // Column 4: piano visibility toggle.
+                                    let visible = self.enabled_stem_indices.contains(&i);
+                                    let eye_icon = if visible { EYE } else { EYE_SLASH };
+                                    let piano_resp = icon_toggle_button(
+                                        ui,
+                                        eye_icon,
+                                        if visible {
+                                            "Shown on piano — click to hide"
+                                        } else {
+                                            "Hidden from piano — click to show"
+                                        },
+                                        visible,
+                                        controls_enabled,
+                                        accent,
+                                    );
+                                    if piano_resp.clicked() {
+                                        if visible {
+                                            self.enabled_stem_indices.remove(&i);
+                                        } else {
+                                            self.enabled_stem_indices.insert(i);
+                                        }
+                                        self.note_timeline = Arc::new(Vec::new());
+                                        self.note_timeline_step_sec = 0.0;
+                                        self.refresh_note_timeline_from_selected_stems_preserving();
+                                    }
+
+                                    ui.end_row();
+                                }
+                            });
+
+                        ui.add_space(UI_VSPACE_TIGHT);
+                        ui.horizontal(|ui| {
+                            if ui.button("Close").clicked() {
+                                self.show_stem_mixer = false;
+                            }
+                        });
+                    });
+                });
+            });
+    }
+
 
     pub(super) fn draw_sheet_music_view(
         &mut self,
@@ -2160,17 +2154,20 @@ fn draw_scrollable_engraved_preview(
 /// Paints the track itself (like the general volume slider in the media
 /// controls) and fills from the center detent to the handle with the
 /// user-chosen accent color, so the direction and amount of the offset are
-/// visible. Returns true when the value changed.
+/// visible. Returns true when the value changed. When `enabled` is false the
+/// slider is painted dimmed and does not react to clicks or drags.
 fn bipolar_db_slider(
     ui: &mut egui::Ui,
     id: egui::Id,
     vol: &mut f32,
     accent: egui::Color32,
+    enabled: bool,
 ) -> bool {
     const RAIL_W: f32 = 140.0;
     const RAIL_H: f32 = 6.0;
     const HANDLE_R: f32 = 7.0;
     const SNAP_DB: f32 = 0.25;
+    const DIM: f32 = 0.4;
 
     let min = -STEM_GAIN_DB_RANGE;
     let max = STEM_GAIN_DB_RANGE;
@@ -2178,22 +2175,37 @@ fn bipolar_db_slider(
 
     let row_h = ui.spacing().interact_size.y.max(18.0);
     let (rect, mut resp) = ui.push_id(id, |ui| {
-        ui.allocate_exact_size(egui::vec2(RAIL_W, row_h), egui::Sense::click_and_drag())
+        ui.allocate_exact_size(
+            egui::vec2(RAIL_W, row_h),
+            if enabled {
+                egui::Sense::click_and_drag()
+            } else {
+                egui::Sense::hover()
+            },
+        )
     }).inner;
-    resp = resp.on_hover_text(format!(
-        "{:+.1} dB — drag to adjust, double-click resets to 0 dB",
-        *vol
-    ));
+    resp = resp.on_hover_text(if enabled {
+        format!("{:+.1} dB — drag to adjust, double-click resets to 0 dB", *vol)
+    } else {
+        "Inactive — unmute the stem to adjust its volume".to_string()
+    });
 
     // Rail background follows the themed weak fill, like the media-controls
     // volume slider does (hover/active variants included).
     let visuals = ui.visuals();
-    let rail_bg = if resp.is_pointer_button_down_on() || resp.has_focus() {
+    let rail_bg = if !enabled {
+        visuals.widgets.inactive.weak_bg_fill
+    } else if resp.is_pointer_button_down_on() || resp.has_focus() {
         visuals.widgets.active.weak_bg_fill
     } else if resp.hovered() {
         visuals.widgets.hovered.weak_bg_fill
     } else {
         visuals.widgets.inactive.weak_bg_fill
+    };
+    let rail_bg = if enabled {
+        rail_bg
+    } else {
+        rail_bg.gamma_multiply(DIM)
     };
     let rail = egui::Rect::from_center_size(rect.center(), egui::vec2(RAIL_W, RAIL_H));
     ui.painter()
@@ -2223,14 +2235,22 @@ fn bipolar_db_slider(
             egui::pos2(left, rail.top()),
             egui::pos2(right, rail.bottom()),
         );
-        ui.painter().rect_filled(fill, RAIL_H * 0.5, accent);
+        let fill_color = if enabled {
+            accent
+        } else {
+            accent.gamma_multiply(DIM)
+        };
+        ui.painter().rect_filled(fill, RAIL_H * 0.5, fill_color);
     }
 
     // Handle in the standard dark-gray widget fill, like the other sliders.
     let thumb_center = egui::pos2(thumb_x, rect.center().y);
-    let (handle_fill, handle_stroke) = if resp.is_pointer_button_down_on()
-        || resp.has_focus()
-    {
+    let (mut handle_fill, mut handle_stroke) = if !enabled {
+        (
+            visuals.widgets.inactive.bg_fill,
+            visuals.widgets.inactive.fg_stroke,
+        )
+    } else if resp.is_pointer_button_down_on() || resp.has_focus() {
         (
             visuals.widgets.active.bg_fill,
             visuals.widgets.active.fg_stroke,
@@ -2246,6 +2266,10 @@ fn bipolar_db_slider(
             visuals.widgets.inactive.fg_stroke,
         )
     };
+    if !enabled {
+        handle_fill = handle_fill.gamma_multiply(DIM);
+        handle_stroke.color = handle_stroke.color.gamma_multiply(DIM);
+    }
     ui.painter()
         .circle_filled(thumb_center, HANDLE_R, handle_fill);
     ui.painter()
