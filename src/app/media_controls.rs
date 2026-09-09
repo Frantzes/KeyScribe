@@ -544,7 +544,7 @@ pub(super) fn draw_media_controls(
         MEDIA_PANEL_BG_LIGHT
     };
 
-    let inner_w = (full_w - if compact_layout { 20.0 } else { 28.0 }).max(0.0);
+    let inner_w = (full_w - if compact_layout { 36.0 } else { 44.0 }).max(0.0);
 
     let fallback_name = app
         .loaded_path
@@ -600,7 +600,7 @@ pub(super) fn draw_media_controls(
         egui::Layout::top_down(egui::Align::Center),
         |ui| {
             ui.set_min_height(target_h);
-            let frame_resp = egui::Frame::none()
+            egui::Frame::none()
                 .fill(panel_fill)
                 .rounding(egui::Rounding::same(8.0))
                 .inner_margin(if compact_layout {
@@ -608,6 +608,9 @@ pub(super) fn draw_media_controls(
                 } else {
                     egui::Margin::symmetric(14.0, UI_VSPACE_MEDIUM)
                 })
+                // Side gutters: the inner margin would otherwise push the
+                // fill past the window edges at every width.
+                .outer_margin(egui::Margin::symmetric(8.0, 0.0))
                 .show(ui, |ui| {
                     // Force frame width to match the parent width so centering is stable.
                     ui.set_min_width(inner_w);
@@ -765,7 +768,6 @@ pub(super) fn draw_media_controls(
 
                                 ui.add_space(14.0);
 
-                                let loop_popup_id = ui.make_persistent_id("loop_inputs_popup");
                                 let loop_resp = icon_toggle_button(
                                     ui,
                                     REPEAT,
@@ -776,24 +778,6 @@ pub(super) fn draw_media_controls(
                                 );
                                 if loop_resp.clicked() {
                                     app.toggle_loop();
-                                    ui.memory_mut(|mem| {
-                                        if app.loop_enabled {
-                                            mem.open_popup(loop_popup_id);
-                                        } else {
-                                            mem.close_popup();
-                                        }
-                                    });
-                                }
-                                if app.loop_enabled {
-                                    egui::popup::popup_below_widget(
-                                        ui,
-                                        loop_popup_id,
-                                        &loop_resp,
-                                        |ui| {
-                                            ui.set_min_width(320.0);
-                                            draw_loop_inputs(ui, app);
-                                        },
-                                    );
                                 }
 
                                 if with_volume {
@@ -971,8 +955,6 @@ pub(super) fn draw_media_controls(
 
                                         ui.add_space(14.0);
 
-                                        let loop_popup_id =
-                                            ui.make_persistent_id("loop_inputs_popup");
                                         let loop_resp = icon_toggle_button(
                                             ui,
                                             REPEAT,
@@ -983,24 +965,6 @@ pub(super) fn draw_media_controls(
                                         );
                                         if loop_resp.clicked() {
                                             app.toggle_loop();
-                                            ui.memory_mut(|mem| {
-                                                if app.loop_enabled {
-                                                    mem.open_popup(loop_popup_id);
-                                                } else {
-                                                    mem.close_popup();
-                                                }
-                                            });
-                                        }
-                                        if app.loop_enabled {
-                                            egui::popup::popup_below_widget(
-                                                ui,
-                                                loop_popup_id,
-                                                &loop_resp,
-                                                |ui| {
-                                                    ui.set_min_width(320.0);
-                                                    draw_loop_inputs(ui, app);
-                                                },
-                                            );
                                         }
                                     });
 
@@ -1031,6 +995,54 @@ pub(super) fn draw_media_controls(
                 });
         },
     );
+}
+
+/// Loop editor pill: floats over the bottom edge of the waveform, centered.
+/// Appears while looping is active, disappears when it is not.
+pub(crate) fn draw_loop_pill(
+    ui: &mut egui::Ui,
+    app: &mut KeyScribeApp,
+    content_bottom: f32,
+    content_left: f32,
+    avail_w: f32,
+) {
+    if !app.loop_enabled {
+        return;
+    }
+    let widget_h = ui.spacing().interact_size.y.clamp(30.0, 42.0);
+    // Exact content width: four step buttons + two time fields + the dash
+    // separator + gaps (including the trailing spacing egui appends after
+    // the last row item), plus the frame's side margins.
+    let pill_w = (4.0 * widget_h + 2.0 * 46.0 + 12.0 + 7.0 * 4.0 + 20.0)
+        .min(avail_w - 16.0)
+        .max(180.0);
+    // Frame inner margin is 6 top + 6 bottom: exact fit, so the row sits
+    // vertically centered with no slack.
+    let pill_h = widget_h + 12.0;
+    let pill_rect = egui::Rect::from_min_size(
+        egui::pos2(
+            content_left + (avail_w - pill_w) * 0.5,
+            content_bottom - pill_h + 8.0,
+        ),
+        egui::vec2(pill_w, pill_h),
+    );
+    ui.allocate_ui_at_rect(pill_rect, |ui| {
+        let fill = if app.dark_mode {
+            crate::theme::MEDIA_PANEL_BG_DARK
+        } else {
+            crate::theme::MEDIA_PANEL_BG_LIGHT
+        };
+        egui::Frame::none()
+            .fill(fill)
+            .rounding(egui::Rounding::same(10.0))
+            .inner_margin(egui::Margin::symmetric(10.0, 6.0))
+            .show(ui, |ui| {
+                // Content box excludes the frame's own margins: sizing to the
+                // full pill size would overflow the pill rect to the right.
+                ui.set_min_size(egui::vec2(pill_w - 20.0, pill_h - 12.0));
+                draw_loop_inputs(ui, app);
+            });
+    });
 }
 
 fn draw_loop_inputs(ui: &mut egui::Ui, app: &mut KeyScribeApp) {
@@ -1083,10 +1095,10 @@ fn draw_loop_inputs(ui: &mut egui::Ui, app: &mut KeyScribeApp) {
         changed = true;
     }
     let start_resp = ui.add_sized(
-        [58.0, widget_h],
+        [46.0, widget_h],
         egui::TextEdit::singleline(&mut app.loop_start_input_str)
             .id(start_id)
-            .margin(egui::vec2(4.0, 2.0)),
+            .margin(egui::vec2(4.0, (widget_h - 16.0) * 0.5)),
     );
     if small_step_button(ui, "start_plus", PLUS, "Add 1 second to loop start") {
         new_start = (start + 1.0).min(end - 0.1);
@@ -1114,10 +1126,10 @@ fn draw_loop_inputs(ui: &mut egui::Ui, app: &mut KeyScribeApp) {
         changed = true;
     }
     let end_resp = ui.add_sized(
-        [58.0, widget_h],
+        [46.0, widget_h],
         egui::TextEdit::singleline(&mut app.loop_end_input_str)
             .id(end_id)
-            .margin(egui::vec2(4.0, 2.0)),
+            .margin(egui::vec2(4.0, (widget_h - 16.0) * 0.5)),
     );
     if small_step_button(ui, "end_plus", PLUS, "Add 1 second to loop end") {
         new_end = (end + 1.0).min(duration);

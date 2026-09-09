@@ -972,6 +972,8 @@ pub struct KeyScribeApp {
     enabled_stem_indices: std::collections::BTreeSet<usize>,
     pending_listening_indices: std::collections::BTreeSet<usize>,
     show_stem_mixer: bool,
+    /// Cog toggle under the piano: reveals the keyboard settings sliders.
+    show_piano_settings: bool,
     stem_mixer_anchor: Option<egui::Rect>,
     pending_seek: Option<f32>,
     pending_seek_age: u32,
@@ -1395,6 +1397,7 @@ impl KeyScribeApp {
             enabled_stem_indices: std::collections::BTreeSet::new(),
             pending_listening_indices: std::collections::BTreeSet::new(),
             show_stem_mixer: false,
+            show_piano_settings: false,
             stem_mixer_anchor: None,
             pending_seek: None,
             pending_seek_age: 0,

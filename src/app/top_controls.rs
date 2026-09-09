@@ -1,15 +1,16 @@
 use super::*;
 use crate::theme::{
-    SLIDER_RAIL_BG_ACTIVE_DARK, SLIDER_RAIL_BG_ACTIVE_LIGHT, SLIDER_RAIL_BG_DARK,
-    SLIDER_RAIL_BG_HOVER_DARK, SLIDER_RAIL_BG_HOVER_LIGHT, SLIDER_RAIL_BG_LIGHT,
+    MEDIA_PANEL_BG_DARK, MEDIA_PANEL_BG_LIGHT, SLIDER_RAIL_BG_ACTIVE_DARK,
+    SLIDER_RAIL_BG_ACTIVE_LIGHT, SLIDER_RAIL_BG_DARK, SLIDER_RAIL_BG_HOVER_DARK,
+    SLIDER_RAIL_BG_HOVER_LIGHT, SLIDER_RAIL_BG_LIGHT,
 };
+use crate::ui::widgets::synth_knob;
 
 const TOOLBAR_MENU_MIN_WIDTH: f32 = 360.0;
 const SETTINGS_RGB_SLIDER_MAX_WIDTH: f32 = 220.0;
 const CONTROLS_PANEL_HORIZONTAL_PADDING: f32 = 6.0;
 const CONTROLS_PANEL_VERTICAL_PADDING: f32 = UI_VSPACE_COMPACT;
 const SHORTCUTS_MODAL_WIDTH: f32 = 470.0;
-pub(super) const COMPACT_PARAM_LABEL_W: f32 = 46.0;
 
 fn get_dir_size(path: impl AsRef<std::path::Path>) -> std::io::Result<u64> {
     let mut size = 0;
@@ -1353,149 +1354,150 @@ impl KeyScribeApp {
         changed
     }
 
-    /// Compact Speed + Pitch pair used inside the merged top row: text
-    /// label, fixed-width slider and a small draggable value.
-    /// Double-clicking the value resets to the default.
-    pub(super) fn draw_compact_speed_pitch(
-        &mut self,
-        ui: &mut egui::Ui,
-        slider_w: f32,
-        value_w: f32,
-        row_h: f32,
-    ) {
-        let speed_changed = Self::compact_param_slider(
-            ui,
-            "Speed",
-            &mut self.speed,
-            0.5,
-            2.0,
-            "x",
-            0.01,
-            2,
-            1.0,
-            slider_w,
-            value_w,
-            row_h,
-        );
-        let pitch_changed = Self::compact_param_slider(
-            ui,
-            "Pitch",
-            &mut self.pitch_semitones,
-            -12.0,
-            12.0,
-            " st",
-            0.1,
-            1,
-            0.0,
-            slider_w,
-            value_w,
-            row_h,
-        );
+    /// Compact Speed + Pitch synth knobs used inside the merged top row.
+    /// Values shown under each knob; drag to change, Shift-drag for fine
+    /// steps, double-click resets to the default. Commits go through the
+    /// same pending-param debounce as the previous sliders.
+    /// Speed/Pitch controls: desktop gets a pair of sliders; compact widths
+    /// get two knobs evenly distributed across the space left of the view
+    /// cluster.
+    pub(super) fn draw_speed_pitch_controls(&mut self, ui: &mut egui::Ui, compact: bool) -> bool {
+        let accent = self.highlight_color;
+        let mut changed = false;
 
-        if speed_changed || pitch_changed {
+        if compact {
+            let knob_size: f32 = 30.0;
+            let cell_h = 11.0 + knob_size + 12.0 + 8.0;
+            let rest = ui.available_width().max(0.0);
+            // Equal halves of the remaining space.
+            ui.columns(2, |cols| {
+                for (ci, col) in cols.iter_mut().enumerate() {
+                    let col_w = col.available_width();
+                    col.allocate_ui_with_layout(
+                        egui::vec2(col_w, cell_h),
+                        egui::Layout::top_down(egui::Align::Center),
+                        |ui| {
+                            ui.set_min_width(col_w);
+                            ui.spacing_mut().item_spacing.y = 2.0;
+                            if ci == 0 {
+                                ui.label(egui::RichText::new("Speed").size(11.0));
+                                changed |= synth_knob(
+                                    ui,
+                                    ("top_param_knob", "speed"),
+                                    &mut self.speed,
+                                    0.5,
+                                    2.0,
+                                    1.0,
+                                    knob_size,
+                                    accent,
+                                    false,
+                                    true,
+                                    false,
+                                    0.01,
+                                );
+                                ui.label(
+                                    egui::RichText::new(format!("{:.2}x", self.speed))
+                                        .monospace()
+                                        .size(10.0),
+                                );
+                            } else {
+                                ui.label(egui::RichText::new("Pitch").size(11.0));
+                                changed |= synth_knob(
+                                    ui,
+                                    ("top_param_knob", "pitch"),
+                                    &mut self.pitch_semitones,
+                                    -12.0,
+                                    12.0,
+                                    0.0,
+                                    knob_size,
+                                    accent,
+                                    true,
+                                    true,
+                                    false,
+                                    0.1,
+                                );
+                                ui.label(
+                                    egui::RichText::new(format!("{:+.1} st", self.pitch_semitones))
+                                        .monospace()
+                                        .size(10.0),
+                                );
+                            }
+                        },
+                    );
+                }
+            });
+        } else {
+            // Desktop: label above a slider with a live value readout.
+            ui.add_space(8.0);
+
+            // One chip behind both sliders: keeps their rails visible on the
+            // transparent wallpaper and stops them stretching into the
+            // cluster's space.
+            let chip_fill = if self.dark_mode {
+                MEDIA_PANEL_BG_DARK
+            } else {
+                MEDIA_PANEL_BG_LIGHT
+            };
+            egui::Frame::none()
+                .fill(chip_fill)
+                .rounding(egui::Rounding::same(8.0))
+                .inner_margin(egui::Margin::symmetric(8.0, 6.0))
+                .show(ui, |ui| {
+                    ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
+                        ui.spacing_mut().item_spacing.x = 8.0;
+
+                        ui.label(egui::RichText::new("Speed").size(10.0));
+                        ui.allocate_ui_with_layout(
+                            egui::vec2(100.0, 18.0),
+                            egui::Layout::left_to_right(egui::Align::Center),
+                            |ui| {
+                                changed |= ui
+                                    .add(
+                                        egui::Slider::new(&mut self.speed, 0.5..=2.0)
+                                            .show_value(false)
+                                            .smart_aim(false),
+                                    )
+                                    .changed();
+                            },
+                        );
+                        ui.label(
+                            egui::RichText::new(format!("{:.2}x", self.speed))
+                                .monospace()
+                                .size(10.0),
+                        );
+
+                        ui.add_space(6.0);
+
+                        ui.label(egui::RichText::new("Pitch").size(10.0));
+                        ui.allocate_ui_with_layout(
+                            egui::vec2(100.0, 18.0),
+                            egui::Layout::left_to_right(egui::Align::Center),
+                            |ui| {
+                                changed |= ui
+                                    .add(
+                                        egui::Slider::new(&mut self.pitch_semitones, -12.0..=12.0)
+                                            .show_value(false)
+                                            .smart_aim(false),
+                                    )
+                                    .changed();
+                            },
+                        );
+                        ui.label(
+                            egui::RichText::new(format!("{:+.1} st", self.pitch_semitones))
+                                .monospace()
+                                .size(10.0),
+                        );
+                    });
+                });
+
+        }
+
+        if changed {
             self.pending_param_change = true;
             self.last_param_change_at = Some(Instant::now());
         }
-
         let pointer_down = ui.input(|i| i.pointer.primary_down());
         self.maybe_commit_pending_param_change(pointer_down);
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    pub(super) fn compact_param_slider(
-        ui: &mut egui::Ui,
-        label: &str,
-        value: &mut f32,
-        min: f32,
-        max: f32,
-        suffix: &str,
-        drag_speed: f64,
-        max_decimals: usize,
-        reset_value: f32,
-        slider_w: f32,
-        value_w: f32,
-        row_h: f32,
-    ) -> bool {
-        let mut changed = false;
-        let dark = ui.visuals().dark_mode;
-        let rail_fill = if dark {
-            SLIDER_RAIL_BG_DARK
-        } else {
-            SLIDER_RAIL_BG_LIGHT
-        };
-        let rail_fill_hover = if dark {
-            SLIDER_RAIL_BG_HOVER_DARK
-        } else {
-            SLIDER_RAIL_BG_HOVER_LIGHT
-        };
-        let rail_fill_active = if dark {
-            SLIDER_RAIL_BG_ACTIVE_DARK
-        } else {
-            SLIDER_RAIL_BG_ACTIVE_LIGHT
-        };
-
-        ui.allocate_ui_with_layout(
-            egui::vec2(COMPACT_PARAM_LABEL_W + 8.0 + slider_w + 8.0 + value_w, row_h),
-            egui::Layout::left_to_right(egui::Align::Min),
-            |ui| {
-                ui.spacing_mut().item_spacing.x = 8.0;
-
-                let label_font = egui::TextStyle::Body.resolve(ui.style());
-                let (label_rect, label_resp) = ui.allocate_exact_size(
-                    egui::vec2(COMPACT_PARAM_LABEL_W, row_h),
-                    egui::Sense::hover(),
-                );
-                ui.painter().text(
-                    label_rect.left_center(),
-                    egui::Align2::LEFT_CENTER,
-                    label,
-                    label_font,
-                    ui.visuals().text_color(),
-                );
-                label_resp.on_hover_text(if label == "Speed" {
-                    "Playback Speed (double-click the value to reset)"
-                } else {
-                    "Pitch in semitones (double-click the value to reset)"
-                });
-
-                ui.scope(|ui| {
-                    let visuals = ui.visuals_mut();
-                    visuals.slider_trailing_fill = true;
-                    visuals.widgets.inactive.bg_fill = rail_fill;
-                    visuals.widgets.hovered.bg_fill = rail_fill_hover;
-                    visuals.widgets.active.bg_fill = rail_fill_active;
-                    visuals.widgets.inactive.weak_bg_fill = rail_fill;
-                    visuals.widgets.hovered.weak_bg_fill = rail_fill_hover;
-                    visuals.widgets.active.weak_bg_fill = rail_fill_active;
-                    visuals.widgets.inactive.bg_stroke = egui::Stroke::new(1.0, rail_fill);
-                    visuals.widgets.hovered.bg_stroke = egui::Stroke::new(1.0, rail_fill_hover);
-                    visuals.widgets.active.bg_stroke = egui::Stroke::new(1.0, rail_fill_active);
-
-                    ui.spacing_mut().slider_width = slider_w;
-                    changed |= ui
-                        .add_sized(
-                            [slider_w, row_h],
-                            egui::Slider::new(value, min..=max).show_value(false),
-                        )
-                        .changed();
-                });
-
-                let value_resp = ui.add_sized(
-                    [value_w, row_h],
-                    egui::DragValue::new(value)
-                        .clamp_range(min..=max)
-                        .speed(drag_speed)
-                        .max_decimals(max_decimals)
-                        .suffix(suffix),
-                );
-                changed |= value_resp.changed();
-                if value_resp.double_clicked() {
-                    *value = reset_value;
-                    changed = true;
-                }
-            },
-        );
-
         changed
     }
 

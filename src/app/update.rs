@@ -326,7 +326,53 @@ impl eframe::App for KeyScribeApp {
                 }
 
                 ui.add_space(UI_VSPACE_TIGHT);
+                ui.add_space(UI_VSPACE_TIGHT);
+                // Cog toggle (bottom-right under the piano): reveals/hides
+                // the keyboard settings sliders below. Hand-painted in a
+                // fixed-height row: a with_layout child Ui here makes the
+                // bottom panel's auto-height run away.
+                let cog_size = 30.0_f32;
+                let row_w = ui.available_width();
+                let (cog_row_rect, _) =
+                    ui.allocate_exact_size(egui::vec2(row_w, cog_size), egui::Sense::hover());
+                let cog_rect = egui::Rect::from_min_size(
+                    egui::pos2(
+                        cog_row_rect.right() - cog_size - 6.0,
+                        cog_row_rect.center().y - cog_size * 0.5,
+                    ),
+                    egui::vec2(cog_size, cog_size),
+                );
+                let cog = ui
+                    .interact(
+                        cog_rect,
+                        egui::Id::new("piano_settings_cog"),
+                        egui::Sense::click(),
+                    )
+                    .on_hover_text(if self.show_piano_settings {
+                        "Hide keyboard settings"
+                    } else {
+                        "Keyboard settings"
+                    });
+                let cog_visuals = ui.style().interact(&cog);
+                ui.painter().rect(
+                    cog_rect,
+                    6.0,
+                    cog_visuals.bg_fill,
+                    cog_visuals.bg_stroke,
+                );
+                ui.painter().text(
+                    cog_rect.center(),
+                    egui::Align2::CENTER_CENTER,
+                    egui_phosphor::regular::GEAR,
+                    crate::ui::widgets::icon_font_id(16.0),
+                    cog_visuals.text_color(),
+                );
+                if cog.clicked() {
+                    self.show_piano_settings = !self.show_piano_settings;
+                }
+                ui.add_space(UI_VSPACE_TIGHT);
                 ui.spacing_mut().item_spacing.y = default_item_spacing_y.min(UI_VSPACE_TIGHT);
+                if self.show_piano_settings {
                 egui::Frame::none()
                     .inner_margin(egui::Margin::symmetric(12.0, UI_VSPACE_TIGHT))
                     .show(ui, |ui| {
@@ -527,6 +573,7 @@ impl eframe::App for KeyScribeApp {
                         }
 
                     });
+                }
                 ui.add_space(UI_VSPACE_TIGHT);
                 ui.spacing_mut().item_spacing.y = default_item_spacing_y;
             });
@@ -596,6 +643,11 @@ impl eframe::App for KeyScribeApp {
                 ui.add_space(UI_VSPACE_TIGHT);
                 draw_horizontal_separator(ui, 0.0);
                 ui.add_space(UI_VSPACE_TIGHT);
+
+                // Stem mixer strip (toggled from the top bar): sits between
+                // the top row and the waveform; its height shrinks the
+                // content area below automatically.
+                self.draw_stem_strip(ui);
 
                 // Absolute layout stability: calculate exact rects for content and footer
                 let full_avail_h = ui.available_height().max(0.0);
@@ -1180,6 +1232,11 @@ impl eframe::App for KeyScribeApp {
                         }
                     }
                 });
+
+                // Loop editor pill floats over the waveform's bottom edge,
+                // centered; the media footer below tucks over its lower
+                // pixels so it reads as pinned to the waveform.
+                crate::app::media_controls::draw_loop_pill(ui, self, content_rect.bottom(), start_pos.x, full_avail_w);
 
                 // 2. Media Footer (Pinned to bottom)
                 ui.allocate_ui_at_rect(footer_rect, |ui| {
