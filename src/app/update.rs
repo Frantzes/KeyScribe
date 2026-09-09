@@ -1,7 +1,24 @@
 use super::*;
 
+/// Repaint pacing.
+///
+/// `ACTIVE_REPAINT_INTERVAL` / `IDLE_REPAINT_INTERVAL` (in `app.rs`) drive
+/// the visible window. A minimized window skips drawing entirely and just
+/// pumps background channels (playback, loading, analysis, loop handling,
+/// autosave) at a low wake rate: presenting into a hidden surface is pure
+/// waste, and on some drivers (notably NVIDIA egl-wayland with vsync on) a
+/// hidden swap can stall the main thread, tripping the compositor's
+/// "not responding" dialog. The NVIDIA + Wayland case is additionally
+/// covered by defaulting vsync off there (see `main.rs`).
+const MINIMIZED_REPAINT_INTERVAL: Duration = Duration::from_millis(500);
+
 impl eframe::App for KeyScribeApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        // Visibility first: the minimized branch below depends on this.
+        // (Note: on Linux/Wayland this is always `Some(false)`/None — winit
+        // reports minimized on Windows/macOS only — so workspace-hidden
+        // windows are handled via the vsync default in `main.rs` instead.)
+        let minimized = ctx.input(|i| i.viewport().minimized.unwrap_or(false));
         apply_brand_theme(ctx, self.dark_mode, self.highlight_color);
         self.lock_startup_min_window_size_once(ctx);
         self.apply_mobile_ui_tweaks_once(ctx);
@@ -108,10 +125,18 @@ impl eframe::App for KeyScribeApp {
             && !self.separation_attempted
         {
             let current_model = self.current_separation_model_name();
-            if self.load_stems_for_model(&current_model) {
-                // Cached stems exist — loaded instantly from cache!
+            if self.loaded_stems_model_name.as_deref() == Some(&current_model)
+                && self.separated_stems.is_some()
+            {
                 self.separation_attempted = true;
-            } else if self.auto_separate {
+            } else if !self.stem_cache_miss {
+                // Kick off the background cache load (idempotent); the result
+                // applies in poll_stem_cache_result without blocking the UI.
+                // Auto-separation waits for a confirmed miss (no double work,
+                // and no re-request loop after a miss).
+                self.request_cached_stems(&current_model);
+            }
+            if self.separated_stems.is_none() && self.stem_cache_miss && self.auto_separate {
                 let duration = self.source_duration() as f64;
                 if duration > super::AUTO_SEPARATE_MAX_DURATION_SEC {
                     self.separation_attempted = true;
@@ -129,7 +154,11 @@ impl eframe::App for KeyScribeApp {
 
         self.poll_processing_result();
         self.poll_separation_result();
+        self.poll_stem_cache_result();
         self.poll_stem_analysis_result();
+        self.poll_cache_precheck_result();
+        #[cfg(feature = "desktop-ui")]
+        self.poll_file_dialog_result(ctx);
         self.poll_streaming_playback();
         self.poll_sheet_preview(ctx);
         self.poll_sheet_rendering(ctx);
@@ -140,6 +169,24 @@ impl eframe::App for KeyScribeApp {
         // can miss one and then swallow all later pushes).
         if ctx.input(|i| i.pointer.any_released() || !i.pointer.primary_down()) {
             self.mix_press_pushed = false;
+        }
+
+        // Minimized: the surface is hidden, so skip every draw call and only
+        // pump background state above. Playback, loading, analysis, loop
+        // handling and autosave all continue via the polls above; drawing
+        // resumes on restore with state already current.
+        // (Note: on Linux/Wayland winit cannot report minimized, and egui
+        // 0.27 has no occlusion flag, so workspace-hidden windows keep
+        // rendering — made safe on NVIDIA + Wayland by defaulting vsync off
+        // in `main.rs`, since a vsync'd hidden swap is what wedged the main
+        // thread and tripped the hang dialog.)
+        if minimized {
+            ctx.request_repaint_after(MINIMIZED_REPAINT_INTERVAL);
+            if self.last_state_save_at.elapsed() >= Duration::from_secs(2) {
+                self.save_state_to_disk();
+                self.last_state_save_at = Instant::now();
+            }
+            return;
         }
 
         self.draw_top_controls_panel(ctx);

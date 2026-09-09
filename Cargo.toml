@@ -27,6 +27,8 @@ desktop-ui = [
 
 [dependencies]
 anyhow = "1.0"
+libloading = "0.8"
+pollster = "0.3"
 eframe = { version = "0.27", optional = true }
 egui_plot = { version = "0.27", optional = true }
 egui-phosphor = { version = "0.5", optional = true }

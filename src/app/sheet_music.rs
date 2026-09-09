@@ -1,5 +1,4 @@
 use std::collections::HashMap;
-use std::path::PathBuf;
 use std::process::Command;
 use std::sync::mpsc::TryRecvError;
 
@@ -1569,6 +1568,30 @@ impl KeyScribeApp {
 
     fn export_sheet_musicxml(&mut self, ctx: &egui::Context) {
         self.refresh_sheet_preview_if_needed(ctx);
+        if self.sheet_preview_cache.is_none() {
+            self.last_error = Some("No sheet preview available to export.".to_string());
+            return;
+        }
+
+        // The save dialog runs on a worker thread (see `spawn_file_dialog`)
+        // so browsing for a destination never stalls the event loop; the
+        // file is written in `finish_musicxml_export` on choice.
+        let file_stem = self.export_file_stem();
+        #[cfg(feature = "desktop-ui")]
+        self.spawn_file_dialog(
+            ctx,
+            super::runtime::FileDialogRequest::SaveMusicXml(file_stem),
+        );
+        #[cfg(not(feature = "desktop-ui"))]
+        {
+            let _ = ctx;
+            self.finish_musicxml_export(
+                &app_data_dir().join(format!("{file_stem}.musicxml")),
+            );
+        }
+    }
+
+    pub(super) fn finish_musicxml_export(&mut self, path: &Path) {
         let Some(preview) = self.sheet_preview_cache.as_ref() else {
             self.last_error = Some("No sheet preview available to export.".to_string());
             return;
@@ -1586,17 +1609,32 @@ impl KeyScribeApp {
             engraving_config,
         );
 
-        if let Some(path) = self.pick_musicxml_export_path(file_stem.as_str()) {
-            if fs::write(path.as_path(), xml.as_bytes()).is_ok() {
-                self.last_error = None;
-            } else {
-                self.last_error = Some("Failed to write MusicXML export.".to_string());
-            }
+        if fs::write(path, xml.as_bytes()).is_ok() {
+            self.last_error = None;
+        } else {
+            self.last_error = Some("Failed to write MusicXML export.".to_string());
         }
     }
 
     fn export_sheet_pdf(&mut self, ctx: &egui::Context) {
         self.refresh_sheet_preview_if_needed(ctx);
+        if self.sheet_preview_cache.is_none() {
+            self.last_error = Some("No sheet preview available to export.".to_string());
+            return;
+        }
+
+        // Async save dialog (see above); written in `finish_pdf_export`.
+        let file_stem = self.export_file_stem();
+        #[cfg(feature = "desktop-ui")]
+        self.spawn_file_dialog(ctx, super::runtime::FileDialogRequest::SavePdf(file_stem));
+        #[cfg(not(feature = "desktop-ui"))]
+        {
+            let _ = ctx;
+            self.finish_pdf_export(&app_data_dir().join(format!("{file_stem}.pdf")));
+        }
+    }
+
+    pub(super) fn finish_pdf_export(&mut self, pdf_path: &Path) {
         let Some(preview) = self.sheet_preview_cache.as_ref() else {
             self.last_error = Some("No sheet preview available to export.".to_string());
             return;
@@ -1613,10 +1651,6 @@ impl KeyScribeApp {
             &preview.foundation,
             engraving_config,
         );
-
-        let Some(pdf_path) = self.pick_pdf_export_path(file_stem.as_str()) else {
-            return;
-        };
 
         let sibling_xml_path = pdf_path.with_extension("musicxml");
         if fs::write(sibling_xml_path.as_path(), xml.as_bytes()).is_err() {
@@ -1624,7 +1658,7 @@ impl KeyScribeApp {
             return;
         }
 
-        match export_engraved_pdf_with_musescore(sibling_xml_path.as_path(), pdf_path.as_path()) {
+        match export_engraved_pdf_with_musescore(sibling_xml_path.as_path(), pdf_path) {
             Ok(()) => {
                 self.last_error = None;
             }
@@ -1714,36 +1748,6 @@ impl KeyScribeApp {
             .unwrap_or("keyscribe-sheet");
 
         sanitize_filename_component(raw)
-    }
-
-    fn pick_musicxml_export_path(&self, file_stem: &str) -> Option<PathBuf> {
-        #[cfg(feature = "desktop-ui")]
-        {
-            return FileDialog::new()
-                .add_filter("MusicXML", &["musicxml", "xml"])
-                .set_file_name(&format!("{file_stem}.musicxml"))
-                .save_file();
-        }
-
-        #[cfg(not(feature = "desktop-ui"))]
-        {
-            Some(app_data_dir().join(format!("{file_stem}.musicxml")))
-        }
-    }
-
-    fn pick_pdf_export_path(&self, file_stem: &str) -> Option<PathBuf> {
-        #[cfg(feature = "desktop-ui")]
-        {
-            return FileDialog::new()
-                .add_filter("PDF", &["pdf"])
-                .set_file_name(&format!("{file_stem}.pdf"))
-                .save_file();
-        }
-
-        #[cfg(not(feature = "desktop-ui"))]
-        {
-            Some(app_data_dir().join(format!("{file_stem}.pdf")))
-        }
     }
 }
 

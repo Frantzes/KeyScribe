@@ -16,9 +16,6 @@ use egui_plot::{Line, Plot, PlotBounds, PlotPoints, Polygon, VLine};
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 
-#[cfg(feature = "desktop-ui")]
-use rfd::FileDialog;
-
 use crate::analysis::{
     analyze_with_full_pipeline, detect_note_probabilities, PIANO_HIGH_MIDI, PIANO_KEY_COUNT,
     PIANO_LOW_MIDI,
@@ -1156,6 +1153,11 @@ pub struct KeyScribeApp {
     cache_status_message: Option<String>,
     cache_status_message_at: Option<Instant>,
     cache_precheck_done: bool,
+    /// Background analysis-cache precheck (see `cache.rs`). File reads +
+    /// decompression run off the event loop so the compositor never sees a
+    /// stalled UI while a file loads.
+    cache_precheck_rx:
+        Option<mpsc::Receiver<cache::CachePrecheckResult>>,
     loading_cache_timeline_preloaded: bool,
     loading_cache_waveform_preloaded: bool,
     pending_param_change: bool,
@@ -1197,6 +1199,9 @@ pub struct KeyScribeApp {
     separation_attempted: bool,
     separation_progress: Arc<std::sync::atomic::AtomicU32>,
     separation_rx: Option<Receiver<SeparationResult>>,
+    stem_cache_rx: Option<Receiver<Option<Vec<crate::leadsheet::SeparatedStem>>>>,
+    stem_cache_pending_model: Option<String>,
+    stem_cache_miss: bool,
     loading_sample_rate: u32,
     loading_total_samples: Option<usize>,
     loading_decoded_samples: usize,
@@ -1240,6 +1245,20 @@ pub struct KeyScribeApp {
         Option<std::sync::mpsc::Receiver<(SheetPreviewCacheKey, Result<SheetPreviewData, String>)>>,
     stem_playback_cache: Option<StemPlaybackCache>,
     cache_size_bytes: Option<Option<u64>>,
+    /// Background `get_dir_size` computation for the Preferences cache row.
+    /// Recursive directory walks stay off the event loop.
+    cache_size_rx: Option<mpsc::Receiver<u64>>,
+    cache_size_pending: bool,
+    /// In-flight native file dialog (open/save/folder). Portal dialogs can
+    /// stay open for minutes; they run on a worker thread and the result is
+    /// collected in `poll_file_dialog_result` so the event loop — and with
+    /// it compositor pings — never stalls.
+    #[cfg(feature = "desktop-ui")]
+    file_dialog_rx: Option<mpsc::Receiver<runtime::FileDialogResult>>,
+    /// Last MVSep key value persisted to the user `.env` file. The periodic
+    /// state save only touches `.env` when the key actually changed instead
+    /// of rewriting it every 2 seconds.
+    mvsep_key_last_persisted: String,
 
     // Export UI
     export_stems_modal_open: bool,
@@ -1453,19 +1472,6 @@ struct EngravedSheetPage {
     note_positions: Vec<NotePosition>,
 }
 
-#[derive(Default)]
-struct CachePrecheckDiagnostics {
-    total_candidates: usize,
-    existing_files: usize,
-    parsed_blobs: usize,
-    read_failures: usize,
-    decompress_failures: usize,
-    deserialize_failures: usize,
-    shared_param_mismatches: usize,
-    strict_len_mismatches: usize,
-    invalid_timeline_blobs: usize,
-}
-
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum RebuildMode {
     Full,
@@ -1595,6 +1601,7 @@ impl KeyScribeApp {
             cache_status_message: None,
             cache_status_message_at: None,
             cache_precheck_done: false,
+            cache_precheck_rx: None,
             loading_cache_timeline_preloaded: false,
             loading_cache_waveform_preloaded: false,
             pending_param_change: false,
@@ -1640,6 +1647,9 @@ impl KeyScribeApp {
             separation_attempted: false,
             separation_progress: Arc::new(std::sync::atomic::AtomicU32::new(0)),
             separation_rx: None,
+            stem_cache_rx: None,
+            stem_cache_pending_model: None,
+            stem_cache_miss: false,
             loading_sample_rate: 0,
             loading_total_samples: None,
             loading_decoded_samples: 0,
@@ -1681,6 +1691,11 @@ impl KeyScribeApp {
             sheet_preview_result_rx: None,
             stem_playback_cache: None,
             cache_size_bytes: None,
+            cache_size_rx: None,
+            cache_size_pending: false,
+            #[cfg(feature = "desktop-ui")]
+            file_dialog_rx: None,
+            mvsep_key_last_persisted: String::new(),
             export_stems_modal_open: false,
             export_midi_modal_open: false,
             export_selected_stems: std::collections::HashSet::new(),
@@ -1728,6 +1743,9 @@ impl KeyScribeApp {
         }
 
         app.refresh_audio_output_devices();
+        // Seed the `.env` write tracker so the periodic autosave doesn't
+        // rewrite the key file on the first tick when nothing changed.
+        app.mvsep_key_last_persisted = app.mvsep_api_key.trim().to_string();
         if let Some(selected) = app.audio_output_device_id.clone() {
             let exists = app.audio_output_devices.iter().any(|d| d.id == selected);
             if !exists {

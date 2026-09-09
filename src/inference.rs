@@ -3,6 +3,146 @@
 use anyhow::{anyhow, Result};
 use ort::{session::Session, value::Tensor};
 use std::path::{Path, PathBuf};
+use std::sync::{Mutex, MutexGuard, Once};
+
+/// Process-wide lock around ONNX Runtime *session construction*
+/// (`Session::builder()`, `commit_from_file`, `ort::init_from`).
+///
+/// ort's global init (`G_ORT_LIB` / `G_ORT_API`) is not safe against
+/// concurrent first-use from multiple threads: when the runtime library
+/// fails to load, the error-formatting path re-enters the half-initialized
+/// globals while another thread is still initializing them, and both threads
+/// park forever. The analysis worker, stem-analysis worker and separation
+/// worker can all build sessions at once, so without this lock a missing
+/// `libonnxruntime` (or a slow first init) wedges every transcription at
+/// "Analyzing..." with `is_processing` stuck forever instead of failing
+/// fast with a readable error. Construction is rare (once per job/model),
+/// so serializing it costs nothing; `session.run` inference itself stays
+/// concurrent (basic-pitch runs are additionally serialized by
+/// `BASIC_PITCH_ENGINE`, as before).
+pub(crate) static ORT_SESSION_LOCK: Mutex<()> = Mutex::new(());
+
+pub(crate) fn ort_session_guard() -> MutexGuard<'static, ()> {
+    ORT_SESSION_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+/// Verify the ONNX Runtime shared library can actually be loaded, *before*
+/// touching any ort API.
+///
+/// Background: with `load-dynamic`, ort resolves `G_ORT_LIB` lazily, and a
+/// failed load formats its error via `Error::new` → `ort::api()` →
+/// `G_ORT_API` init → `setup_api` → back into `G_ORT_LIB` init, which is
+/// still in progress on the same thread. `std::sync::Once` parks forever on
+/// re-entrant init, so the FIRST session construction on a machine without
+/// a loadable runtime deadlocks single-threadedly instead of returning an
+/// error — every transcription wedges at "Analyzing..." with no message.
+/// Probing with the real OS loader first turns that into a fast, actionable
+/// error. The probe mirrors ort's own search order (explicit
+/// `ORT_DYLIB_PATH`, exe-adjacent, system search), so anything the probe
+/// accepts, ort will load too.
+pub(crate) fn ensure_onnxruntime_loadable() -> Result<()> {
+    fn probe(path: &Path) -> bool {
+        // SAFETY: immediately dropped; only tests OS loader resolvability.
+        unsafe { libloading::Library::new(path).is_ok() }
+    }
+
+    let mut tried: Vec<PathBuf> = Vec::new();
+    if let Ok(s) = std::env::var("ORT_DYLIB_PATH") {
+        if !s.trim().is_empty() {
+            tried.push(PathBuf::from(s.trim()));
+        }
+    }
+    let lib_name = if cfg!(target_os = "windows") {
+        "onnxruntime.dll"
+    } else if cfg!(target_os = "linux") {
+        "libonnxruntime.so"
+    } else {
+        "libonnxruntime.dylib"
+    };
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(parent) = exe.parent() {
+            tried.push(parent.join(lib_name));
+        }
+    }
+    tried.push(PathBuf::from(lib_name));
+
+    if tried.iter().any(|p| probe(p)) {
+        return Ok(());
+    }
+
+    let searched = tried
+        .iter()
+        .map(|p| format!("'{}'", p.display()))
+        .collect::<Vec<_>>()
+        .join(", ");
+    Err(anyhow!(
+        "ONNX Runtime library ({lib_name}) could not be loaded (searched {searched}). \
+         Transcription and stem separation need it: place {lib_name} next to the \
+         executable or install it system-wide."
+    ))
+}
+
+/// Initialize the ONNX Runtime environment from a bundled
+/// `onnxruntime` shared library.
+///
+/// With the `load-dynamic` feature, ort loads the runtime library at
+/// runtime instead of linking it at build time. We search for it next to
+/// the executable (portable bundle) and in the working directory (dev
+/// layout), then call `ort::init_from()` to load it.
+///
+/// This must run before any `Session::builder()` call — callers hold
+/// [`ORT_SESSION_LOCK`] across init + construction so concurrent first-use
+/// from several worker threads cannot interleave. It is safe to call
+/// multiple times; the `Once` makes repeats no-ops.
+pub(crate) fn init_ort_environment() {
+    static INIT: Once = Once::new();
+
+    INIT.call_once(|| {
+        let lib_name = if cfg!(target_os = "windows") {
+            "onnxruntime.dll"
+        } else if cfg!(target_os = "linux") {
+            "libonnxruntime.so"
+        } else {
+            "libonnxruntime.dylib"
+        };
+
+        // Search for the library next to the executable, then in the
+        // working directory.
+        let mut lib_path: Option<PathBuf> = None;
+        if let Ok(exe) = std::env::current_exe() {
+            if let Some(parent) = exe.parent() {
+                let p = parent.join(lib_name);
+                if p.exists() {
+                    lib_path = Some(p);
+                }
+            }
+        }
+        if lib_path.is_none() {
+            let p = PathBuf::from(lib_name);
+            if p.exists() {
+                lib_path = Some(p);
+            }
+        }
+
+        match &lib_path {
+            Some(path) => {
+                eprintln!("[ORT] Loading ONNX Runtime from {}", path.display());
+                if let Err(e) = ort::init_from(path) {
+                    eprintln!("[ORT] Failed to load ONNX Runtime: {e}");
+                }
+            }
+            None => {
+                eprintln!(
+                    "[ORT] {lib_name} not found next to executable; \
+                     ort will use the system default"
+                );
+                // Don't call init_from — ort will try to load from PATH.
+            }
+        }
+    });
+}
 
 /// Configuration for Spotify Basic Pitch ONNX inference.
 #[derive(Debug, Clone)]
@@ -47,6 +187,16 @@ impl BasicPitchInference {
     /// layout) before falling back to the working directory. This keeps the
     /// app working regardless of the launch CWD (e.g. desktop entries).
     pub fn new(config: InferenceConfig) -> Result<Self> {
+        // Serialize with every other ORT session construction in the
+        // process (see ORT_SESSION_LOCK) and make sure the runtime library
+        // is initialized first — the transcription path previously skipped
+        // init entirely, so exe-bundled libonnxruntime was never found here.
+        let _ort_guard = ort_session_guard();
+        init_ort_environment();
+        // Fail fast when unloadable: entering ort without a loadable runtime
+        // deadlocks inside its global init (see ensure_onnxruntime_loadable).
+        ensure_onnxruntime_loadable()?;
+
         let given = Path::new(&config.model_path);
         let model_path: PathBuf = if given.exists() {
             given.to_path_buf()
@@ -57,8 +207,10 @@ impl BasicPitchInference {
                 .unwrap_or(&config.model_path);
             crate::demucs::resolve_model_path(filename).ok_or_else(|| {
                 anyhow!(
-                    "Basic Pitch ONNX model not found at: {}",
-                    config.model_path
+                    "Basic Pitch ONNX model '{}' not found. Searched <exe>/models/, \
+                     <exe>/, ./models/ and ./ — place it next to the executable \
+                     or run from the project directory.",
+                    filename
                 )
             })?
         };
@@ -328,6 +480,11 @@ pub struct MelodyQuantizerInference {
 
 impl MelodyQuantizerInference {
     pub fn new(model_path: &Path) -> Result<Self> {
+        // Same ORT construction discipline as BasicPitchInference::new.
+        let _ort_guard = ort_session_guard();
+        init_ort_environment();
+        ensure_onnxruntime_loadable()?;
+
         if !model_path.exists() {
             return Err(anyhow!(
                 "melody quantizer ONNX model not found at {}",

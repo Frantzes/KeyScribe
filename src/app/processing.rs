@@ -11,6 +11,53 @@ struct StemAnalysisCacheBlob {
     timeline: Vec<Vec<f32>>,
 }
 
+/// Express each stem's confidence as its fraction of total stem energy.
+///
+/// Worker-thread helper: for minutes-long stems this scans hundreds of
+/// millions of samples, which stalls the event loop for seconds when run on
+/// the UI thread (the compositor then reports the app as hung). Callers on
+/// the event loop must never do this inline — normalize in the worker that
+/// produced the stems instead.
+pub(super) fn normalize_stem_confidences(stems: &mut [crate::leadsheet::SeparatedStem]) {
+    let mut total_energy = 0.0f32;
+    let mut energies: Vec<f32> = Vec::with_capacity(stems.len());
+    for stem in stems.iter() {
+        let e = stem.samples_mono.iter().map(|s| s * s).sum::<f32>()
+            / stem.samples_mono.len().max(1) as f32;
+        total_energy += e;
+        energies.push(e);
+    }
+    for (stem, &e) in stems.iter_mut().zip(energies.iter()) {
+        stem.confidence = (e / total_energy.max(1e-10)).clamp(0.0, 1.0);
+    }
+}
+
+/// Check the version stamp and decode cached stems. Worker-thread only:
+/// decoding minutes of audio on the event loop stalls it for seconds.
+fn load_cached_stems_for_model(
+    song_hash: &str,
+    model_name: &str,
+) -> Option<Vec<crate::leadsheet::SeparatedStem>> {
+    const STEM_CACHE_VERSION: u32 = 3;
+    let stem_cache_root = app_cache_base_dir()
+        .join("stems")
+        .join(song_hash)
+        .join(model_name);
+    let version_path = stem_cache_root.join(".cache_version");
+    let cache_valid = stem_cache_root.exists()
+        && std::fs::read_to_string(&version_path)
+            .ok()
+            .and_then(|s| s.trim().parse::<u32>().ok())
+            .map_or(false, |v| v == STEM_CACHE_VERSION);
+    if !cache_valid {
+        return None;
+    }
+    match crate::leadsheet::load_stems_from_dir(&stem_cache_root) {
+        Ok(stems) if !stems.is_empty() => Some(stems),
+        _ => None,
+    }
+}
+
 impl KeyScribeApp {
     pub(super) fn request_rebuild(&mut self, restart_playback: bool, mode: RebuildMode) {
         if self.is_audio_loading {
@@ -597,20 +644,10 @@ impl KeyScribeApp {
         self.loaded_stems_model_name = Some(model_name);
         self.stem_playback_cache = None;
 
-        // Compute confidence as each stem's fraction of total stem energy.
-        if let Some(stems) = self.separated_stems.as_mut() {
-            let mut total_energy = 0.0f32;
-            let mut energies: Vec<f32> = Vec::with_capacity(stems.len());
-            for stem in stems.iter() {
-                let e = stem.samples_mono.iter().map(|s| s * s).sum::<f32>()
-                    / stem.samples_mono.len().max(1) as f32;
-                total_energy += e;
-                energies.push(e);
-            }
-            for (stem, &e) in stems.iter_mut().zip(energies.iter()) {
-                stem.confidence = (e / total_energy.max(1e-10)).clamp(0.0, 1.0);
-            }
-        }
+        // NOTE: stem confidences arrive pre-normalized (energy fractions)
+        // from the worker that produced the stems. They must NOT be
+        // recomputed here: the scan is O(total samples) and stalls the event
+        // loop for seconds on long files.
 
         self.stem_colors = assign_stem_colors(self.separated_stems.as_ref().unwrap());
         self.stem_analyses.clear();
@@ -653,33 +690,68 @@ impl KeyScribeApp {
         self.start_stem_analysis();
     }
 
-    pub(super) fn load_stems_for_model(&mut self, model_name: &str) -> bool {
-        let Some(ref song_hash) = self.loaded_audio_hash else {
-            return false;
-        };
-
-        const STEM_CACHE_VERSION: u32 = 3;
-        let stem_cache_root = app_cache_base_dir()
-            .join("stems")
-            .join(song_hash)
-            .join(model_name);
-        let version_path = stem_cache_root.join(".cache_version");
-        let cache_valid = stem_cache_root.exists()
-            && std::fs::read_to_string(&version_path)
-                .ok()
-                .and_then(|s| s.trim().parse::<u32>().ok())
-                .map_or(false, |v| v == STEM_CACHE_VERSION);
-
-        if !cache_valid {
-            return false;
+    /// Load cached stems on a worker thread. Decoding minutes of stems on
+    /// the event loop stalls it for seconds (the compositor then reports the
+    /// app as hung), so callers use this and read the result in
+    /// [`Self::poll_stem_cache_result`]. Idempotent per model.
+    pub(super) fn request_cached_stems(&mut self, model_name: &str) {
+        if self.loaded_stems_model_name.as_deref() == Some(model_name)
+            && self.separated_stems.is_some()
+        {
+            return;
         }
+        if self.stem_cache_pending_model.as_deref() == Some(model_name) {
+            return;
+        }
+        let Some(song_hash) = self.loaded_audio_hash.clone() else {
+            return;
+        };
+        let model_name_owned = model_name.to_string();
+        let (tx, rx) = mpsc::channel();
+        self.stem_cache_rx = Some(rx);
+        self.stem_cache_pending_model = Some(model_name_owned.clone());
+        self.stem_cache_miss = false;
+        std::thread::spawn(move || {
+            let stems = load_cached_stems_for_model(&song_hash, &model_name_owned).map(|mut s| {
+                normalize_stem_confidences(&mut s);
+                s
+            });
+            let _ = tx.send(stems);
+        });
+    }
 
-        match crate::leadsheet::load_stems_from_dir(&stem_cache_root) {
-            Ok(stems) if !stems.is_empty() => {
-                self.apply_separation_stems(stems, model_name.to_string());
-                true
+    pub(super) fn poll_stem_cache_result(&mut self) {
+        let Some(rx) = &self.stem_cache_rx else {
+            return;
+        };
+        match rx.try_recv() {
+            Ok(result) => {
+                let model = self.stem_cache_pending_model.clone().unwrap_or_default();
+                self.stem_cache_rx = None;
+                self.stem_cache_pending_model = None;
+                match result {
+                    Some(stems) if !stems.is_empty() => {
+                        self.apply_separation_stems(stems, model);
+                        self.separation_attempted = true;
+                    }
+                    _ => {
+                        // Cache miss: same end state as the old sync path.
+                        // stem_cache_miss lets the auto-separate flow proceed.
+                        self.separated_stems = None;
+                        self.loaded_stems_model_name = None;
+                        self.enabled_listening_indices.clear();
+                        self.enabled_stem_indices.clear();
+                        self.export_selected_stems.clear();
+                        self.stem_cache_miss = true;
+                        self.refresh_note_timeline_from_selected_stems();
+                    }
+                }
             }
-            _ => false,
+            Err(TryRecvError::Empty) => {}
+            Err(TryRecvError::Disconnected) => {
+                self.stem_cache_rx = None;
+                self.stem_cache_pending_model = None;
+            }
         }
     }
 
@@ -895,7 +967,7 @@ impl KeyScribeApp {
         }
     }
 
-    pub(super) fn save_state_to_disk(&self) {
+    pub(super) fn save_state_to_disk(&mut self) {
         // Save the current playback position into the per-file map so we
         // can resume from where the user left off when reopening this file.
         let mut file_positions = self.file_positions.clone();
@@ -961,15 +1033,23 @@ impl KeyScribeApp {
             // A successful `.env` write clears the JSON field (one-way
             // migration for keys saved by older versions); clearing the
             // settings field removes the `.env` entry too.
+            //
+            // The autosave runs every 2 s, so the `.env` file is only
+            // touched when the key actually changed — never rewritten
+            // unconditionally on the event loop.
             mvsep_api_key: {
-                let trimmed = self.mvsep_api_key.trim();
-                if trimmed.is_empty() {
-                    let _ = crate::mvsep::save_mvsep_api_key_to_dotenv("");
+                let trimmed = self.mvsep_api_key.trim().to_string();
+                if trimmed == self.mvsep_key_last_persisted {
                     None
-                } else if crate::mvsep::save_mvsep_api_key_to_dotenv(trimmed).is_ok() {
+                } else if trimmed.is_empty() {
+                    let _ = crate::mvsep::save_mvsep_api_key_to_dotenv("");
+                    self.mvsep_key_last_persisted = String::new();
+                    None
+                } else if crate::mvsep::save_mvsep_api_key_to_dotenv(&trimmed).is_ok() {
+                    self.mvsep_key_last_persisted = trimmed;
                     None
                 } else {
-                    Some(trimmed.to_string())
+                    Some(trimmed)
                 }
             },
             selected_separation_model_name: self.selected_separation_model_name.clone(),
@@ -1128,48 +1208,31 @@ impl KeyScribeApp {
             self.note_probs = self.note_timeline[idx].clone();
             self.note_stem_colors = vec![self.highlight_color; note_count];
         }
-        // 3. Live analysis fallback
-        // Skip expensive ONNX inference during playback — the visualization
-        // isn't worth the UI-thread freeze. Full analysis will populate the
-        // timeline shortly, at which point path 2 (cheap lookup) is used.
+        // 3. Live analysis fallback: never run ONNX inference (or touch
+        // the shared inference engine) on the UI thread. A single call can
+        // stall the event loop for seconds — long enough for the compositor
+        // to declare the app hung ("Application Not Responding") — and it can
+        // block behind the background analysis worker holding the engine.
+        // The timeline fills in shortly via path 2; until then, silence.
         else if self.is_playing() {
             self.note_probs = vec![0.0; note_count];
             self.note_stem_colors = vec![self.highlight_color; note_count];
-        } else if let Some((stem_audio, stem_sample_rate)) = self.visualizing_stem_audio() {
+        } else if let Some((_stem_audio, _stem_sample_rate)) = self.visualizing_stem_audio() {
             if self.audio_raw.is_none() {
                 return;
             }
 
-            if stem_audio.len() >= 64 {
-                let center = (current_time.max(0.0) * stem_sample_rate as f32) as usize;
-                let fft_window_size = self.audio_quality_mode.fft_window_size();
-                self.note_probs = detect_note_probabilities(
-                    &stem_audio,
-                    stem_sample_rate,
-                    center.min(stem_audio.len().saturating_sub(1)),
-                    fft_window_size,
-                );
-            } else {
-                self.note_probs = vec![0.0; note_count];
-            }
+            self.note_probs = vec![0.0; note_count];
             self.note_stem_colors = vec![self.highlight_color; note_count];
         } else {
-            let Some(raw) = &self.audio_raw else {
+            let Some(_raw) = &self.audio_raw else {
                 return;
             };
             if self.processed_samples.is_empty() {
                 return;
             }
 
-            let output_time_sec = self.source_to_output_time(current_time.max(0.0));
-            let center = (output_time_sec * raw.sample_rate as f32) as usize;
-            let fft_window_size = self.audio_quality_mode.fft_window_size();
-            self.note_probs = detect_note_probabilities(
-                &self.processed_samples,
-                raw.sample_rate,
-                center,
-                fft_window_size,
-            );
+            self.note_probs = vec![0.0; note_count];
             self.note_stem_colors = vec![self.highlight_color; note_count];
         }
 

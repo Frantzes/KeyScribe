@@ -14,7 +14,7 @@ impl KeyScribeApp {
                 .show(ctx, |ui| {
                     let current_model = self.current_separation_model_name();
                     if self.separated_stems.is_none() || self.loaded_stems_model_name.as_deref() != Some(&current_model) {
-                        let _ = self.load_stems_for_model(&current_model);
+                        self.request_cached_stems(&current_model);
                     }
                     let model_display = self.separation_model_display_name(&current_model);
                     ui.label(egui::RichText::new(format!("Model: {model_display}")).strong());
@@ -23,10 +23,15 @@ impl KeyScribeApp {
                     self.draw_export_stem_selection(ui);
                     ui.add_space(8.0);
                     if ui.button("Select Destination & Export").clicked() {
+                        // The folder picker runs on a worker thread (see
+                        // `spawn_file_dialog`): the modal closes immediately
+                        // and the export fires when a folder is chosen, so a
+                        // long browsing session never stalls the event loop.
                         #[cfg(feature = "desktop-ui")]
-                        if let Some(folder) = rfd::FileDialog::new().pick_folder() {
-                            self.execute_export_stems(&folder);
-                        }
+                        self.spawn_file_dialog(
+                            ui.ctx(),
+                            super::runtime::FileDialogRequest::ExportStemsFolder,
+                        );
                         close_modal = true;
                     }
                 });
@@ -66,10 +71,13 @@ impl KeyScribeApp {
                     
                     ui.add_space(8.0);
                     if ui.button("Select Destination & Export").clicked() {
+                        // Async folder picker (see above): the modal closes
+                        // now, the export fires on choice.
                         #[cfg(feature = "desktop-ui")]
-                        if let Some(folder) = rfd::FileDialog::new().pick_folder() {
-                            self.execute_export_midi(&folder);
-                        }
+                        self.spawn_file_dialog(
+                            ui.ctx(),
+                            super::runtime::FileDialogRequest::ExportMidiFolder,
+                        );
                         close_modal = true;
                     }
                 });
@@ -93,10 +101,15 @@ impl KeyScribeApp {
         }
     }
 
-    fn execute_export_stems(&mut self, dest_folder: &Path) {
+    pub(super) fn execute_export_stems(&mut self, dest_folder: &Path) {
         let current_model = self.current_separation_model_name();
         if self.separated_stems.is_none() || self.loaded_stems_model_name.as_deref() != Some(&current_model) {
-            let _ = self.load_stems_for_model(&current_model);
+            self.request_cached_stems(&current_model);
+            self.last_error = Some(
+                "Loading cached stems in the background — try the export again in a moment."
+                    .to_string(),
+            );
+            return;
         }
 
         let mut exported_count = 0;
@@ -136,7 +149,7 @@ impl KeyScribeApp {
         }
     }
 
-    fn execute_export_midi(&self, dest_folder: &Path) {
+    pub(super) fn execute_export_midi(&self, dest_folder: &Path) {
         // Export the original/full mix when requested.
         if self.export_full_mix_midi && !self.note_timeline.is_empty() && self.note_timeline_step_sec > 0.0 {
             let mut next_id = 0;

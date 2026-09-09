@@ -125,7 +125,37 @@ impl KeyScribeApp {
         (viewport_w * 0.48).clamp(220.0, TOOLBAR_MENU_MIN_WIDTH)
     }
 
+    /// Local ONNX separation models, cached for a few seconds.
+    ///
+    /// This scans the filesystem (`read_dir` + `canonicalize` per file) and
+    /// is called on every frame while the audio-settings/export menus are
+    /// open. The TTL keeps menus live (newly dropped-in models appear within
+    /// seconds) without redoing syscalls at 60 Hz on the event loop.
     fn available_separation_models() -> Vec<SeparationModelOption> {
+        static CACHE: std::sync::OnceLock<
+            std::sync::Mutex<(Instant, Vec<SeparationModelOption>)>,
+        > = std::sync::OnceLock::new();
+        const TTL: Duration = Duration::from_secs(5);
+
+        if let Some(cache) = CACHE.get() {
+            if let Ok(guard) = cache.lock() {
+                if guard.0.elapsed() < TTL {
+                    return guard.1.clone();
+                }
+            }
+        }
+        let fresh = Self::scan_separation_models();
+        if let Some(cache) = CACHE.get() {
+            if let Ok(mut guard) = cache.lock() {
+                *guard = (Instant::now(), fresh.clone());
+            }
+        } else {
+            let _ = CACHE.set(std::sync::Mutex::new((Instant::now(), fresh.clone())));
+        }
+        fresh
+    }
+
+    fn scan_separation_models() -> Vec<SeparationModelOption> {
         let mut options = Vec::new();
         let mut seen_names = std::collections::BTreeSet::<String>::new();
 
@@ -277,15 +307,10 @@ impl KeyScribeApp {
 
         self.selected_separation_model_name = Some(model_name.clone());
 
-        // Attempt to immediately load stems from cache if this model was previously separated
-        if !self.load_stems_for_model(&model_name) {
-            self.separated_stems = None;
-            self.loaded_stems_model_name = None;
-            self.enabled_listening_indices.clear();
-            self.enabled_stem_indices.clear();
-            self.export_selected_stems.clear();
-            self.refresh_note_timeline_from_selected_stems();
-        }
+        // Load cached stems on a worker: decoding minutes of stems on the
+        // event loop stalls it for seconds. A cache miss clears via the poll
+        // path, same end state as before.
+        self.request_cached_stems(&model_name);
     }
 
     pub(super) fn draw_separation_model_options(&mut self, ui: &mut egui::Ui) {
@@ -568,6 +593,9 @@ impl KeyScribeApp {
         self.separation_rx = Some(rx);
         self.is_separating = true;
         self.separation_attempted = false;
+        self.stem_cache_miss = false;
+        self.stem_cache_pending_model = None;
+        self.stem_cache_rx = None;
         self.separation_progress.store(0, Ordering::Release);
 
         let progress_atomic = Arc::clone(&self.separation_progress);
@@ -589,7 +617,10 @@ impl KeyScribeApp {
                 }) as Box<dyn Fn(f32) + Send + Sync>);
 
                 match separator.separate(&[], 0, 0, progress_cb) {
-                    Ok(stems) => {
+                    Ok(mut stems) => {
+                        // Normalize here, not on the event loop: the energy
+                        // scan is O(total samples) and would stall UI pings.
+                        super::processing::normalize_stem_confidences(&mut stems);
                         let _ = tx.send(SeparationResult { stems, error: None });
                     }
                     Err(e) => {
@@ -739,14 +770,39 @@ impl KeyScribeApp {
 
         Self::draw_toolbar_separator(ui);
 
-        if self.cache_size_bytes.is_none() {
+        if self.cache_size_bytes.is_none() && !self.cache_size_pending {
+            // Recursive directory walk — runs on a worker so opening
+            // Preferences never stalls the event loop on a large cache.
             let cache_dir = crate::app::analysis_cache_dir();
             let legacy_dir = crate::app::app_cache_base_dir().join(".transcriber_cache");
             let stems_dir = crate::app::app_cache_base_dir().join("stems");
-            let size = get_dir_size(&cache_dir).unwrap_or(0) 
-                     + get_dir_size(&legacy_dir).unwrap_or(0)
-                     + get_dir_size(&stems_dir).unwrap_or(0);
-            self.cache_size_bytes = Some(Some(size));
+            let (tx, rx) = mpsc::channel::<u64>();
+            self.cache_size_rx = Some(rx);
+            self.cache_size_pending = true;
+            thread::spawn(move || {
+                let size = get_dir_size(&cache_dir).unwrap_or(0)
+                    + get_dir_size(&legacy_dir).unwrap_or(0)
+                    + get_dir_size(&stems_dir).unwrap_or(0);
+                let _ = tx.send(size);
+            });
+        }
+        if self.cache_size_pending {
+            if let Some(rx) = &self.cache_size_rx {
+                match rx.try_recv() {
+                    Ok(size) => {
+                        self.cache_size_bytes = Some(Some(size));
+                        self.cache_size_rx = None;
+                        self.cache_size_pending = false;
+                    }
+                    Err(mpsc::TryRecvError::Disconnected) => {
+                        self.cache_size_rx = None;
+                        self.cache_size_pending = false;
+                    }
+                    Err(mpsc::TryRecvError::Empty) => {}
+                }
+            } else {
+                self.cache_size_pending = false;
+            }
         }
 
         let size_text = match self.cache_size_bytes {
@@ -764,6 +820,10 @@ impl KeyScribeApp {
             let _ = std::fs::remove_dir_all(&stems_dir);
             let _ = std::fs::create_dir_all(&stems_dir);
             self.cache_size_bytes = Some(Some(0));
+            // Drop any in-flight background size scan so its stale result
+            // can't overwrite the just-cleaned value.
+            self.cache_size_rx = None;
+            self.cache_size_pending = false;
         }
     }
 
@@ -827,7 +887,7 @@ impl KeyScribeApp {
                 
                 let current_model = self.current_separation_model_name();
                 if self.separated_stems.is_none() || self.loaded_stems_model_name.as_deref() != Some(&current_model) {
-                    let _ = self.load_stems_for_model(&current_model);
+                    self.request_cached_stems(&current_model);
                 }
                 let has_stems = self.separated_stems.is_some();
                 let can_export_midi = has_stems || !self.note_timeline.is_empty();

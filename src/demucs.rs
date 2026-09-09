@@ -75,8 +75,8 @@ impl DemucsSeparator {
         if !model_path.exists() {
             return Err(anyhow!("Demucs ONNX model not found at {}", model_path.display()));
         }
-        // Initialize the ONNX Runtime environment from our bundled DLL.
-        init_ort_environment();
+        // Initialize the ONNX Runtime environment from our bundled library.
+        crate::inference::init_ort_environment();
 
         // Preload CUDA/cuDNN DLLs so the CUDA EP can find them at runtime.
         preload_cuda_dylibs();
@@ -583,6 +583,11 @@ fn to_stereo_44100(audio: &crate::audio_io::AudioData) -> Vec<f32> {
 /// `cudnn_conv_use_max_workspace` is disabled to bound the cuDNN workspace
 /// memory, which helps the model fit in GPUs with limited VRAM (e.g. 8 GB).
 fn build_gpu_session(model_path: &Path) -> Result<Session> {
+    // Shared ORT construction discipline (see inference::ORT_SESSION_LOCK).
+    let _ort_guard = crate::inference::ort_session_guard();
+    crate::inference::init_ort_environment();
+    crate::inference::ensure_onnxruntime_loadable()?;
+
     let cuda = CUDA::default()
         .with_conv_algorithm_search(ort::ep::cuda::ConvAlgorithmSearch::Heuristic)
         .with_conv_max_workspace(false)
@@ -605,6 +610,11 @@ fn build_gpu_session(model_path: &Path) -> Result<Session> {
 const MIN_FREE_CORES: usize = 1;
 
 fn build_cpu_session(model_path: &Path) -> Result<Session> {
+    // Shared ORT construction discipline (see inference::ORT_SESSION_LOCK).
+    let _ort_guard = crate::inference::ort_session_guard();
+    crate::inference::init_ort_environment();
+    crate::inference::ensure_onnxruntime_loadable()?;
+
     // Use all available cores minus one for system responsiveness.
     // The previous code capped this at 4, leaving most cores idle on modern
     // CPUs (e.g. only 4 of 12 logical processors were used).
@@ -627,65 +637,10 @@ fn build_cpu_session(model_path: &Path) -> Result<Session> {
     Ok(builder.commit_from_file(model_path)?)
 }
 
-/// Initialize the ONNX Runtime environment from our bundled `onnxruntime.dll`.
-///
-/// With the `load-dynamic` feature, ort loads the runtime DLL at runtime
-/// instead of linking it at build time. We search for `onnxruntime.dll`
-/// next to the executable (portable bundle) and in the working directory
-/// (dev layout), then call `ort::init_from()` to load it.
-///
-/// This must be called before any `Session::builder()` call. It is safe to
-/// call multiple times — the environment is process-global and can only be
-/// committed once; subsequent calls are no-ops.
-fn init_ort_environment() {
-    use std::sync::Once;
-
-    static INIT: Once = Once::new();
-
-    INIT.call_once(|| {
-        let dll_name = if cfg!(target_os = "windows") {
-            "onnxruntime.dll"
-        } else if cfg!(target_os = "linux") {
-            "libonnxruntime.so"
-        } else {
-            "libonnxruntime.dylib"
-        };
-
-        // Search for onnxruntime.dll next to the executable, then in the
-        // working directory.
-        let mut dll_path: Option<PathBuf> = None;
-        if let Ok(exe) = std::env::current_exe() {
-            if let Some(parent) = exe.parent() {
-                let p = parent.join(dll_name);
-                if p.exists() {
-                    dll_path = Some(p);
-                }
-            }
-        }
-        if dll_path.is_none() {
-            let p = PathBuf::from(dll_name);
-            if p.exists() {
-                dll_path = Some(p);
-            }
-        }
-
-        match &dll_path {
-            Some(path) => {
-                eprintln!("[DEMUCS] Loading ONNX Runtime from {}", path.display());
-                if let Err(e) = ort::init_from(path) {
-                    eprintln!("[DEMUCS] Failed to load onnxruntime.dll: {e}");
-                }
-            }
-            None => {
-                eprintln!(
-                    "[DEMUCS] onnxruntime.dll not found next to executable; \
-                     ort will use the system default"
-                );
-                // Don't call init_from — ort will try to load from PATH.
-            }
-        }
-    });
-}
+// NOTE: ONNX Runtime environment init now lives in
+// `crate::inference::init_ort_environment` so every ORT session
+// construction site (transcription, quantizer, separation) shares one init
+// path under one lock (see `inference::ORT_SESSION_LOCK`).
 
 /// Preload the CUDA 12 runtime and cuDNN 9 DLLs so the CUDA execution
 /// provider can find them at runtime.
