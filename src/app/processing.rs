@@ -17,6 +17,13 @@ impl KeyScribeApp {
             return;
         }
 
+        // Parameter-only/preview jobs come from speed/pitch tweaks: silent.
+        // (Set-only: the param path may have already marked a Full rebuild.
+        // Cleared when the job ends.)
+        if matches!(mode, RebuildMode::ParametersOnly | RebuildMode::ParametersPreview) {
+            self.param_tweak_rebuild = true;
+        }
+
         let (raw_sample_rate, raw_samples_mono, raw_samples_interleaved, raw_channels) = {
             let Some(raw) = &self.audio_raw else {
                 return;

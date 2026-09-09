@@ -262,6 +262,8 @@ impl KeyScribeApp {
                 .add(egui::Button::new(egui::RichText::new("All").size(11.0)))
                 .clicked()
             {
+                let pd = ui.input(|i| i.pointer.primary_down());
+                self.push_mix_undo(pd);
                 self.enabled_listening_indices = (0..stems.len()).collect();
                 self.stem_playback_cache = None;
                 let live = self.sync_all_stem_gains_live();
@@ -279,6 +281,8 @@ impl KeyScribeApp {
                 )
                 .clicked()
             {
+                let pd = ui.input(|i| i.pointer.primary_down());
+                self.push_mix_undo(pd);
                 self.enabled_listening_indices.clear();
                 self.stem_playback_cache = None;
                 self.maybe_restart_playback_for_listen_sync();
@@ -371,6 +375,8 @@ impl KeyScribeApp {
                                 if audible { text_color } else { dim_color },
                             );
                             if mute_resp.clicked() {
+                                let pd = ui.input(|i| i.pointer.primary_down());
+                                self.push_mix_undo(pd);
                                 self.toggle_stem_mute(idx, label.as_ref());
                             }
                             painter.text(
@@ -406,6 +412,8 @@ impl KeyScribeApp {
                                 if visible { text_color } else { dim_color },
                             );
                             if eye_resp.clicked() {
+                                let pd = ui.input(|i| i.pointer.primary_down());
+                                self.push_mix_undo(pd);
                                 self.toggle_stem_piano_visibility(idx);
                             }
                             let vol_changed = synth_knob(
@@ -433,6 +441,8 @@ impl KeyScribeApp {
                                     }),
                             );
                             if vol_changed {
+                                let pd = ui.input(|i| i.pointer.primary_down());
+                                self.push_mix_undo(pd);
                                 self.apply_stem_volume_change(idx, label.as_ref(), vol);
                             }
                         });

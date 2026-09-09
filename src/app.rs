@@ -953,6 +953,114 @@ fn load_persisted_state() -> PersistedState {
     PersistedState::default()
 }
 
+/// Undoable mix + transport params: stem volumes, audibility/piano
+/// visibility sets, Speed/Pitch, master volume. Snapshots are pushed before
+/// each mutation (one step per click or drag gesture) for Ctrl+Z / redo.
+#[derive(Clone, Default)]
+pub(super) struct MixSnapshot {
+    stem_volumes: std::collections::HashMap<String, f32>,
+    enabled_listening_indices: std::collections::BTreeSet<usize>,
+    enabled_stem_indices: std::collections::BTreeSet<usize>,
+    speed: f32,
+    pitch_semitones: f32,
+    playback_volume: f32,
+    key_color_sensitivity: f32,
+    key_highlight_max_sec: f32,
+    visualization_timing_offset_ms: f32,
+    piano_zoom: f32,
+}
+
+impl MixSnapshot {
+    fn capture(app: &KeyScribeApp) -> Self {
+        Self {
+            stem_volumes: app.stem_volumes.clone(),
+            enabled_listening_indices: app.enabled_listening_indices.clone(),
+            enabled_stem_indices: app.enabled_stem_indices.clone(),
+            speed: app.speed,
+            pitch_semitones: app.pitch_semitones,
+            playback_volume: app.playback_volume,
+            key_color_sensitivity: app.key_color_sensitivity,
+            key_highlight_max_sec: app.key_highlight_max_sec,
+            visualization_timing_offset_ms: app.visualization_timing_offset_ms,
+            piano_zoom: app.piano_zoom,
+        }
+    }
+}
+
+impl KeyScribeApp {
+    /// Record the pre-change mix state. Called at every mix mutation site;
+    /// coalesces a whole pointer drag into a single undo step.
+    pub(super) fn push_mix_undo(&mut self, pointer_down: bool) {
+        let snap = MixSnapshot::capture(self);
+        self.push_mix_undo_with(pointer_down, snap);
+    }
+
+    /// Push a caller-built snapshot (for widgets that mutate `self` directly:
+    /// callers capture the pre-change values first, then hand them over).
+    pub(super) fn push_mix_undo_with(&mut self, pointer_down: bool, snap: MixSnapshot) {
+        // Exactly one undo step per discrete action or pointer press: the
+        // first change of a drag pushes; continuations and the release
+        // click after a drag do not.
+        if !self.mix_press_pushed {
+            self.mix_undo.push(snap);
+            if self.mix_undo.len() > 50 {
+                self.mix_undo.remove(0);
+            }
+            self.mix_redo.clear();
+        }
+        self.mix_press_pushed = pointer_down;
+    }
+
+    pub(super) fn undo_mix(&mut self) {
+        if let Some(snap) = self.mix_undo.pop() {
+            self.mix_redo.push(MixSnapshot::capture(self));
+            self.restore_mix_snapshot(&snap);
+        }
+    }
+
+    pub(super) fn redo_mix(&mut self) {
+        if let Some(snap) = self.mix_redo.pop() {
+            self.mix_undo.push(MixSnapshot::capture(self));
+            self.restore_mix_snapshot(&snap);
+        }
+    }
+
+    fn restore_mix_snapshot(&mut self, snap: &MixSnapshot) {
+        self.stem_volumes = snap.stem_volumes.clone();
+        self.enabled_listening_indices = snap.enabled_listening_indices.clone();
+        self.enabled_stem_indices = snap.enabled_stem_indices.clone();
+        self.speed = snap.speed;
+        self.pitch_semitones = snap.pitch_semitones;
+        self.playback_volume = snap.playback_volume;
+        self.key_color_sensitivity = snap.key_color_sensitivity;
+        self.key_highlight_max_sec = snap.key_highlight_max_sec;
+        self.visualization_timing_offset_ms = snap.visualization_timing_offset_ms;
+        self.piano_zoom = snap.piano_zoom;
+        self.update_note_probabilities(true);
+        if let Some(hash) = self.loaded_audio_hash.clone() {
+            self.file_stem_volumes
+                .insert(hash, self.stem_volumes.clone());
+        }
+        let _ = self.sync_all_stem_gains_live();
+        self.stem_playback_cache = None;
+        self.maybe_restart_playback_for_listen_sync();
+        // Piano visibility may have changed: rebuild the note timeline.
+        // Restoring an empty-visible set triggers a silent rebuild job.
+        if self.stem_analyses.is_empty() || self.enabled_stem_indices.is_empty() {
+            self.param_tweak_rebuild = true;
+        }
+        self.note_timeline = std::sync::Arc::new(Vec::new());
+        self.note_timeline_step_sec = 0.0;
+        self.refresh_note_timeline_from_selected_stems_preserving();
+        // Commit Speed/Pitch + volume through the live engines.
+        self.pending_param_change = true;
+        self.last_param_change_at = Some(std::time::Instant::now());
+        if let Some(engine) = &mut self.engine {
+            engine.set_volume(self.playback_volume);
+        }
+    }
+}
+
 pub struct KeyScribeApp {
     loaded_path: Option<PathBuf>,
     loaded_audio_hash: Option<String>,
@@ -974,6 +1082,15 @@ pub struct KeyScribeApp {
     show_stem_mixer: bool,
     /// Cog toggle under the piano: reveals the keyboard settings sliders.
     show_piano_settings: bool,
+    mix_undo: Vec<MixSnapshot>,
+    mix_redo: Vec<MixSnapshot>,
+    /// True once a snapshot was pushed for the ongoing pointer press, so a
+    /// whole drag (and its release click) yields exactly one undo step.
+    mix_press_pushed: bool,
+    /// A processing job triggered by a speed/pitch tweak: no status text.
+    param_tweak_rebuild: bool,
+    undo_z_held: bool,
+    undo_y_held: bool,
     stem_mixer_anchor: Option<egui::Rect>,
     pending_seek: Option<f32>,
     pending_seek_age: u32,
@@ -1398,6 +1515,12 @@ impl KeyScribeApp {
             pending_listening_indices: std::collections::BTreeSet::new(),
             show_stem_mixer: false,
             show_piano_settings: false,
+            mix_undo: Vec::new(),
+            mix_redo: Vec::new(),
+            mix_press_pushed: false,
+            param_tweak_rebuild: false,
+            undo_z_held: false,
+            undo_y_held: false,
             stem_mixer_anchor: None,
             pending_seek: None,
             pending_seek_age: 0,

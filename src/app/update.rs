@@ -135,6 +135,13 @@ impl eframe::App for KeyScribeApp {
         self.poll_sheet_rendering(ctx);
         self.sync_playhead_from_engine();
 
+        // Undo coalescing reset: release EVENTS queue in winit until the
+        // next update, so this observes every release (a level-state check
+        // can miss one and then swallow all later pushes).
+        if ctx.input(|i| i.pointer.any_released() || !i.pointer.primary_down()) {
+            self.mix_press_pushed = false;
+        }
+
         self.draw_top_controls_panel(ctx);
 
         self.piano_panel_height_needs_init = false;
@@ -401,12 +408,15 @@ impl eframe::App for KeyScribeApp {
                                         0.01,
                                         2,
                                     ) {
+                                        let pd = ui.input(|i| i.pointer.primary_down());
+                                        self.push_mix_undo(pd);
                                         self.key_color_sensitivity =
                                             (ui_key_sensitivity * 2.0).clamp(0.0, 2.0);
                                         visuals_changed = true;
                                     }
 
                                     ui.add_space(UI_VSPACE_TIGHT);
+                                    let pre_highlight_max = self.key_highlight_max_sec;
                                     if Self::top_bar_slider_with_input(
                                         ui,
                                         "Max Key Highlight Time",
@@ -417,6 +427,10 @@ impl eframe::App for KeyScribeApp {
                                         0.005,
                                         2,
                                     ) {
+                                        let pd = ui.input(|i| i.pointer.primary_down());
+                                        let mut snap = MixSnapshot::capture(self);
+                                        snap.key_highlight_max_sec = pre_highlight_max;
+                                        self.push_mix_undo_with(pd, snap);
                                         self.key_highlight_max_sec = self
                                             .key_highlight_max_sec
                                             .clamp(KEY_HIGHLIGHT_MAX_SEC_MIN, KEY_HIGHLIGHT_MAX_SEC_MAX);
@@ -424,6 +438,7 @@ impl eframe::App for KeyScribeApp {
                                     }
 
                                     ui.add_space(UI_VSPACE_TIGHT);
+                                    let pre_vis_offset = self.visualization_timing_offset_ms;
                                     if Self::top_bar_slider_with_input(
                                         ui,
                                         "Visualization Offset",
@@ -434,6 +449,10 @@ impl eframe::App for KeyScribeApp {
                                         1.0,
                                         0,
                                     ) {
+                                        let pd = ui.input(|i| i.pointer.primary_down());
+                                        let mut snap = MixSnapshot::capture(self);
+                                        snap.visualization_timing_offset_ms = pre_vis_offset;
+                                        self.push_mix_undo_with(pd, snap);
                                         self.visualization_timing_offset_ms = self
                                             .visualization_timing_offset_ms
                                             .clamp(
@@ -444,7 +463,8 @@ impl eframe::App for KeyScribeApp {
                                     }
 
                                     ui.add_space(UI_VSPACE_TIGHT);
-                                    let _ = Self::top_bar_slider_with_input(
+                                    let pre_piano_zoom = self.piano_zoom;
+                                    if Self::top_bar_slider_with_input(
                                         ui,
                                         "Piano Zoom",
                                         &mut self.piano_zoom,
@@ -453,7 +473,12 @@ impl eframe::App for KeyScribeApp {
                                         "x",
                                         0.01,
                                         2,
-                                    );
+                                    ) {
+                                        let pd = ui.input(|i| i.pointer.primary_down());
+                                        let mut snap = MixSnapshot::capture(self);
+                                        snap.piano_zoom = pre_piano_zoom;
+                                        self.push_mix_undo_with(pd, snap);
+                                    }
                                 },
                             );
                         } else {
@@ -482,6 +507,8 @@ impl eframe::App for KeyScribeApp {
                                                 0.01,
                                                 2,
                                             ) {
+                                                let pd = ui.input(|i| i.pointer.primary_down());
+                                                self.push_mix_undo(pd);
                                                 self.key_color_sensitivity =
                                                     (ui_key_sensitivity * 2.0).clamp(0.0, 2.0);
                                                 visuals_changed = true;
@@ -493,6 +520,7 @@ impl eframe::App for KeyScribeApp {
                                         egui::vec2(col_w, slider_row_h),
                                         egui::Layout::top_down(egui::Align::Center),
                                         |ui| {
+                                            let pre_highlight_max = self.key_highlight_max_sec;
                                             if Self::top_bar_slider_with_input(
                                                 ui,
                                                 "Max Key Highlight Time",
@@ -503,6 +531,10 @@ impl eframe::App for KeyScribeApp {
                                                 0.005,
                                                 2,
                                             ) {
+                                                let pd = ui.input(|i| i.pointer.primary_down());
+                                                let mut snap = MixSnapshot::capture(self);
+                                                snap.key_highlight_max_sec = pre_highlight_max;
+                                                self.push_mix_undo_with(pd, snap);
                                                 self.key_highlight_max_sec = self
                                                     .key_highlight_max_sec
                                                     .clamp(
@@ -518,6 +550,7 @@ impl eframe::App for KeyScribeApp {
                                         egui::vec2(col_w, slider_row_h),
                                         egui::Layout::top_down(egui::Align::Center),
                                         |ui| {
+                                            let pre_vis_offset = self.visualization_timing_offset_ms;
                                             if Self::top_bar_slider_with_input(
                                                 ui,
                                                 "Visualization Offset",
@@ -528,6 +561,10 @@ impl eframe::App for KeyScribeApp {
                                                 1.0,
                                                 0,
                                             ) {
+                                                let pd = ui.input(|i| i.pointer.primary_down());
+                                                let mut snap = MixSnapshot::capture(self);
+                                                snap.visualization_timing_offset_ms = pre_vis_offset;
+                                                self.push_mix_undo_with(pd, snap);
                                                 self.visualization_timing_offset_ms = self
                                                     .visualization_timing_offset_ms
                                                     .clamp(
@@ -543,7 +580,8 @@ impl eframe::App for KeyScribeApp {
                                         egui::vec2(col_w, slider_row_h),
                                         egui::Layout::top_down(egui::Align::Center),
                                         |ui| {
-                                            let _ = Self::top_bar_slider_with_input(
+                                            let pre_piano_zoom = self.piano_zoom;
+                                            if Self::top_bar_slider_with_input(
                                                 ui,
                                                 "Piano Zoom",
                                                 &mut self.piano_zoom,
@@ -552,7 +590,12 @@ impl eframe::App for KeyScribeApp {
                                                 "x",
                                                 0.01,
                                                 2,
-                                            );
+                                            ) {
+                                                let pd = ui.input(|i| i.pointer.primary_down());
+                                                let mut snap = MixSnapshot::capture(self);
+                                                snap.piano_zoom = pre_piano_zoom;
+                                                self.push_mix_undo_with(pd, snap);
+                                            }
                                         },
                                     );
                                 },
@@ -1286,6 +1329,34 @@ impl eframe::App for KeyScribeApp {
         });
 
         self.draw_export_modals(ctx);
+
+        // Mix undo/redo, read after all widgets ran: a focused TextEdit
+        // consumes Ctrl+Z/Y for its own undo (protecting typing), while
+        // knob/slider/button focus does not block mix undo.
+        // Edge-triggered (physical press, not OS repeat): holding Ctrl+Z
+        // must undo exactly one step, not machine-gun the whole stack.
+        let (cmd_held, shift_held, z_pressed, y_pressed, z_down, y_down) = ctx.input(|i| {
+            (
+                i.modifiers.ctrl || i.modifiers.command,
+                i.modifiers.shift,
+                i.key_pressed(egui::Key::Z),
+                i.key_pressed(egui::Key::Y),
+                i.key_down(egui::Key::Z),
+                i.key_down(egui::Key::Y),
+            )
+        });
+        if cmd_held && z_pressed && !shift_held && !self.undo_z_held {
+            self.undo_mix();
+            ctx.request_repaint();
+        }
+        let redo_z = cmd_held && z_pressed && shift_held && !self.undo_z_held;
+        let redo_y = cmd_held && y_pressed && !self.undo_y_held;
+        if redo_z || redo_y {
+            self.redo_mix();
+            ctx.request_repaint();
+        }
+        self.undo_z_held = z_down;
+        self.undo_y_held = y_down;
 
         if self.last_state_save_at.elapsed() >= Duration::from_secs(2) {
             self.save_state_to_disk();

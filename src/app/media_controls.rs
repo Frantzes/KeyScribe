@@ -3,7 +3,9 @@ use egui_phosphor::regular::{
     FAST_FORWARD, PAUSE, PLAY, REPEAT, REWIND, SPEAKER_HIGH, SPEAKER_NONE, MINUS, PLUS,
 };
 
-use super::{KeyScribeApp, SEEK_STEP_SEC, UI_VSPACE_COMPACT, UI_VSPACE_MEDIUM};
+use super::{
+    KeyScribeApp, MixSnapshot, SEEK_STEP_SEC, UI_VSPACE_COMPACT, UI_VSPACE_MEDIUM,
+};
 use crate::theme::{
     MEDIA_PANEL_BG_DARK, MEDIA_PANEL_BG_LIGHT, SLIDER_RAIL_BG_ACTIVE_DARK,
     SLIDER_RAIL_BG_ACTIVE_LIGHT, SLIDER_RAIL_BG_DARK, SLIDER_RAIL_BG_HOVER_DARK,
@@ -126,6 +128,8 @@ fn draw_volume_slider_row(ui: &mut egui::Ui, app: &mut KeyScribeApp, max_slider_
 
             // Right_to_left places the first allocation at the right edge, so
             // the slider is allocated first and the icon ends up on its left.
+            // Captured before the slider below mutates app in place.
+            let pre_vol = app.playback_volume;
             let slider_w = ui.available_width().min(max_slider_w).max(60.0);
             ui.spacing_mut().slider_width = slider_w;
             let (rail_fill, rail_hover, rail_active) = if app.dark_mode {
@@ -160,6 +164,10 @@ fn draw_volume_slider_row(ui: &mut egui::Ui, app: &mut KeyScribeApp, max_slider_
                 })
                 .inner;
             if vol_changed {
+                let pd = ui.input(|i| i.pointer.primary_down());
+                let mut snap = MixSnapshot::capture(app);
+                snap.playback_volume = pre_vol;
+                app.push_mix_undo_with(pd, snap);
                 if let Some(engine) = &mut app.engine {
                     engine.set_volume(app.playback_volume);
                 }
@@ -271,8 +279,15 @@ fn draw_vertical_volume_slider(ui: &mut egui::Ui, app: &mut KeyScribeApp) {
         6.0,
         ui.visuals().widgets.inactive.fg_stroke,
     );
+    // Captured before the slider below mutates app in place.
+    let pre_popup_vol = app.playback_volume;
     if resp.dragged() || resp.clicked() {
         if let Some(pos) = resp.interact_pointer_pos() {
+            // Drags coalesce into one undo step via pointer transitions;
+            // taps count as discrete actions.
+            let mut snap = MixSnapshot::capture(app);
+            snap.playback_volume = pre_popup_vol;
+            app.push_mix_undo_with(resp.dragged(), snap);
             let f = ((rail.bottom() - pos.y) / rail.height().max(1.0)).clamp(0.0, 1.0);
             app.playback_volume = f * 1.5;
             if let Some(engine) = &mut app.engine {

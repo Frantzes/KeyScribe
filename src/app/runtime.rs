@@ -231,6 +231,7 @@ impl KeyScribeApp {
             && (self.base_note_timeline.is_empty() || self.base_note_timeline_step_sec <= 0.0);
         if needs_full_rebuild {
             let was_playing = self.stop_if_playing();
+            self.param_tweak_rebuild = true;
             self.request_rebuild(was_playing, RebuildMode::Full);
             return;
         }
@@ -309,6 +310,7 @@ impl KeyScribeApp {
 
     pub(super) fn clear_processing_job(&mut self) {
         self.is_processing = false;
+        self.param_tweak_rebuild = false;
         self.processing_rx = None;
         self.active_job_id = None;
         self.active_rebuild_mode = RebuildMode::Full;

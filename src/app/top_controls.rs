@@ -1364,6 +1364,9 @@ impl KeyScribeApp {
     pub(super) fn draw_speed_pitch_controls(&mut self, ui: &mut egui::Ui, compact: bool) -> bool {
         let accent = self.highlight_color;
         let mut changed = false;
+        // Captured before the widgets below mutate self in place.
+        let pre_speed = self.speed;
+        let pre_pitch = self.pitch_semitones;
 
         if compact {
             let knob_size: f32 = 30.0;
@@ -1493,6 +1496,13 @@ impl KeyScribeApp {
         }
 
         if changed {
+            let pd = ui.input(|i| i.pointer.primary_down());
+            // The knobs/sliders above wrote straight into self: rebuild the
+            // pre-change snapshot from the values captured before drawing.
+            let mut snap = MixSnapshot::capture(self);
+            snap.speed = pre_speed;
+            snap.pitch_semitones = pre_pitch;
+            self.push_mix_undo_with(pd, snap);
             self.pending_param_change = true;
             self.last_param_change_at = Some(Instant::now());
         }
@@ -1583,27 +1593,37 @@ impl KeyScribeApp {
                         ui.colored_label(ERROR_RED, err);
                     }
 
-                    if self.is_processing {
+                    if self.is_processing && !self.param_tweak_rebuild {
+                        // No status text for the full speed/pitch rebuild: it
+                        // fires on every knob/slider tweak and the message is
+                        // just noise.
                         let msg = match self.active_rebuild_mode {
                             RebuildMode::Full if self.preprocess_audio => {
-                                "Analyzing track in background... waveform and playback stay available."
+                                Some("Analyzing track in background... waveform and playback stay available.")
                             }
-                            RebuildMode::ParametersPreview => "Buffering speed/pitch preview...",
+                            RebuildMode::ParametersPreview => {
+                                Some("Buffering speed/pitch preview...")
+                            }
                             _ if speed_pitch_is_identity(self.speed, self.pitch_semitones) => {
-                                "Building playback buffer..."
+                                Some("Building playback buffer...")
                             }
-                            _ => "Rendering full speed/pitch update...",
+                            _ => None,
                         };
-                        let processing_color = egui::Color32::from_rgb(
-                            self.highlight_color.r().saturating_add(12),
-                            self.highlight_color.g().saturating_add(12),
-                            self.highlight_color.b().saturating_add(12),
-                        );
-                        ui.colored_label(processing_color, msg);
+                        if let Some(msg) = msg {
+                            let processing_color = egui::Color32::from_rgb(
+                                self.highlight_color.r().saturating_add(12),
+                                self.highlight_color.g().saturating_add(12),
+                                self.highlight_color.b().saturating_add(12),
+                            );
+                            ui.colored_label(processing_color, msg);
+                        }
                     }
 
                     if let Some(cache_msg) = self.cache_status_message.as_deref() {
-                        let show_cache_msg = self.is_processing
+                        // A stale message (e.g. "Stem analysis complete.")
+                        // must not resurface just because a silent
+                        // param-tweak rebuild is running.
+                        let show_cache_msg = (self.is_processing && !self.param_tweak_rebuild)
                             || self
                                 .cache_status_message_at
                                 .map(|at| at.elapsed() <= Duration::from_secs(8))
