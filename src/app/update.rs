@@ -456,6 +456,7 @@ impl eframe::App for KeyScribeApp {
                                         "",
                                         0.01,
                                         2,
+                                        default_key_color_sensitivity() * 0.5,
                                     ) {
                                         let pd = ui.input(|i| i.pointer.primary_down());
                                         self.push_mix_undo(pd);
@@ -475,6 +476,7 @@ impl eframe::App for KeyScribeApp {
                                         " s",
                                         0.005,
                                         2,
+                                        default_key_highlight_max_sec(),
                                     ) {
                                         let pd = ui.input(|i| i.pointer.primary_down());
                                         let mut snap = MixSnapshot::capture(self);
@@ -497,6 +499,7 @@ impl eframe::App for KeyScribeApp {
                                         " ms",
                                         1.0,
                                         0,
+                                        default_visualization_timing_offset_ms(),
                                     ) {
                                         let pd = ui.input(|i| i.pointer.primary_down());
                                         let mut snap = MixSnapshot::capture(self);
@@ -522,6 +525,7 @@ impl eframe::App for KeyScribeApp {
                                         "x",
                                         0.01,
                                         2,
+                                        1.0,
                                     ) {
                                         let pd = ui.input(|i| i.pointer.primary_down());
                                         let mut snap = MixSnapshot::capture(self);
@@ -555,6 +559,7 @@ impl eframe::App for KeyScribeApp {
                                                 "",
                                                 0.01,
                                                 2,
+                                                default_key_color_sensitivity() * 0.5,
                                             ) {
                                                 let pd = ui.input(|i| i.pointer.primary_down());
                                                 self.push_mix_undo(pd);
@@ -579,6 +584,7 @@ impl eframe::App for KeyScribeApp {
                                                 " s",
                                                 0.005,
                                                 2,
+                                                default_key_highlight_max_sec(),
                                             ) {
                                                 let pd = ui.input(|i| i.pointer.primary_down());
                                                 let mut snap = MixSnapshot::capture(self);
@@ -609,6 +615,7 @@ impl eframe::App for KeyScribeApp {
                                                 " ms",
                                                 1.0,
                                                 0,
+                                                default_visualization_timing_offset_ms(),
                                             ) {
                                                 let pd = ui.input(|i| i.pointer.primary_down());
                                                 let mut snap = MixSnapshot::capture(self);
@@ -639,6 +646,7 @@ impl eframe::App for KeyScribeApp {
                                                 "x",
                                                 0.01,
                                                 2,
+                                                1.0,
                                             ) {
                                                 let pd = ui.input(|i| i.pointer.primary_down());
                                                 let mut snap = MixSnapshot::capture(self);

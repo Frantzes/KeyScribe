@@ -1211,6 +1211,7 @@ impl KeyScribeApp {
         suffix: &str,
         drag_speed: f64,
         max_decimals: usize,
+        default: f32,
     ) -> bool {
         let mut changed = false;
         let parent_width = ui.max_rect().width().max(0.0);
@@ -1291,6 +1292,7 @@ impl KeyScribeApp {
                                                     value,
                                                     min,
                                                     max,
+                                                    default,
                                                     bipolar,
                                                     egui::vec2(controls_w, row_height),
                                                     accent,
@@ -1347,6 +1349,7 @@ impl KeyScribeApp {
                                                     value,
                                                     min,
                                                     max,
+                                                    default,
                                                     bipolar,
                                                     egui::vec2(slider_width, row_height),
                                                     accent,
@@ -1531,6 +1534,7 @@ impl KeyScribeApp {
                             &mut self.speed,
                             0.5,
                             2.0,
+                            1.0,
                             false,
                             egui::vec2(100.0, 18.0),
                             accent,
@@ -1550,6 +1554,7 @@ impl KeyScribeApp {
                             &mut self.pitch_semitones,
                             -12.0,
                             12.0,
+                            0.0,
                             true,
                             egui::vec2(100.0, 18.0),
                             accent,

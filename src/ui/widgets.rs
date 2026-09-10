@@ -129,6 +129,10 @@ fn paint_knob_arc(
 /// double-click to reset to `default`. With `bipolar` the value arc fills
 /// from 12 o'clock so center stands for `default`-centered ranges.
 /// `granularity` > 0 snaps values to a step (e.g. 0.25 for dB, 0.1 for st).
+///
+/// Note: interaction uses click-and-drag (not drag-only) specifically so
+/// double-click detection works — `Response::double_clicked` requires click
+/// sense, and with drag-only sense the reset above could never fire.
 pub fn synth_knob(
     ui: &mut egui::Ui,
     id_salt: impl std::hash::Hash,
@@ -146,7 +150,7 @@ pub fn synth_knob(
     let span = (max - min).max(f32::EPSILON);
     let mut changed = false;
     let (rect, mut resp) = if enabled {
-        let (rect, resp) = ui.allocate_exact_size(egui::vec2(size, size), egui::Sense::drag());
+        let (rect, resp) = ui.allocate_exact_size(egui::vec2(size, size), egui::Sense::click_and_drag());
         (rect, resp.on_hover_cursor(egui::CursorIcon::ResizeVertical))
     } else {
         ui.allocate_exact_size(egui::vec2(size, size), egui::Sense::hover())
@@ -250,14 +254,16 @@ pub fn synth_knob(
 /// `synth_knob`'s value arc: unipolar fills from the range start, bipolar
 /// (e.g. pitch ±st, centered ranges) fills outward from the middle.
 ///
-/// Drag horizontally or click to jump. The rail follows the ambient widget
-/// visuals, so callers can restyle it with a scope like anywhere else.
+/// Drag horizontally or click to jump; double-click resets to `default`.
+/// The rail follows the ambient widget visuals, so callers can restyle it
+/// with a scope like anywhere else.
 pub fn accent_slider(
     ui: &mut egui::Ui,
     id_salt: impl std::hash::Hash,
     value: &mut f32,
     min: f32,
     max: f32,
+    default: f32,
     bipolar: bool,
     size: egui::Vec2,
     accent: egui::Color32,
@@ -270,9 +276,15 @@ pub fn accent_slider(
     let (rect, resp) = ui.allocate_exact_size(size, egui::Sense::click_and_drag());
     let resp = resp
         .on_hover_cursor(egui::CursorIcon::ResizeHorizontal)
-        .on_hover_text("Drag to adjust");
+        .on_hover_text("Drag to adjust · double-click to reset");
 
-    if resp.dragged() || resp.clicked() {
+    if resp.double_clicked() {
+        let reset = default.clamp(min, max);
+        if (*value - reset).abs() > f32::EPSILON {
+            *value = reset;
+            changed = true;
+        }
+    } else if resp.dragged() || resp.clicked() {
         if let Some(pos) = resp.interact_pointer_pos() {
             let handle_r = (size.y * 0.33).clamp(5.0, 9.0);
             let travel_min = rect.left() + handle_r;

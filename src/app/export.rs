@@ -62,6 +62,7 @@ impl KeyScribeApp {
                             "",
                             0.01,
                             2,
+                            super::default_key_color_sensitivity() * 0.5,
                         );
                         if changed {
                             self.key_color_sensitivity = (ui_key_sensitivity * 2.0).clamp(0.0, 2.0);

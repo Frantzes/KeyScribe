@@ -5,6 +5,7 @@ use egui_phosphor::regular::{
 
 use super::{
     KeyScribeApp, MixSnapshot, SEEK_STEP_SEC, UI_VSPACE_COMPACT, UI_VSPACE_MEDIUM,
+    default_playback_volume,
 };
 use crate::theme::{
     MEDIA_PANEL_BG_DARK, MEDIA_PANEL_BG_LIGHT, SLIDER_RAIL_BG_ACTIVE_DARK,
@@ -302,7 +303,20 @@ fn draw_vertical_volume_slider(ui: &mut egui::Ui, app: &mut KeyScribeApp) {
     );
     // Captured before the slider below mutates app in place.
     let pre_popup_vol = app.playback_volume;
-    if resp.dragged() || resp.clicked() {
+    // Double-click resets to the default. Checked first: the second click
+    // of the gesture would otherwise jump the value before the reset lands.
+    if resp.double_clicked() {
+        let reset = default_playback_volume().clamp(0.0, 1.5);
+        if (app.playback_volume - reset).abs() > f32::EPSILON {
+            let mut snap = MixSnapshot::capture(app);
+            snap.playback_volume = pre_popup_vol;
+            app.push_mix_undo_with(false, snap);
+            app.playback_volume = reset;
+            if let Some(engine) = &mut app.engine {
+                engine.set_volume(app.playback_volume);
+            }
+        }
+    } else if resp.dragged() || resp.clicked() {
         if let Some(pos) = resp.interact_pointer_pos() {
             // Drags coalesce into one undo step via pointer transitions;
             // taps count as discrete actions.
@@ -316,7 +330,7 @@ fn draw_vertical_volume_slider(ui: &mut egui::Ui, app: &mut KeyScribeApp) {
             }
         }
     }
-    resp.on_hover_text("Drag to adjust volume");
+    resp.on_hover_text("Drag to adjust volume · double-click to reset");
 }
 
 /// Spotify-style progress row: thin rail with the elapsed portion in the

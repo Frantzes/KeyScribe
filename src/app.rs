@@ -911,7 +911,11 @@ fn legacy_state_file_path() -> PathBuf {
     app_data_dir().join(LEGACY_STATE_FILE_NAME)
 }
 
-fn load_persisted_state() -> PersistedState {
+/// Load persisted UI state, reporting whether a state file was actually
+/// found. Callers need the distinction: first-run defaults (e.g. tuned
+/// pipeline parameters) may seed a fresh state but must never clobber
+/// settings the user already saved.
+fn load_persisted_state() -> (PersistedState, bool) {
     let mut search_paths = vec![
         state_file_path(),
         legacy_state_file_path(),
@@ -943,11 +947,11 @@ fn load_persisted_state() -> PersistedState {
         };
 
         if let Ok(state) = serde_json::from_str::<PersistedState>(&raw) {
-            return state;
+            return (state, true);
         }
     }
 
-    PersistedState::default()
+    (PersistedState::default(), false)
 }
 
 /// Undoable mix + transport params: stem volumes, audibility/piano
@@ -1482,7 +1486,7 @@ enum RebuildMode {
 
 impl KeyScribeApp {
     pub fn new(_cc: &eframe::CreationContext<'_>) -> Self {
-        let persisted = load_persisted_state();
+        let (persisted, had_saved_state) = load_persisted_state();
         let startup_path = persisted.last_file.clone();
         let mut recent_file_paths = persisted.recent_files.clone();
         if recent_file_paths.is_empty() {
@@ -1715,11 +1719,14 @@ impl KeyScribeApp {
             last_listen_sync_at: None,
         };
 
-        // Apply tuned pipeline parameters (written by `keyscribe-cli tune`) by
-        // default, so the GUI matches the tuned CLI behavior for lead sheets
-        // and melody extraction. Explicit persisted user settings win because
-        // this only runs before the first user interaction.
-        if let Ok(Some(tuned)) = crate::headless::TunedConfig::load_default() {
+        // Apply tuned pipeline parameters (written by `keyscribe-cli tune`)
+        // ONLY on first run (no saved state found), so the GUI matches the
+        // tuned CLI behavior out of the box. On later launches the user's
+        // saved settings win: applying unconditionally here used to reset
+        // e.g. key color sensitivity back to the tuned value on every start,
+        // which is why configured values seemingly never persisted.
+        if !had_saved_state {
+            if let Ok(Some(tuned)) = crate::headless::TunedConfig::load_default() {
             app.key_color_sensitivity = tuned.key_sensitivity.clamp(0.0, 2.0);
             app.manual_bpm = tuned.bpm;
             match tuned.melody.as_str() {
@@ -1740,6 +1747,7 @@ impl KeyScribeApp {
             eprintln!(
                 "[keyscribe] applied tuned pipeline parameters from keyscribe.tuned.json"
             );
+            }
         }
 
         app.refresh_audio_output_devices();
