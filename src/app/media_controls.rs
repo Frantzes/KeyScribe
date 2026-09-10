@@ -223,28 +223,49 @@ fn draw_volume_button(ui: &mut egui::Ui, app: &mut KeyScribeApp, icon_size: f32)
         ui.memory_mut(|mem| mem.toggle_popup(id));
     }
     if ui.memory(|mem| mem.is_popup_open(id)) {
-        egui::popup::popup_above_or_below_widget(
-            ui,
-            id,
-            &resp,
-            egui::AboveOrBelow::Above,
-            |ui| {
-                ui.set_min_width(40.0);
-                ui.set_min_height(132.0);
-                ui.vertical_centered(|ui| {
-                    draw_vertical_volume_slider(ui, app);
-                    ui.add_space(2.0);
-                    ui.label(
-                        egui::RichText::new(format!(
-                            "{}%",
-                            ((app.playback_volume / 1.5).clamp(0.0, 1.0) * 100.0) as i32
-                        ))
-                        .text_style(egui::TextStyle::Small)
-                        .color(egui::Color32::from_rgb(176, 188, 203)),
+        // Centered above the button: egui's popup_above_or_below_widget
+        // anchors the popup's left edge to the button's left edge, pushing
+        // the box to the right. Same popup mechanics, but pivoted on the
+        // button's top-center (with a small gap) instead.
+        let pos = egui::pos2(resp.rect.center().x, resp.rect.top() - 4.0);
+        egui::Area::new(id)
+            .order(egui::Order::Foreground)
+            .constrain(true)
+            .fixed_pos(pos)
+            .pivot(egui::Align2::CENTER_BOTTOM)
+            .show(ui.ctx(), |ui| {
+                egui::Frame::popup(ui.style()).show(ui, |ui| {
+                    // Fixed content size: an auto-sized area offers
+                    // unbounded height, which balloons the popup with dead
+                    // space. 92px slider + spacing + measured % label.
+                    let label_h = ui.fonts(|fonts| {
+                        fonts.row_height(&egui::TextStyle::Small.resolve(ui.style()))
+                    });
+                    let content_h =
+                        92.0 + ui.spacing().item_spacing.y + 2.0 + label_h;
+                    ui.allocate_ui_with_layout(
+                        egui::vec2(28.0, content_h),
+                        egui::Layout::top_down(egui::Align::Center),
+                        |ui| {
+                            draw_vertical_volume_slider(ui, app);
+                            ui.add_space(2.0);
+                            ui.label(
+                                egui::RichText::new(format!(
+                                    "{}%",
+                                    ((app.playback_volume / 1.5).clamp(0.0, 1.0)
+                                        * 100.0)
+                                        as i32
+                                ))
+                                .text_style(egui::TextStyle::Small)
+                                .color(egui::Color32::from_rgb(176, 188, 203)),
+                            );
+                        },
                     );
                 });
-            },
-        );
+            });
+        if ui.input(|i| i.key_pressed(egui::Key::Escape)) || resp.clicked_elsewhere() {
+            ui.memory_mut(|mem| mem.close_popup());
+        }
     }
     resp
 }
@@ -559,7 +580,8 @@ pub(super) fn draw_media_controls(
         MEDIA_PANEL_BG_LIGHT
     };
 
-    let inner_w = (full_w - if compact_layout { 36.0 } else { 44.0 }).max(0.0);
+    let inner_pad = if compact_layout { 10.0 } else { 14.0 };
+    let inner_w = (full_w - 2.0 * inner_pad).max(0.0);
 
     let fallback_name = app
         .loaded_path
@@ -623,9 +645,9 @@ pub(super) fn draw_media_controls(
                 } else {
                     egui::Margin::symmetric(14.0, UI_VSPACE_MEDIUM)
                 })
-                // Side gutters: the inner margin would otherwise push the
-                // fill past the window edges at every width.
-                .outer_margin(egui::Margin::symmetric(8.0, 0.0))
+                // No outer gutter: the parent panel already insets its
+                // content, so the fill spans exactly the same width as the
+                // waveform plot and piano panes above/below it.
                 .show(ui, |ui| {
                     // Force frame width to match the parent width so centering is stable.
                     ui.set_min_width(inner_w);
@@ -1024,16 +1046,19 @@ pub(crate) fn draw_loop_pill(
     if !app.loop_enabled {
         return;
     }
-    let widget_h = ui.spacing().interact_size.y.clamp(30.0, 42.0);
+    // Compact overlay pill: it floats over the waveform, so every pixel
+    // counts. Buttons stay finger-friendly but small; keep the width math in
+    // sync with draw_loop_inputs below (fields 42 wide, 4px gaps).
+    let widget_h = ui.spacing().interact_size.y.clamp(24.0, 32.0);
     // Exact content width: four step buttons + two time fields + the dash
     // separator + gaps (including the trailing spacing egui appends after
     // the last row item), plus the frame's side margins.
-    let pill_w = (4.0 * widget_h + 2.0 * 46.0 + 12.0 + 7.0 * 4.0 + 20.0)
+    let pill_w = (4.0 * widget_h + 2.0 * 42.0 + 12.0 + 7.0 * 4.0 + 16.0)
         .min(avail_w - 16.0)
         .max(180.0);
-    // Frame inner margin is 6 top + 6 bottom: exact fit, so the row sits
+    // Frame inner margin is 5 top + 5 bottom: exact fit, so the row sits
     // vertically centered with no slack.
-    let pill_h = widget_h + 12.0;
+    let pill_h = widget_h + 10.0;
     let pill_rect = egui::Rect::from_min_size(
         egui::pos2(
             content_left + (avail_w - pill_w) * 0.5,
@@ -1050,11 +1075,11 @@ pub(crate) fn draw_loop_pill(
         egui::Frame::none()
             .fill(fill)
             .rounding(egui::Rounding::same(10.0))
-            .inner_margin(egui::Margin::symmetric(10.0, 6.0))
+            .inner_margin(egui::Margin::symmetric(8.0, 5.0))
             .show(ui, |ui| {
                 // Content box excludes the frame's own margins: sizing to the
                 // full pill size would overflow the pill rect to the right.
-                ui.set_min_size(egui::vec2(pill_w - 20.0, pill_h - 12.0));
+                ui.set_min_size(egui::vec2(pill_w - 16.0, pill_h - 10.0));
                 draw_loop_inputs(ui, app);
             });
     });
@@ -1083,9 +1108,9 @@ fn draw_loop_inputs(ui: &mut egui::Ui, app: &mut KeyScribeApp) {
 
     ui.spacing_mut().item_spacing.x = 4.0;
 
-    // Fixed widget height matching the transport buttons so the whole row
-    // stays on one visual line (mixed auto heights drifted apart).
-    let widget_h = ui.spacing().interact_size.y.clamp(30.0, 42.0);
+    // Fixed widget height matching draw_loop_pill so the whole row stays
+    // on one visual line (mixed auto heights drifted apart).
+    let widget_h = ui.spacing().interact_size.y.clamp(24.0, 32.0);
 
     let mut new_start = start;
     let mut new_end = end;
@@ -1097,7 +1122,7 @@ fn draw_loop_inputs(ui: &mut egui::Ui, app: &mut KeyScribeApp) {
         ui.push_id(id, |ui| {
             ui.add_sized(
                 [widget_h, widget_h],
-                egui::Button::new(egui::RichText::new(icon).font(icon_font_id(14.0))),
+                egui::Button::new(egui::RichText::new(icon).font(icon_font_id(12.0))),
             )
         })
         .inner
@@ -1110,7 +1135,7 @@ fn draw_loop_inputs(ui: &mut egui::Ui, app: &mut KeyScribeApp) {
         changed = true;
     }
     let start_resp = ui.add_sized(
-        [46.0, widget_h],
+        [42.0, widget_h],
         egui::TextEdit::singleline(&mut app.loop_start_input_str)
             .id(start_id)
             .margin(egui::vec2(4.0, (widget_h - 16.0) * 0.5)),
@@ -1141,7 +1166,7 @@ fn draw_loop_inputs(ui: &mut egui::Ui, app: &mut KeyScribeApp) {
         changed = true;
     }
     let end_resp = ui.add_sized(
-        [46.0, widget_h],
+        [42.0, widget_h],
         egui::TextEdit::singleline(&mut app.loop_end_input_str)
             .id(end_id)
             .margin(egui::vec2(4.0, (widget_h - 16.0) * 0.5)),

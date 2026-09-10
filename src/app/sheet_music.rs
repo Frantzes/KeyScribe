@@ -8,6 +8,116 @@ use super::*;
 use crate::theme::{MEDIA_PANEL_BG_DARK, MEDIA_PANEL_BG_LIGHT};
 use crate::ui::widgets::{icon_button, icon_toggle_button, responsive_icon_button_size, synth_knob};
 
+/// Build the stem-strip value row (mute icon + dB number + eye icon) as one
+/// text job so all three sections share a single baseline.
+///
+/// Icon fonts carry different vertical bearings than the digit font, so
+/// centering separately-laid-out boxes can never line the ink up (it showed
+/// as a ~1px float). One job = one baseline = optically aligned by
+/// construction.
+fn stem_value_row_job(
+    mute_icon: &str,
+    mute_color: egui::Color32,
+    db_text: &str,
+    db_color: egui::Color32,
+    eye_icon: &str,
+    eye_color: egui::Color32,
+    icon_gap: f32,
+) -> egui::text::LayoutJob {
+    use crate::ui::widgets::icon_font_id;
+
+    let mut job = egui::text::LayoutJob::default();
+    job.wrap = egui::text::TextWrapping::no_max_width();
+    job.append(
+        mute_icon,
+        0.0,
+        egui::text::TextFormat {
+            font_id: icon_font_id(11.0),
+            color: mute_color,
+            ..Default::default()
+        },
+    );
+    job.append(
+        db_text,
+        icon_gap,
+        egui::text::TextFormat {
+            font_id: egui::FontId::monospace(10.0),
+            color: db_color,
+            ..Default::default()
+        },
+    );
+    job.append(
+        eye_icon,
+        icon_gap,
+        egui::text::TextFormat {
+            font_id: icon_font_id(11.0),
+            color: eye_color,
+            ..Default::default()
+        },
+    );
+    job
+}
+
+#[cfg(test)]
+mod stem_row_tests {
+    use super::*;
+
+    /// The value row must lay out as exactly ONE row: that is what puts the
+    /// icons and the dB number on a shared baseline. Multiple rows (wrapping)
+    /// or an empty layout would break both alignment and the hitboxes.
+    #[test]
+    fn stem_value_row_lays_out_on_a_single_shared_baseline() {
+        let ctx = egui::Context::default();
+        crate::theme::apply_brand_theme(&ctx, true, crate::theme::ACCENT_PURPLE);
+
+        let vols = [-12.5f32, 0.0, 7.2, 10.0];
+        let jobs: Vec<_> = vols
+            .iter()
+            .map(|vol| {
+                stem_value_row_job(
+                    SPEAKER_HIGH,
+                    egui::Color32::WHITE,
+                    &format!("{:+.1} dB", vol),
+                    egui::Color32::WHITE,
+                    EYE,
+                    egui::Color32::WHITE,
+                    4.0,
+                )
+            })
+            .collect();
+        // Fonts are only usable inside a run pass.
+        ctx.run(egui::RawInput::default(), |ctx| {
+            for (job, vol) in jobs.into_iter().zip(vols.iter()) {
+                assert_eq!(job.sections.len(), 3, "mute + dB + eye sections");
+                let galley = ctx.fonts(|fonts| fonts.layout_job(job));
+                assert_eq!(
+                    galley.rows.len(),
+                    1,
+                    "value row must not wrap (vol={vol})"
+                );
+                assert!(
+                    galley.size().x > 40.0,
+                    "row should have real width, got {}",
+                    galley.size().x
+                );
+                // Glyphs must span mute → dB → eye left-to-right.
+                let glyphs = &galley.rows[0].glyphs;
+                assert!(
+                    glyphs.len() >= 3,
+                    "expected icon + text + icon glyphs, got {}",
+                    glyphs.len()
+                );
+                let first = glyphs.first().unwrap();
+                let last = glyphs.last().unwrap();
+                assert!(
+                    first.pos.x < last.pos.x,
+                    "glyphs should run left-to-right"
+                );
+            }
+        });
+    }
+}
+
 /// Thin vertical rule used to separate clusters inside a horizontal row.
 fn draw_vertical_separator(ui: &mut egui::Ui, row_h: f32) {
     let h = (row_h * 0.55).clamp(16.0, 24.0);
@@ -233,13 +343,12 @@ impl KeyScribeApp {
             .fill(frame_fill)
             .rounding(egui::Rounding::same(8.0))
             .inner_margin(egui::Margin::symmetric(10.0, UI_VSPACE_COMPACT))
-            // Side gutters: without them the inner margin pushes the fill
-            // past the window edges when the panel spans the full width.
-            .outer_margin(egui::Margin::symmetric(8.0, 0.0))
+            // No outer gutter: the parent panel already insets its content,
+            // so the fill spans exactly the same width as the waveform pane.
             .show(ui, |ui| {
-                // Content width accounts for inner + outer margins so the
-                // fill lands inset with visible rounded corners.
-                let content_w = (ui.available_width() - 36.0).max(0.0);
+                // Content width accounts for the inner margin so the fill
+                // lands exactly on the pane edges with rounded corners.
+                let content_w = (ui.available_width() - 20.0).max(0.0);
                 ui.set_min_width(content_w);
 
                 if !analysis_ready {
@@ -325,96 +434,16 @@ impl KeyScribeApp {
                         let text_color = ui.visuals().text_color();
                         let dim_color = text_color.gamma_multiply(0.4);
 
-                        // Cell: name (with mute/eye flanking it) above the
-                        // knob, value below — all centered.
+                        // Cell: name above the knob, then a value row with
+                        // mute/eye flanking the dB number — all centered.
                         ui.vertical_centered(|ui| {
                             ui.spacing_mut().item_spacing.y = 2.0;
-                            // Name row: hand-composed inside a single
-                            // centered widget so it aligns exactly with the
-                            // knob below (nested child Uis paint left-aligned
-                            // and would break the centering).
-                            let name_gal_w = ui
-                                .painter()
-                                .layout_no_wrap(
-                                    label.as_ref().to_string(),
-                                    egui::FontId::proportional(11.0),
-                                    text_color,
-                                )
-                                .size()
-                                .x;
-                            let icon_w = 18.0_f32;
-                            let gap = 4.0_f32;
-                            let row_w = icon_w + gap + name_gal_w + gap + icon_w;
-                            let (row_rect, _) = ui.allocate_exact_size(
-                                egui::vec2(row_w, 16.0),
-                                egui::Sense::hover(),
+                            // Name alone, centered.
+                            ui.label(
+                                egui::RichText::new(label.as_ref())
+                                    .size(11.0)
+                                    .color(if audible { text_color } else { dim_color }),
                             );
-                            let row_center_y = row_rect.center().y;
-                            let painter = ui.painter();
-                            let mute_rect = egui::Rect::from_min_size(
-                                egui::pos2(row_rect.left(), row_center_y - 8.0),
-                                egui::vec2(icon_w, 16.0),
-                            );
-                            let mute_resp = ui
-                                .interact(
-                                    mute_rect,
-                                    egui::Id::new(("stem_mute", idx)),
-                                    egui::Sense::click(),
-                                )
-                                .on_hover_text(if audible {
-                                    "Audible in playback — click to mute"
-                                } else {
-                                    "Muted — click to unmute"
-                                });
-                            painter.text(
-                                mute_rect.center(),
-                                egui::Align2::CENTER_CENTER,
-                                if audible { SPEAKER_HIGH } else { SPEAKER_LOW },
-                                crate::ui::widgets::icon_font_id(11.0),
-                                if audible { text_color } else { dim_color },
-                            );
-                            if mute_resp.clicked() {
-                                let pd = ui.input(|i| i.pointer.primary_down());
-                                self.push_mix_undo(pd);
-                                self.toggle_stem_mute(idx, label.as_ref());
-                            }
-                            painter.text(
-                                egui::pos2(mute_rect.right() + gap, row_center_y),
-                                egui::Align2::LEFT_CENTER,
-                                label.as_ref(),
-                                egui::FontId::proportional(11.0),
-                                if audible { text_color } else { dim_color },
-                            );
-                            let eye_rect = egui::Rect::from_min_size(
-                                egui::pos2(
-                                    mute_rect.right() + gap + name_gal_w + gap,
-                                    row_center_y - 8.0,
-                                ),
-                                egui::vec2(icon_w, 16.0),
-                            );
-                            let eye_resp = ui
-                                .interact(
-                                    eye_rect,
-                                    egui::Id::new(("stem_eye", idx)),
-                                    egui::Sense::click(),
-                                )
-                                .on_hover_text(if visible {
-                                    "Shown on piano — click to hide"
-                                } else {
-                                    "Hidden from piano — click to show"
-                                });
-                            painter.text(
-                                eye_rect.center(),
-                                egui::Align2::CENTER_CENTER,
-                                if visible { EYE } else { EYE_SLASH },
-                                crate::ui::widgets::icon_font_id(11.0),
-                                if visible { text_color } else { dim_color },
-                            );
-                            if eye_resp.clicked() {
-                                let pd = ui.input(|i| i.pointer.primary_down());
-                                self.push_mix_undo(pd);
-                                self.toggle_stem_piano_visibility(idx);
-                            }
                             let vol_changed = synth_knob(
                                 ui,
                                 ("stem_strip_knob", idx),
@@ -429,16 +458,95 @@ impl KeyScribeApp {
                                 true,
                                 0.25,
                             );
-                            ui.label(
-                                egui::RichText::new(format!("{:+.1} dB", vol))
-                                    .monospace()
-                                    .size(10.0)
-                                    .color(if audible {
-                                        text_color
-                                    } else {
-                                        dim_color
-                                    }),
+                            // Value row: a single text job so the icons and
+                            // the dB number share one baseline — icon fonts
+                            // carry different vertical bearings than the
+                            // digits, so centering separate boxes can never
+                            // line the ink up. Hand-composed inside a single
+                            // centered widget so it aligns exactly with the
+                            // knob above (nested child Uis paint left-aligned
+                            // and would break the centering).
+                            let db_color = if audible { text_color } else { dim_color };
+                            let icon_w = 18.0_f32;
+                            let gap = 4.0_f32;
+                            let mute_str =
+                                if audible { SPEAKER_HIGH } else { SPEAKER_LOW };
+                            let mute_color =
+                                if audible { text_color } else { dim_color };
+                            let eye_str = if visible { EYE } else { EYE_SLASH };
+                            let eye_color =
+                                if visible { text_color } else { dim_color };
+                            let job = stem_value_row_job(
+                                mute_str,
+                                mute_color,
+                                &format!("{:+.1} dB", vol),
+                                db_color,
+                                eye_str,
+                                eye_color,
+                                gap,
                             );
+                            let row_galley =
+                                ui.ctx().fonts(|fonts| fonts.layout_job(job));
+                            let row_size = row_galley.size();
+                            let row_w =
+                                (row_size.x + gap * 2.0).max(icon_w * 2.0 + 8.0);
+                            let (row_rect, _) = ui.allocate_exact_size(
+                                egui::vec2(row_w, row_size.y.max(1.0)),
+                                egui::Sense::hover(),
+                            );
+                            // Center the laid-out row inside the (possibly
+                            // padded) hitbox row so it stays aligned with the
+                            // knob when the dB text is narrow.
+                            let row_left =
+                                row_rect.center().x - row_size.x * 0.5;
+                            ui.painter().galley(
+                                egui::pos2(row_left, row_rect.min.y),
+                                row_galley,
+                                db_color,
+                            );
+                            let mute_rect = egui::Rect::from_min_size(
+                                egui::pos2(row_rect.left(), row_rect.top()),
+                                egui::vec2(icon_w, row_rect.height()),
+                            );
+                            let mute_resp = ui
+                                .interact(
+                                    mute_rect,
+                                    egui::Id::new(("stem_mute", idx)),
+                                    egui::Sense::click(),
+                                )
+                                .on_hover_text(if audible {
+                                    "Audible in playback — click to mute"
+                                } else {
+                                    "Muted — click to unmute"
+                                });
+                            if mute_resp.clicked() {
+                                let pd = ui.input(|i| i.pointer.primary_down());
+                                self.push_mix_undo(pd);
+                                self.toggle_stem_mute(idx, label.as_ref());
+                            }
+                            let eye_rect = egui::Rect::from_min_size(
+                                egui::pos2(
+                                    row_rect.right() - icon_w,
+                                    row_rect.top(),
+                                ),
+                                egui::vec2(icon_w, row_rect.height()),
+                            );
+                            let eye_resp = ui
+                                .interact(
+                                    eye_rect,
+                                    egui::Id::new(("stem_eye", idx)),
+                                    egui::Sense::click(),
+                                )
+                                .on_hover_text(if visible {
+                                    "Shown on piano — click to hide"
+                                } else {
+                                    "Hidden from piano — click to show"
+                                });
+                            if eye_resp.clicked() {
+                                let pd = ui.input(|i| i.pointer.primary_down());
+                                self.push_mix_undo(pd);
+                                self.toggle_stem_piano_visibility(idx);
+                            }
                             if vol_changed {
                                 let pd = ui.input(|i| i.pointer.primary_down());
                                 self.push_mix_undo(pd);

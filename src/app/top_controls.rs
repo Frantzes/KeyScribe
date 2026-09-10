@@ -1254,6 +1254,12 @@ impl KeyScribeApp {
                         let label_font = egui::TextStyle::Body.resolve(ui.style());
 
                         let mut draw_controls = |ui: &mut egui::Ui| {
+                            // Moved-portion fill matches the synth knobs:
+                            // bipolar ranges (min < 0, e.g. visualization
+                            // offset) fill outward from the middle. The theme
+                            // always points selection at the accent color.
+                            let bipolar = min < 0.0;
+                            let accent = ui.visuals().selection.bg_fill;
                             let controls_row_width = ui.available_width().max(0.0);
                             ui.allocate_ui_with_layout(
                                 egui::vec2(controls_row_width, row_height),
@@ -1278,15 +1284,17 @@ impl KeyScribeApp {
                                             < (min_slider_width + min_input_width);
 
                                         if stacked_controls {
-                                            ui.spacing_mut().slider_width = controls_w;
-                                            changed |= ui
-                                                .add_sized(
-                                                    [controls_w, row_height],
-                                                    egui::Slider::new(value, min..=max)
-                                                        .show_value(false)
-                                                        .suffix(suffix),
-                                                )
-                                                .changed();
+                                            changed |=
+                                                crate::ui::widgets::accent_slider(
+                                                    ui,
+                                                    ("piano_setting", label),
+                                                    value,
+                                                    min,
+                                                    max,
+                                                    bipolar,
+                                                    egui::vec2(controls_w, row_height),
+                                                    accent,
+                                                );
 
                                             let compact_input_width = controls_w
                                                 .min(96.0)
@@ -1332,14 +1340,17 @@ impl KeyScribeApp {
                                                 .max(min_slider_width);
 
                                             ui.spacing_mut().slider_width = slider_width;
-                                            changed |= ui
-                                                .add_sized(
-                                                    [slider_width, row_height],
-                                                    egui::Slider::new(value, min..=max)
-                                                        .show_value(false)
-                                                        .suffix(suffix),
-                                                )
-                                                .changed();
+                                            changed |=
+                                                crate::ui::widgets::accent_slider(
+                                                    ui,
+                                                    ("piano_setting", label),
+                                                    value,
+                                                    min,
+                                                    max,
+                                                    bipolar,
+                                                    egui::vec2(slider_width, row_height),
+                                                    accent,
+                                                );
 
                                             changed |= ui
                                                 .scope(|ui| {
@@ -1432,15 +1443,20 @@ impl KeyScribeApp {
             let knob_size: f32 = 30.0;
             let cell_h = 11.0 + knob_size + 12.0 + 8.0;
             let rest = ui.available_width().max(0.0);
-            // Equal halves of the remaining space.
-            ui.columns(2, |cols| {
-                for (ci, col) in cols.iter_mut().enumerate() {
-                    let col_w = col.available_width();
-                    col.allocate_ui_with_layout(
-                        egui::vec2(col_w, cell_h),
-                        egui::Layout::top_down(egui::Align::Center),
-                        |ui| {
-                            ui.set_min_width(col_w);
+            // Content-width cells packed from the left so the cluster starts
+            // flush with the pane below instead of floating centered in
+            // halves with dead space on the left.
+            let cell_w = (rest * 0.5).clamp(40.0, 64.0);
+            let gap = ui.spacing().item_spacing.x;
+            ui.allocate_ui_with_layout(
+                egui::vec2(cell_w * 2.0 + gap, cell_h),
+                egui::Layout::left_to_right(egui::Align::Center),
+                |ui| {
+                    for ci in 0..2 {
+                        ui.allocate_ui_with_layout(
+                            egui::vec2(cell_w, cell_h),
+                            egui::Layout::top_down(egui::Align::Center),
+                            |ui| {
                             ui.spacing_mut().item_spacing.y = 2.0;
                             if ci == 0 {
                                 ui.label(egui::RichText::new("Speed").size(11.0));
@@ -1491,8 +1507,7 @@ impl KeyScribeApp {
             });
         } else {
             // Desktop: label above a slider with a live value readout.
-            ui.add_space(8.0);
-
+            // The chip starts flush with the pane below (no leading gap).
             // One chip behind both sliders: keeps their rails visible on the
             // transparent wallpaper and stops them stretching into the
             // cluster's space.
@@ -1510,18 +1525,15 @@ impl KeyScribeApp {
                         ui.spacing_mut().item_spacing.x = 8.0;
 
                         ui.label(egui::RichText::new("Speed").size(10.0));
-                        ui.allocate_ui_with_layout(
+                        changed |= crate::ui::widgets::accent_slider(
+                            ui,
+                            ("top_param_slider", "speed"),
+                            &mut self.speed,
+                            0.5,
+                            2.0,
+                            false,
                             egui::vec2(100.0, 18.0),
-                            egui::Layout::left_to_right(egui::Align::Center),
-                            |ui| {
-                                changed |= ui
-                                    .add(
-                                        egui::Slider::new(&mut self.speed, 0.5..=2.0)
-                                            .show_value(false)
-                                            .smart_aim(false),
-                                    )
-                                    .changed();
-                            },
+                            accent,
                         );
                         ui.label(
                             egui::RichText::new(format!("{:.2}x", self.speed))
@@ -1532,18 +1544,15 @@ impl KeyScribeApp {
                         ui.add_space(6.0);
 
                         ui.label(egui::RichText::new("Pitch").size(10.0));
-                        ui.allocate_ui_with_layout(
+                        changed |= crate::ui::widgets::accent_slider(
+                            ui,
+                            ("top_param_slider", "pitch"),
+                            &mut self.pitch_semitones,
+                            -12.0,
+                            12.0,
+                            true,
                             egui::vec2(100.0, 18.0),
-                            egui::Layout::left_to_right(egui::Align::Center),
-                            |ui| {
-                                changed |= ui
-                                    .add(
-                                        egui::Slider::new(&mut self.pitch_semitones, -12.0..=12.0)
-                                            .show_value(false)
-                                            .smart_aim(false),
-                                    )
-                                    .changed();
-                            },
+                            accent,
                         );
                         ui.label(
                             egui::RichText::new(format!("{:+.1} st", self.pitch_semitones))

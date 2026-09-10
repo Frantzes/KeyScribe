@@ -391,7 +391,9 @@ impl eframe::App for KeyScribeApp {
                     ui.allocate_exact_size(egui::vec2(row_w, cog_size), egui::Sense::hover());
                 let cog_rect = egui::Rect::from_min_size(
                     egui::pos2(
-                        cog_row_rect.right() - cog_size - 6.0,
+                        // Flush with the row's right edge (which already
+                        // aligns with the piano above): no extra margin.
+                        cog_row_rect.right() - cog_size,
                         cog_row_rect.center().y - cog_size * 0.5,
                     ),
                     egui::vec2(cog_size, cog_size),

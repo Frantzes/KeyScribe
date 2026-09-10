@@ -245,3 +245,92 @@ pub fn synth_knob(
 
     changed
 }
+
+/// Horizontal slider whose moved portion is painted in `accent`, matching
+/// `synth_knob`'s value arc: unipolar fills from the range start, bipolar
+/// (e.g. pitch ±st, centered ranges) fills outward from the middle.
+///
+/// Drag horizontally or click to jump. The rail follows the ambient widget
+/// visuals, so callers can restyle it with a scope like anywhere else.
+pub fn accent_slider(
+    ui: &mut egui::Ui,
+    id_salt: impl std::hash::Hash,
+    value: &mut f32,
+    min: f32,
+    max: f32,
+    bipolar: bool,
+    size: egui::Vec2,
+    accent: egui::Color32,
+) -> bool {
+    let span = (max - min).max(f32::EPSILON);
+    let mut changed = false;
+    // Persistent id keeps the widget identity stable for drags that cross
+    // frames; interaction itself is position-driven below.
+    let _id = ui.make_persistent_id(id_salt);
+    let (rect, resp) = ui.allocate_exact_size(size, egui::Sense::click_and_drag());
+    let resp = resp
+        .on_hover_cursor(egui::CursorIcon::ResizeHorizontal)
+        .on_hover_text("Drag to adjust");
+
+    if resp.dragged() || resp.clicked() {
+        if let Some(pos) = resp.interact_pointer_pos() {
+            let handle_r = (size.y * 0.33).clamp(5.0, 9.0);
+            let travel_min = rect.left() + handle_r;
+            let travel_max = rect.right() - handle_r;
+            let frac =
+                ((pos.x - travel_min) / (travel_max - travel_min).max(1.0)).clamp(0.0, 1.0);
+            let new_value = (min + span * frac).clamp(min, max);
+            if (new_value - *value).abs() > f32::EPSILON {
+                *value = new_value;
+                changed = true;
+            }
+        }
+    }
+
+    let painter = ui.painter();
+    let visuals = ui.visuals();
+    let handle_r = (size.y * 0.33).clamp(5.0, 9.0);
+    let rail_h = (size.y * 0.22).clamp(3.0, 6.0);
+    let travel_min = rect.left() + handle_r;
+    let travel_max = rect.right() - handle_r;
+    let rail = egui::Rect::from_min_max(
+        egui::pos2(travel_min, rect.center().y - rail_h * 0.5),
+        egui::pos2(travel_max, rect.center().y + rail_h * 0.5),
+    );
+    painter.rect_filled(rail, rail.height() * 0.5, visuals.widgets.inactive.bg_fill);
+
+    // Moved portion: from the range start, or outward from the middle when
+    // bipolar — the same rule as `synth_knob`'s value arc.
+    let origin_t = if bipolar { 0.5 } else { 0.0 };
+    let t_now = ((*value - min) / span).clamp(0.0, 1.0);
+    let (f0, f1) = if t_now >= origin_t {
+        (origin_t, t_now)
+    } else {
+        (t_now, origin_t)
+    };
+    if f1 - f0 > 1.0e-3 {
+        let fill = egui::Rect::from_min_max(
+            egui::pos2(travel_min + f0 * (travel_max - travel_min), rail.top()),
+            egui::pos2(travel_min + f1 * (travel_max - travel_min), rail.bottom()),
+        );
+        painter.rect_filled(fill, rail.height() * 0.5, accent);
+    }
+
+    let active = resp.hovered() || resp.dragged();
+    let handle_pos = egui::pos2(
+        travel_min + t_now * (travel_max - travel_min),
+        rect.center().y,
+    );
+    painter.circle_filled(
+        handle_pos,
+        handle_r,
+        if active {
+            visuals.widgets.hovered.bg_fill
+        } else {
+            visuals.widgets.inactive.bg_fill
+        },
+    );
+    painter.circle_stroke(handle_pos, handle_r, visuals.widgets.inactive.fg_stroke);
+
+    changed
+}
