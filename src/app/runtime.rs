@@ -538,10 +538,6 @@ impl KeyScribeApp {
         0.0
     }
 
-    pub(super) fn source_to_output_time(&self, source_sec: f32) -> f32 {
-        source_sec / self.playback_rate()
-    }
-
     pub(super) fn timeline_duration_sec(&self) -> f32 {
         if self.is_audio_loading
             && (self.loading_cache_waveform_preloaded || self.loading_cache_timeline_preloaded)

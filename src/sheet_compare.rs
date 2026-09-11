@@ -9,7 +9,7 @@ use std::path::Path;
 use crate::midi::{parse_midi_notes, MidiNote};
 
 /// Parse a MusicXML document, tolerating the DOCTYPE MuseScore emits.
-fn parse_doc(xml: &str) -> anyhow::Result<roxmltree::Document> {
+fn parse_doc(xml: &str) -> anyhow::Result<roxmltree::Document<'_>> {
     roxmltree::Document::parse_with_options(
         xml,
         roxmltree::ParsingOptions {
@@ -546,7 +546,7 @@ mod a1_diag {
         let pc = per_bar_matches(&refn, &co, 0.25);
         for (bar, cnt_n, m_n) in &pn {
             let m_c = pc.iter().find(|(b, _, _)| b == bar).map(|(_, _, m)| *m).unwrap_or(0.0);
-            let cnt_c = pc.iter().find(|(b, c, _)| b == bar).map(|(_, c, _)| *c).unwrap_or(0);
+            let cnt_c = pc.iter().find(|(b, _, _)| b == bar).map(|(_, c, _)| *c).unwrap_or(0);
             let delta = m_c as i32 - *m_n as i32;
             if *cnt_n > 0 && delta != 0 {
                 eprintln!("DIAG bar {} no={}matches({}) co={}matches({}) delta={}",

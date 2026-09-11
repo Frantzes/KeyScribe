@@ -495,7 +495,7 @@ pub fn refine_beat_phase_fixed_bpm(
         }
     }
 
-    let mut refined = if changed {
+    let refined = if changed {
         let mut r = base.clone();
         r.beats = best_beats;
         r.downbeats = best_downbeats;

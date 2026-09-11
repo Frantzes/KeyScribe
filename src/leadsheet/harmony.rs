@@ -503,6 +503,7 @@ pub(crate) const ALL_TEMPLATES: [(&str, &[u8]); 27] = [
 /// The quality suffixes that survive the extension collapse unchanged. Every
 /// template suffix must map into this set; enumerate `ALL_TEMPLATES` in tests
 /// rather than duplicating it.
+#[cfg(test)]
 pub(crate) const KEEP_QUALITIES: [&str; 12] = [
     "", "-", "dim", "aug", "sus2", "sus4", "7", "\u{0394}7", "-7", "-\u{0394}7",
     "dim7", "-7b5",
@@ -650,7 +651,7 @@ pub fn detect_chords_from_timeline(
     for prof in profiles.iter() {
         let split = if config.split_threshold > 0.0 {
             match (prof.halves, prof.halves_bass) {
-                (Some((h1, h2)), Some((hb1, hb2))) => {
+                (Some((h1, h2)), Some((_hb1, _hb2))) => {
                     let (w1, e1) = whiten_profile(&h1);
                     let (w2, e2) = whiten_profile(&h2);
                     let cosine_dist = 1.0 - profile_cosine(&w1, &w2);

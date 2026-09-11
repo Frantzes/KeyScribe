@@ -1833,6 +1833,7 @@ pub fn detect_articulation(
 mod tests {
     use super::*;
 
+    #[allow(dead_code)]
     fn note(start: f32, end: f32) -> NoteEvent {
         NoteEvent {
             id: 0,

@@ -89,7 +89,7 @@ mod stem_row_tests {
             })
             .collect();
         // Fonts are only usable inside a run pass.
-        ctx.run(egui::RawInput::default(), |ctx| {
+        let _ = ctx.run(egui::RawInput::default(), |ctx| {
             for (job, vol) in jobs.into_iter().zip(vols.iter()) {
                 assert_eq!(job.sections.len(), 3, "mute + dB + eye sections");
                 let galley = ctx.fonts(|fonts| fonts.layout_job(job));
@@ -145,12 +145,10 @@ use crate::leadsheet::{
 };
 use crate::musicxml::{
     build_musicxml_document, export_engraved_pdf_with_musescore, extract_melody_heuristic,
-    extract_melody_skyline, merge_adjacent_notes, merge_adjacent_notes_with_gap,
-    sanitize_filename_component, write_temp_musicxml, MUSICXML_DIVISIONS, SHEET_SWING_BIAS,
+    extract_melody_skyline, sanitize_filename_component, write_temp_musicxml, MUSICXML_DIVISIONS,
+    SHEET_SWING_BIAS,
     SheetEngravingConfig,
 };
-
-const MIN_SHEET_NOTE_FRAMES: usize = 2;
 
 impl KeyScribeApp {
     fn estimate_sheet_cursor_offset_sec(
@@ -2348,6 +2346,7 @@ fn draw_scrollable_engraved_preview(
 /// user-chosen accent color, so the direction and amount of the offset are
 /// visible. Returns true when the value changed. When `enabled` is false the
 /// slider is painted dimmed and does not react to clicks or drags.
+#[allow(dead_code)]
 fn bipolar_db_slider(
     ui: &mut egui::Ui,
     id: egui::Id,

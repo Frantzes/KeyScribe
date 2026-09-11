@@ -787,14 +787,14 @@ pub fn extract_melody_skyline(notes: &[NoteEvent], outlier_semitones: u8) -> Vec
                     .map(|lp| active.iter().any(|a| a.0 == lp))
                     .unwrap_or(false);
                 match best {
-                    Some((p, bs)) if !old_still_sounding => p,
+                    Some((p, _)) if !old_still_sounding => p,
                     Some((p, bs)) => {
                         if let Some(ls) = last_running_score {
                             // Only apply the continuity margin when we just
                             // switched (chatter window) — otherwise allow
                             // genuine melodic motion through freely.
                             let rapid = batch_time - last_switch_time < CHATTER_WINDOW_SEC;
-                            if (!rapid || bs - ls >= CONTINUITY_MARGIN) {
+                            if !rapid || bs - ls >= CONTINUITY_MARGIN {
                                 p
                             } else if let Some(lp) = last_melody_pitch {
                                 lp
@@ -990,22 +990,6 @@ pub fn extract_melody_skyline(notes: &[NoteEvent], outlier_semitones: u8) -> Vec
         eprintln!("[quant-debug] segment duration hist: {}", durs.join(" "));
     }
     melody_segments
-}
-
-/// Stepwise-motion prior: how strongly we penalize a pitch jump of `d`
-/// semitones between consecutive melody decisions.
-fn transition_penalty(q: u8, p: u8) -> f32 {
-    let d = (p as i16 - q as i16).abs();
-    match d {
-        0 => 0.0,
-        1 => 0.15,
-        2 => 0.35,
-        3 => 0.8,
-        4 => 1.4,
-        5..=7 => 2.2,
-        8..=11 => 4.0,
-        _ => 7.0,
-    }
 }
 
 pub fn merge_adjacent_notes(notes: &mut Vec<NoteEvent>, step: f32) {

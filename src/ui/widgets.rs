@@ -262,7 +262,7 @@ fn paint_knob_arc(
 /// sense, and with drag-only sense the reset above could never fire.
 pub fn synth_knob(
     ui: &mut egui::Ui,
-    id_salt: impl std::hash::Hash,
+    _id_salt: impl std::hash::Hash,
     value: &mut f32,
     min: f32,
     max: f32,

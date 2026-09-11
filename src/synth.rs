@@ -44,7 +44,7 @@ pub struct Song {
     pub duration_sec: f32,
 }
 
-fn parse_doc(xml: &str) -> Result<roxmltree::Document> {
+fn parse_doc(xml: &str) -> Result<roxmltree::Document<'_>> {
     roxmltree::Document::parse_with_options(
         xml,
         roxmltree::ParsingOptions {

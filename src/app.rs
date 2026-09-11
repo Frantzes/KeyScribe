@@ -17,8 +17,7 @@ use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 
 use crate::analysis::{
-    analyze_with_full_pipeline, detect_note_probabilities, PIANO_HIGH_MIDI, PIANO_KEY_COUNT,
-    PIANO_LOW_MIDI,
+    analyze_with_full_pipeline, PIANO_HIGH_MIDI, PIANO_KEY_COUNT, PIANO_LOW_MIDI,
 };
 use crate::audio_io::{
     load_audio_file_streaming, load_audio_preview_chunk, AudioData, AudioPreviewChunk,
@@ -1333,7 +1332,6 @@ pub struct KeyScribeApp {
     marker_edit_index: Option<usize>,
     marker_edit_str: String,
     streaming_stretch: Option<StreamingStretchState>,
-    last_listen_sync_at: Option<Instant>,
 }
 
 struct StreamingStretchState {
@@ -1770,7 +1768,6 @@ impl KeyScribeApp {
             marker_edit_index: None,
             marker_edit_str: String::new(),
             streaming_stretch: None,
-            last_listen_sync_at: None,
         };
 
         // Apply tuned pipeline parameters (written by `keyscribe-cli tune`)
