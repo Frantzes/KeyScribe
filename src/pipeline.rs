@@ -41,6 +41,9 @@ impl Default for PipelineConfig {
 /// Simplified pipeline result for file-based processing
 pub struct PipelineResult {
     pub note_probs_sequence: Vec<Vec<f32>>,
+    /// Onset probabilities per frame (same shape), when the model exposes a
+    /// separate onset head.
+    pub onset_probs_sequence: Option<Vec<Vec<f32>>>,
     pub smoothed_notes: Vec<Vec<bool>>,
 }
 
@@ -61,6 +64,7 @@ impl AudioPipeline {
         if samples.is_empty() {
             return Ok(PipelineResult {
                 note_probs_sequence: vec![],
+                onset_probs_sequence: None,
                 smoothed_notes: vec![],
             });
         }
@@ -83,25 +87,38 @@ impl AudioPipeline {
         if model_samples.is_empty() {
             return Ok(PipelineResult {
                 note_probs_sequence: vec![],
+                onset_probs_sequence: None,
                 smoothed_notes: vec![],
             });
         }
 
         let mut note_probs_sequence = Vec::new();
+        let mut onset_probs_sequence: Option<Vec<Vec<f32>>> = None;
         let mut start = 0usize;
         let mut first = true;
 
         loop {
             let end = (start + model_input_samples).min(model_samples.len());
             let window = &model_samples[start..end];
-            let mut window_probs = inference.infer_audio_window(window)?;
+            let (mut window_probs, window_onsets) = inference.infer_audio_window(window)?;
 
             if first {
                 note_probs_sequence.append(&mut window_probs);
+                if let Some(mut ons) = window_onsets {
+                    onset_probs_sequence = Some(Vec::new());
+                    onset_probs_sequence.as_mut().unwrap().append(&mut ons);
+                }
                 first = false;
             } else {
                 let keep_from = overlap_output.min(window_probs.len());
                 note_probs_sequence.extend(window_probs.into_iter().skip(keep_from));
+                if let Some(ons) = window_onsets {
+                    let keep_from = overlap_output.min(ons.len());
+                    onset_probs_sequence
+                        .as_mut()
+                        .unwrap()
+                        .extend(ons.into_iter().skip(keep_from));
+                }
             }
 
             if end >= model_samples.len() {
@@ -117,6 +134,7 @@ impl AudioPipeline {
         if note_probs_sequence.is_empty() {
             return Ok(PipelineResult {
                 note_probs_sequence,
+                onset_probs_sequence: None,
                 smoothed_notes: vec![],
             });
         }
@@ -129,6 +147,7 @@ impl AudioPipeline {
 
         Ok(PipelineResult {
             note_probs_sequence,
+            onset_probs_sequence,
             smoothed_notes: smoothed,
         })
     }

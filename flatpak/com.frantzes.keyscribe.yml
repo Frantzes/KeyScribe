@@ -1,0 +1,228 @@
+---
+id: com.frantzes.keyscribe
+runtime: org.freedesktop.Platform//24.08
+sdk: org.freedesktop.Sdk//24.08
+sdk-extensions:
+  - org.freedesktop.Sdk.Extension.rust-stable
+  - org.freedesktop.Sdk.Extension.llvm18
+
+# ONNX Runtime GPU only publishes CUDA-enabled wheels for x86_64, so the
+# Flatpak is x86_64-only (the app still runs on CPU without any CUDA libs).
+architectures:
+  - x86_64
+
+command: keyscribe
+
+finish-args:
+  - --share=ipc
+  - --share=network # MVSep cloud stem separation API (HTTPS)
+  - --socket=x11
+  - --socket=wayland
+  - --device=dri
+  - --socket=pulseaudio
+  - --socket=session-bus
+  - --talk-name=org.freedesktop.portal.FileChooser
+  - --talk-name=org.freedesktop.portal.OpenURI
+  # Media libraries only; anything else is opened through the FileChooser
+  # portal (per-file grants, no broad host access).
+  - --filesystem=xdg-music
+  - --filesystem=xdg-videos
+  - --filesystem=xdg-download
+  - --filesystem=xdg-documents
+  - --env=LD_LIBRARY_PATH=/app/bin/cuda
+  - --env=XDG_CURRENT_DESKTOP=Unity
+
+modules:
+  # ──────────────────────────────────────────────
+  # FFmpeg — static build from BtbN GitHub
+  # ──────────────────────────────────────────────
+  - name: ffmpeg
+    buildsystem: simple
+    build-commands:
+      - install -Dm755 bin/ffmpeg /app/bin/ffmpeg
+      - install -Dm755 bin/ffprobe /app/bin/ffprobe
+    sources:
+      - type: archive
+        url: https://github.com/BtbN/FFmpeg-Builds/releases/download/autobuild-2026-09-05-13-10/ffmpeg-N-126416-g9997fd0606-linux64-gpl.tar.xz
+        sha256: 13c82fe68c401eb3f3ae2e402beb480fdd384b4de7222ae368bdbab36e949ab6
+        strip-components: 1
+
+  # ──────────────────────────────────────────────
+  # ONNX models — from GitHub Releases
+  # ──────────────────────────────────────────────
+  - name: onnx-models
+    buildsystem: simple
+    build-commands:
+      - install -Dm644 htdemucs_6s.onnx /app/bin/models/htdemucs_6s.onnx
+      - install -Dm644 beat_this_small.onnx /app/bin/models/beat_this_small.onnx
+      - install -Dm644 mel_spectrogram.onnx /app/bin/models/mel_spectrogram.onnx
+    sources:
+      - type: file
+        url: https://github.com/Frantzes/KeyScribe/releases/download/assets-v1/htdemucs_6s.onnx
+        sha256: b268327119b709141d43ba4103e7bb5f54bbf33311d6f1af5054ef663bf83322
+        dest-filename: htdemucs_6s.onnx
+      - type: file
+        url: https://github.com/Frantzes/KeyScribe/releases/download/assets-v1/beat_this_small.onnx
+        sha256: a5f8d39d989f31859454ba27afe61c5317ca95e4d9373e6853e5361b8937172f
+        dest-filename: beat_this_small.onnx
+      - type: file
+        url: https://github.com/Frantzes/KeyScribe/releases/download/assets-v1/mel_spectrogram.onnx
+        sha256: fdd59e65c515331308e4c8841edf99972deca646bdf6197744c2a5b7755e3de9
+        dest-filename: mel_spectrogram.onnx
+
+  # ──────────────────────────────────────────────
+  # cuDNN 9 — from NVIDIA redistributable
+  # ──────────────────────────────────────────────
+  - name: cudnn
+    buildsystem: simple
+    build-commands:
+      - mkdir -p /app/bin/cuda
+      - |
+        cd cudnn-extract
+        for lib in libcudnn.so.9 libcudnn_graph.so.9 libcudnn_ops.so.9 \
+                   libcudnn_heuristic.so.9 libcudnn_adv.so.9 \
+                   libcudnn_cnn.so.9 libcudnn_engines_precompiled.so.9 \
+                   libcudnn_engines_runtime_compiled.so.9; do
+          find . -name "$lib" -exec install -m755 {} /app/bin/cuda/ \;
+        done
+    sources:
+      - type: archive
+        url: https://developer.download.nvidia.com/compute/cudnn/redist/cudnn/linux-x86_64/cudnn-linux-x86_64-9.3.0.75_cuda12-archive.tar.xz
+        sha256: 3d6ef10aa06dc9339a477e2b057e085ff8500bbdee79e42c7e13655c9eff2c26
+        dest: cudnn-extract
+
+  # ──────────────────────────────────────────────
+  # ONNX Runtime GPU — from PyPI pip wheel
+  # ──────────────────────────────────────────────
+  - name: onnxruntime-gpu
+    buildsystem: simple
+    build-commands:
+      - mkdir -p wheel-extract
+      - unzip -q onnxruntime_gpu*.whl -d wheel-extract
+      - |
+        cd wheel-extract/onnxruntime/capi
+        for f in libonnxruntime.so* libonnxruntime_providers_cuda.so* \
+                 libonnxruntime_providers_shared.so*; do
+          if [ -f "$f" ] || [ -L "$f" ]; then
+            cp -aP "$f" /app/bin/cuda/
+          fi
+        done
+      # The wheel only ships a versioned file, but the app loads the exact
+      # name `libonnxruntime.so` via ort::init_from (see src/demucs.rs).
+      # NOTE: keep the version in sync with the wheel pinned above.
+      - ln -sf libonnxruntime.so.1.24.4 /app/bin/cuda/libonnxruntime.so
+      - ln -sf /app/bin/cuda/libonnxruntime.so /app/bin/libonnxruntime.so
+      - cp -aP /app/bin/cuda/libonnxruntime_providers_cuda.so /app/bin/
+    sources:
+      - type: file
+        url: https://files.pythonhosted.org/packages/d0/2c/5b3fd4748cf7ed291eae541a37e426efc20ea04cb6e6a05768304ab0aa41/onnxruntime_gpu-1.24.4-cp312-cp312-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl
+        sha256: eb0e38f0c1ef3b76ae0081c8e51eed20dd8925aa916f0fc6f9b8b17d05610e99
+        dest-filename: onnxruntime_gpu-1.24.4-cp312-cp312-manylinux.whl
+
+  # ──────────────────────────────────────────────
+  # CUDA 12 runtime — NVIDIA cu12 pip wheels + nvrtc .deb
+  #
+  # These provide libcudart/cublas/cufft/curand/nvrtc for the ONNX Runtime
+  # CUDA execution provider. Pinned as file sources so the build stays
+  # fully offline (flatpak-builder build-commands have no network).
+  # Without these the app falls back to CPU inference.
+  # ──────────────────────────────────────────────
+  - name: cuda-libs
+    buildsystem: simple
+    build-commands:
+      - mkdir -p /app/bin/cuda wheel-extract
+      - |
+        for whl in ./*.whl; do python3 -m zipfile -e "$whl" wheel-extract; done
+        for lib in libcudart.so.12 libcublas.so.12 libcublasLt.so.12 \
+                   libcufft.so.11 libcurand.so.10; do
+          find wheel-extract -name "$lib" -exec cp -aP {} /app/bin/cuda/ \;
+        done
+      - |
+        mkdir -p nvrtc-data
+        ar p cuda-nvrtc.deb data.tar.xz | tar -xJ -C nvrtc-data
+        find nvrtc-data -name "libnvrtc*.so*" -exec cp -aP {} /app/bin/cuda/ \;
+    sources:
+      - type: file
+        url: https://files.pythonhosted.org/packages/bc/46/a92db19b8309581092a3add7e6fceb4c301a3fd233969856a8cbf042cd3c/nvidia_cuda_runtime_cu12-12.9.79-py3-none-manylinux2014_x86_64.manylinux_2_17_x86_64.whl
+        sha256: 25bba2dfb01d48a9b59ca474a1ac43c6ebf7011f1b0b8cc44f54eb6ac48a96c3
+        dest-filename: nvidia_cuda_runtime_cu12-12.9.79-py3-none-manylinux.whl
+      - type: file
+        url: https://files.pythonhosted.org/packages/cb/c0/0a517bfe63ccd3b92eb254d264e28fca3c7cab75d07daea315250fb1bf73/nvidia_cublas_cu12-12.9.2.10-py3-none-manylinux_2_27_x86_64.whl
+        sha256: e4f53a8ca8c5d6e8c492d0d0a3d565ecb59a751b19cfdaa4f6da0ab2104c1702
+        dest-filename: nvidia_cublas_cu12-12.9.2.10-py3-none-manylinux.whl
+      - type: file
+        url: https://files.pythonhosted.org/packages/95/f4/61e6996dd20481ee834f57a8e9dca28b1869366a135e0d42e2aa8493bdd4/nvidia_cufft_cu12-11.4.1.4-py3-none-manylinux2014_x86_64.manylinux_2_17_x86_64.whl
+        sha256: c67884f2a7d276b4b80eb56a79322a95df592ae5e765cf1243693365ccab4e28
+        dest-filename: nvidia_cufft_cu12-11.4.1.4-py3-none-manylinux.whl
+      - type: file
+        url: https://files.pythonhosted.org/packages/31/44/193a0e171750ca9f8320626e8a1f2381e4077a65e69e2fb9708bd479e34a/nvidia_curand_cu12-10.3.10.19-py3-none-manylinux_2_27_x86_64.whl
+        sha256: 49b274db4780d421bd2ccd362e1415c13887c53c214f0d4b761752b8f9f6aa1e
+        dest-filename: nvidia_curand_cu12-10.3.10.19-py3-none-manylinux.whl
+      - type: file
+        url: https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2204/x86_64/cuda-nvrtc-12-9_12.9.86-1_amd64.deb
+        sha256: 4e1cc14cc3578dd69286d9ac6a0623297e854ba09539b1780b6989d2199395af
+        dest-filename: cuda-nvrtc.deb
+
+  # ──────────────────────────────────────────────
+  # KeyScribe — Rust binary + desktop integration
+  # ──────────────────────────────────────────────
+  - name: keyscribe
+    buildsystem: simple
+    build-options:
+      append-path: /usr/lib/sdk/rust-stable/bin
+      env:
+        CARGO_HOME: /run/build/keyscribe/cargo
+        CARGO_NET_OFFLINE: "true"
+        VEROVIO_SOURCE_DIR: /run/build/keyscribe/verovio-source
+        LIBCLANG_PATH: /usr/lib/sdk/llvm18/lib
+    build-commands:
+      # Build Rust binary from vendored crates (no network needed). bindgen
+      # crates need the SDK's gcc/glibc headers; clang from the llvm18
+      # extension doesn't find them on its own.
+      # (CUDA 12/cuDNN/ORT libs arrive via the cuda-libs, cudnn and
+      # onnxruntime-gpu modules into /app/bin/cuda/ + /app/bin/.)
+      - cargo --offline fetch --manifest-path Cargo.toml
+      - |
+        export BINDGEN_EXTRA_CLANG_ARGS="-I$(gcc -print-file-name=include) -I$(gcc -print-file-name=include-fixed) -I/usr/include"
+        cargo build --offline --release --manifest-path Cargo.toml
+      # Install binary
+      - install -Dm755 target/release/keyscribe /app/bin/keyscribe
+      # basic-pitch.onnx is committed to git (not in the release assets), so
+      # it arrives via the staged repo sources above.
+      - install -Dm644 models/basic-pitch.onnx /app/bin/models/basic-pitch.onnx
+      # Desktop integration
+      - install -Dm644 flatpak/com.frantzes.keyscribe.desktop /app/share/applications/com.frantzes.keyscribe.desktop
+      - install -Dm644 flatpak/com.frantzes.keyscribe.metainfo.xml /app/share/metainfo/com.frantzes.keyscribe.metainfo.xml
+      - install -Dm644 icon.png /app/share/icons/hicolor/256x256/apps/com.frantzes.keyscribe.png
+    sources:
+      # Copy the repo root, skipping heavy/dev-only dirs so they don't get
+      # staged into the sandbox (target/, .venv/, vendor/, ...).
+      # NOTE: models/ is intentionally NOT skipped: basic-pitch.onnx is
+      # committed to git and installed from the staged tree (the other
+      # models arrive via the onnx-models module). assets/ holds the
+      # bundled Jost font embedded into the binary via include_bytes!.
+      - type: dir
+        path: ..
+        dest: .
+        skip:
+          - .git
+          - .gitignore
+          - .venv
+          - .flatpak-builder
+          - .vscode
+          - .agents
+          - target
+          - build
+          - vendor
+          - demucs_output
+      # Vendored Rust crates (generated by flatpak-cargo-generator.py) so the
+      # build is fully offline and deterministic.
+      - cargo-sources.json
+      # Verovio C++ source for verovioxide-sys' bundled build. Its build.rs
+      # downloads this from GitHub unless VEROVIO_SOURCE_DIR is set; the
+      # download would fail in the offline build sandbox.
+      - type: archive
+        url: https://github.com/rism-digital/verovio/archive/refs/tags/version-5.7.0.tar.gz
+        sha256: bf7483504ddbf2d7ff59ae53b547e6347f89f82583559bf264d97b3624279d5e
+        dest: verovio-source
+        strip-components: 1

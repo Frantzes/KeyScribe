@@ -1,15 +1,15 @@
 use super::*;
 use crate::theme::{
-    SLIDER_RAIL_BG_ACTIVE_DARK, SLIDER_RAIL_BG_ACTIVE_LIGHT, SLIDER_RAIL_BG_DARK,
-    SLIDER_RAIL_BG_HOVER_DARK, SLIDER_RAIL_BG_HOVER_LIGHT, SLIDER_RAIL_BG_LIGHT,
-    SLIDER_ROW_BG_DARK, SLIDER_ROW_BG_LIGHT, SLIDER_ROW_STROKE_DARK, SLIDER_ROW_STROKE_LIGHT,
+    MEDIA_PANEL_BG_DARK, MEDIA_PANEL_BG_LIGHT, SLIDER_RAIL_BG_ACTIVE_DARK,
+    SLIDER_RAIL_BG_ACTIVE_LIGHT, SLIDER_RAIL_BG_DARK, SLIDER_RAIL_BG_HOVER_DARK,
+    SLIDER_RAIL_BG_HOVER_LIGHT, SLIDER_RAIL_BG_LIGHT,
 };
+use crate::ui::widgets::synth_knob;
 
 const TOOLBAR_MENU_MIN_WIDTH: f32 = 360.0;
 const SETTINGS_RGB_SLIDER_MAX_WIDTH: f32 = 220.0;
 const CONTROLS_PANEL_HORIZONTAL_PADDING: f32 = 6.0;
 const CONTROLS_PANEL_VERTICAL_PADDING: f32 = UI_VSPACE_COMPACT;
-const SLIDER_PAIR_VERTICAL_SPACING: f32 = UI_VSPACE_TIGHT;
 const SHORTCUTS_MODAL_WIDTH: f32 = 470.0;
 
 fn get_dir_size(path: impl AsRef<std::path::Path>) -> std::io::Result<u64> {
@@ -60,6 +60,58 @@ impl SeparationModelOption {
 }
 
 impl KeyScribeApp {
+    /// Start MVSep key verification on a worker thread. The 15s network
+    /// call must never run on the UI thread (it froze the app and triggered
+    /// the desktop's "not responding" dialog on slow networks).
+    fn start_mvsep_verify(&mut self) {
+        let key = self.mvsep_api_key.trim().to_string();
+        if key.is_empty() {
+            self.mvsep_verify_message = Some("Key is empty".to_string());
+            return;
+        }
+        // Drop any stale in-flight verification.
+        self.mvsep_verify_rx = None;
+        let (tx, rx) = std::sync::mpsc::channel();
+        self.mvsep_verify_rx = Some(rx);
+        self.mvsep_verify_message = Some("Verifying…".to_string());
+        std::thread::spawn(move || {
+            let msg = match crate::mvsep::verify_api_key(&key) {
+                Ok(user) => {
+                    let name = user
+                        .name
+                        .or(user.email)
+                        .unwrap_or_else(|| "User".to_string());
+                    format!("Valid: {name}")
+                }
+                Err(e) => format!("Invalid: {e}"),
+            };
+            let _ = tx.send(msg);
+        });
+    }
+
+    /// Collect a finished background verification, if any. Call once per
+    /// frame from every site that shows the verify message.
+    fn poll_mvsep_verify(&mut self) {
+        if let Some(rx) = self.mvsep_verify_rx.take() {
+            match rx.try_recv() {
+                Ok(msg) => {
+                    let valid = msg.starts_with("Valid");
+                    self.mvsep_verify_message = Some(msg);
+                    if valid {
+                        self.save_state_to_disk();
+                    }
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => {
+                    self.mvsep_verify_rx = Some(rx);
+                }
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    self.mvsep_verify_message =
+                        Some("Invalid: verification task ended".to_string());
+                }
+            }
+        }
+    }
+
     fn draw_toolbar_separator(ui: &mut egui::Ui) {
         Self::draw_toolbar_separator_with_bleed(ui, 0.0);
     }
@@ -73,7 +125,37 @@ impl KeyScribeApp {
         (viewport_w * 0.48).clamp(220.0, TOOLBAR_MENU_MIN_WIDTH)
     }
 
+    /// Local ONNX separation models, cached for a few seconds.
+    ///
+    /// This scans the filesystem (`read_dir` + `canonicalize` per file) and
+    /// is called on every frame while the audio-settings/export menus are
+    /// open. The TTL keeps menus live (newly dropped-in models appear within
+    /// seconds) without redoing syscalls at 60 Hz on the event loop.
     fn available_separation_models() -> Vec<SeparationModelOption> {
+        static CACHE: std::sync::OnceLock<
+            std::sync::Mutex<(Instant, Vec<SeparationModelOption>)>,
+        > = std::sync::OnceLock::new();
+        const TTL: Duration = Duration::from_secs(5);
+
+        if let Some(cache) = CACHE.get() {
+            if let Ok(guard) = cache.lock() {
+                if guard.0.elapsed() < TTL {
+                    return guard.1.clone();
+                }
+            }
+        }
+        let fresh = Self::scan_separation_models();
+        if let Some(cache) = CACHE.get() {
+            if let Ok(mut guard) = cache.lock() {
+                *guard = (Instant::now(), fresh.clone());
+            }
+        } else {
+            let _ = CACHE.set(std::sync::Mutex::new((Instant::now(), fresh.clone())));
+        }
+        fresh
+    }
+
+    fn scan_separation_models() -> Vec<SeparationModelOption> {
         let mut options = Vec::new();
         let mut seen_names = std::collections::BTreeSet::<String>::new();
 
@@ -161,6 +243,7 @@ impl KeyScribeApp {
         }
     }
 
+    #[allow(dead_code)]
     pub(super) fn selected_separation_model_path(&self) -> Option<std::path::PathBuf> {
         let options = Self::available_separation_models();
         if options.is_empty() {
@@ -196,6 +279,64 @@ impl KeyScribeApp {
         }
 
         options.first().map(|option| option.path.clone())
+    }
+
+    pub(super) fn current_separation_model_name(&self) -> String {
+        if let Some(ref name) = self.selected_separation_model_name {
+            return name.clone();
+        }
+        crate::mvsep::DEFAULT_MVSEP_MODEL_NAME.to_string()
+    }
+
+    pub(crate) fn separation_model_display_name(&self, model_name: &str) -> String {
+        if let Some(m) = crate::mvsep::get_mvsep_model_by_name(model_name) {
+            m.display_name.to_string()
+        } else if let Some(opt) = Self::available_separation_models().iter().find(|o| o.stem_name().as_deref() == Some(model_name)) {
+            opt.label.clone()
+        } else {
+            model_name.to_string()
+        }
+    }
+
+    pub(super) fn select_separation_model(&mut self, model_name: String) {
+        if self.selected_separation_model_name.as_deref() == Some(&model_name)
+            && self.loaded_stems_model_name.as_deref() == Some(&model_name)
+        {
+            return;
+        }
+
+        self.selected_separation_model_name = Some(model_name.clone());
+
+        // Load cached stems on a worker: decoding minutes of stems on the
+        // event loop stalls it for seconds. A cache miss clears via the poll
+        // path, same end state as before.
+        self.request_cached_stems(&model_name);
+    }
+
+    pub(super) fn draw_separation_model_options(&mut self, ui: &mut egui::Ui) {
+        let current_model = self.current_separation_model_name();
+        ui.label(egui::RichText::new("MVSep Cloud Models (High Quality)").strong());
+        for model in crate::mvsep::MVSEP_MODELS {
+            let is_sel = current_model == model.technical_name;
+            if ui.selectable_label(is_sel, model.display_name).clicked() {
+                self.select_separation_model(model.technical_name.to_string());
+                self.show_separation_model_dropdown = false;
+            }
+        }
+
+        let local_models = Self::available_separation_models();
+        if !local_models.is_empty() {
+            ui.separator();
+            ui.label(egui::RichText::new("Local Models (ONNX)").strong());
+            for option in &local_models {
+                let stem = option.stem_name().unwrap_or_default();
+                let is_sel = current_model == stem;
+                if ui.selectable_label(is_sel, &option.label).clicked() {
+                    self.select_separation_model(stem);
+                    self.show_separation_model_dropdown = false;
+                }
+            }
+        }
     }
 
     pub(super) fn draw_audio_settings_menu(&mut self, ui: &mut egui::Ui) {
@@ -296,47 +437,83 @@ impl KeyScribeApp {
 
         Self::draw_toolbar_separator(ui);
 
-        ui.label("Separation Model");
-        let models = Self::available_separation_models();
-        for option in &models {
-            let is_sel = self
-                .selected_separation_model_name
-                .as_ref()
-                .map(|name| option.stem_name().as_deref() == Some(name.as_str()))
-                .unwrap_or(false);
-            if ui.selectable_label(is_sel, option.label.as_str()).clicked() {
-                if let Some(stem) = option.stem_name() {
-                    self.selected_separation_model_name = Some(stem);
-                }
-                self.separated_stems = None;
-                self.enabled_listening_indices.clear();
-                self.enabled_stem_indices.clear();
-                self.refresh_note_timeline_from_selected_stems();
-            }
+        let current_model = self.current_separation_model_name();
+        let current_display = self.separation_model_display_name(&current_model);
+
+        ui.label(egui::RichText::new("Separation Model").strong());
+        let dropdown_icon = if self.show_separation_model_dropdown { "⏶" } else { "⏷" };
+        let btn_text = format!("{current_display}  {dropdown_icon}");
+        let btn = egui::Button::new(btn_text).min_size(egui::vec2(280.0, 0.0));
+        if ui.add(btn).clicked() {
+            self.show_separation_model_dropdown = !self.show_separation_model_dropdown;
         }
 
-        Self::draw_toolbar_separator(ui);
+        if self.show_separation_model_dropdown {
+            egui::Frame::group(ui.style()).show(ui, |ui| {
+                ui.set_min_width(280.0);
+                egui::ScrollArea::vertical()
+                    .max_height(240.0)
+                    .show(ui, |ui| {
+                        self.draw_separation_model_options(ui);
+                    });
+            });
+        }
 
-        ui.horizontal(|ui| {
-            if self.is_separating {
-                ui.add_enabled(false, egui::Button::new("Separating..."));
-            } else if ui.button("Run Separation").clicked() {
-                self.run_instrument_separation();
+        if current_model.starts_with("mvsep") {
+            ui.add_space(4.0);
+            ui.label(egui::RichText::new("MVSep API Key").strong());
+            ui.horizontal(|ui| {
+                let response = ui.add(
+                    egui::TextEdit::singleline(&mut self.mvsep_api_key)
+                        .password(!self.mvsep_api_key_visible)
+                        .hint_text("Enter MVSep API key...")
+                        .desired_width(180.0),
+                );
+                if response.changed() || response.lost_focus() {
+                    self.mvsep_verify_message = None;
+                    self.save_state_to_disk();
+                }
+
+                let toggle_icon = if self.mvsep_api_key_visible { "Hide" } else { "Show" };
+                if ui.small_button(toggle_icon).clicked() {
+                    self.mvsep_api_key_visible = !self.mvsep_api_key_visible;
+                }
+
+                if ui.small_button("Verify").clicked() {
+                    self.start_mvsep_verify();
+                }
+                self.poll_mvsep_verify();
+
+                if ui.small_button("Help").on_hover_text("What is MVSep & how to get an API key").clicked() {
+                    self.show_mvsep_api_key_modal = true;
+                }
+            });
+
+            if let Some(ref msg) = self.mvsep_verify_message {
+                let color = if msg.starts_with("Valid") {
+                    egui::Color32::from_rgb(50, 200, 80)
+                } else {
+                    egui::Color32::from_rgb(230, 80, 80)
+                };
+                ui.colored_label(color, msg);
             }
-        });
+
+            ui.horizontal(|ui| {
+                ui.label("Generate an API key at:");
+                ui.hyperlink_to("mvsep.com/en/full_api", "https://mvsep.com/en/full_api");
+            });
+        }
     }
 
     /// Check whether a valid stem separation cache exists for the currently
     /// loaded song and selected model. Mirrors the cache validation logic in
     /// `InstrumentSeparator::separate` (version + path).
+    #[allow(dead_code)]
     pub(super) fn stem_cache_exists_for_current_song(&self) -> bool {
         let Some(song_hash) = &self.loaded_audio_hash else {
             return false;
         };
-        let model_name = self
-            .selected_separation_model_path()
-            .and_then(|p| p.file_stem().map(|s| s.to_string_lossy().to_string()))
-            .unwrap_or_else(|| "htdemucs_6s".to_string());
+        let model_name = self.current_separation_model_name();
 
         const STEM_CACHE_VERSION: u32 = 3;
         let stem_cache_root = app_cache_base_dir()
@@ -366,10 +543,37 @@ impl KeyScribeApp {
             return;
         };
 
-        let model_name = self
-            .selected_separation_model_path()
-            .and_then(|p| p.file_stem().map(|s| s.to_string_lossy().to_string()))
-            .unwrap_or_else(|| "htdemucs_6s".to_string());
+        let model_name = self.current_separation_model_name();
+
+        if model_name.starts_with("mvsep") {
+            let key = if !self.mvsep_api_key.trim().is_empty() {
+                Some(self.mvsep_api_key.trim().to_string())
+            } else {
+                crate::mvsep::find_mvsep_api_key()
+            };
+            if key.is_none() {
+                self.last_error = Some(
+                    "MVSep API key required. Please enter your API key in Settings -> Audio Processing (get one at https://mvsep.com/en/full_api)."
+                        .to_string(),
+                );
+                self.show_mvsep_api_key_modal = true;
+                return;
+            }
+
+            // Client-side duration pre-check against MVSep hard 100-minute maximum
+            if let Some(ref raw) = self.audio_raw {
+                if raw.sample_rate > 0 && !raw.samples_mono.is_empty() {
+                    let dur_sec = raw.samples_mono.len() as f32 / raw.sample_rate as f32;
+                    if dur_sec > 6000.0 {
+                        self.last_error = Some(format!(
+                            "Audio file duration ({:.1} min) exceeds MVSep maximum limit of 100 minutes.",
+                            dur_sec / 60.0
+                        ));
+                        return;
+                    }
+                }
+            }
+        }
 
         let canonical_path = loaded_path.canonicalize().unwrap_or_else(|_| loaded_path.clone());
         let config = crate::leadsheet::SeparationConfig {
@@ -377,6 +581,11 @@ impl KeyScribeApp {
             song_hash: Some(song_hash.clone()),
             source_path: Some(canonical_path),
             cache_dir: Some(app_cache_base_dir()),
+            mvsep_api_key: if !self.mvsep_api_key.trim().is_empty() {
+                Some(self.mvsep_api_key.trim().to_string())
+            } else {
+                crate::mvsep::find_mvsep_api_key()
+            },
         };
 
         self.last_error = None;
@@ -384,6 +593,9 @@ impl KeyScribeApp {
         self.separation_rx = Some(rx);
         self.is_separating = true;
         self.separation_attempted = false;
+        self.stem_cache_miss = false;
+        self.stem_cache_pending_model = None;
+        self.stem_cache_rx = None;
         self.separation_progress.store(0, Ordering::Release);
 
         let progress_atomic = Arc::clone(&self.separation_progress);
@@ -405,7 +617,10 @@ impl KeyScribeApp {
                 }) as Box<dyn Fn(f32) + Send + Sync>);
 
                 match separator.separate(&[], 0, 0, progress_cb) {
-                    Ok(stems) => {
+                    Ok(mut stems) => {
+                        // Normalize here, not on the event loop: the energy
+                        // scan is O(total samples) and would stall UI pings.
+                        super::processing::normalize_stem_confidences(&mut stems);
                         let _ = tx.send(SeparationResult { stems, error: None });
                     }
                     Err(e) => {
@@ -555,14 +770,39 @@ impl KeyScribeApp {
 
         Self::draw_toolbar_separator(ui);
 
-        if self.cache_size_bytes.is_none() {
+        if self.cache_size_bytes.is_none() && !self.cache_size_pending {
+            // Recursive directory walk — runs on a worker so opening
+            // Preferences never stalls the event loop on a large cache.
             let cache_dir = crate::app::analysis_cache_dir();
             let legacy_dir = crate::app::app_cache_base_dir().join(".transcriber_cache");
             let stems_dir = crate::app::app_cache_base_dir().join("stems");
-            let size = get_dir_size(&cache_dir).unwrap_or(0) 
-                     + get_dir_size(&legacy_dir).unwrap_or(0)
-                     + get_dir_size(&stems_dir).unwrap_or(0);
-            self.cache_size_bytes = Some(Some(size));
+            let (tx, rx) = mpsc::channel::<u64>();
+            self.cache_size_rx = Some(rx);
+            self.cache_size_pending = true;
+            thread::spawn(move || {
+                let size = get_dir_size(&cache_dir).unwrap_or(0)
+                    + get_dir_size(&legacy_dir).unwrap_or(0)
+                    + get_dir_size(&stems_dir).unwrap_or(0);
+                let _ = tx.send(size);
+            });
+        }
+        if self.cache_size_pending {
+            if let Some(rx) = &self.cache_size_rx {
+                match rx.try_recv() {
+                    Ok(size) => {
+                        self.cache_size_bytes = Some(Some(size));
+                        self.cache_size_rx = None;
+                        self.cache_size_pending = false;
+                    }
+                    Err(mpsc::TryRecvError::Disconnected) => {
+                        self.cache_size_rx = None;
+                        self.cache_size_pending = false;
+                    }
+                    Err(mpsc::TryRecvError::Empty) => {}
+                }
+            } else {
+                self.cache_size_pending = false;
+            }
         }
 
         let size_text = match self.cache_size_bytes {
@@ -580,6 +820,10 @@ impl KeyScribeApp {
             let _ = std::fs::remove_dir_all(&stems_dir);
             let _ = std::fs::create_dir_all(&stems_dir);
             self.cache_size_bytes = Some(Some(0));
+            // Drop any in-flight background size scan so its stale result
+            // can't overwrite the just-cleaned value.
+            self.cache_size_rx = None;
+            self.cache_size_pending = false;
         }
     }
 
@@ -640,7 +884,7 @@ impl KeyScribeApp {
 
             ui.menu_button("Export", |ui| {
                 ui.set_min_width(Self::responsive_menu_min_width(ui));
-                
+
                 let has_stems = self.separated_stems.is_some();
                 let can_export_midi = has_stems || !self.note_timeline.is_empty();
                 if ui.add_enabled(has_stems, egui::Button::new("Export Stems...")).clicked() {
@@ -661,8 +905,6 @@ impl KeyScribeApp {
                 }
             });
 
-            // Separation model selector — placed directly in the menu bar
-            // (not inside Settings) to avoid egui's nested-popup click issue.
             ui.menu_button("Settings", |ui| {
                 ui.set_min_width(Self::responsive_menu_min_width(ui));
                 self.draw_audio_settings_menu(ui);
@@ -816,6 +1058,146 @@ impl KeyScribeApp {
         self.show_shortcuts_help_modal = keep_open;
     }
 
+    fn draw_mvsep_api_key_modal(&mut self, ctx: &egui::Context) {
+        if !self.show_mvsep_api_key_modal {
+            return;
+        }
+
+        let mut keep_open = self.show_mvsep_api_key_modal;
+        let mut close_requested = false;
+        let mut run_separation_requested = false;
+
+        egui::Window::new("MVSep Cloud Stem Separation — API Key")
+            .id(egui::Id::new("mvsep_api_key_modal"))
+            .open(&mut keep_open)
+            .default_width(520.0)
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
+            .show(ctx, |ui| {
+                ui.label(
+                    egui::RichText::new("What is MVSep?")
+                        .strong()
+                        .size(15.0),
+                );
+                ui.add_space(3.0);
+                ui.label(
+                    "MVSep (Music Voice Separation) is a cloud AI service providing top-tier audio source \
+                     separation models (such as BS Roformer and Ensemble algorithms). It processes separation \
+                     on dedicated cloud GPUs, isolating Vocals, Bass, Drums, Guitar, Piano, and Other stems \
+                     with studio-grade quality.",
+                );
+
+                ui.add_space(10.0);
+                ui.label(
+                    egui::RichText::new("How to get a Free API Key:")
+                        .strong()
+                        .size(15.0),
+                );
+                ui.add_space(3.0);
+                ui.label("1. Create a free account or sign in at mvsep.com.");
+                ui.label("2. Open your API dashboard at mvsep.com/en/full_api to view or generate your personal API token.");
+                ui.label("3. Copy the token and paste it into the field below.");
+                ui.add_space(4.0);
+                ui.horizontal(|ui| {
+                    ui.label("Direct link:");
+                    ui.hyperlink_to("mvsep.com/en/full_api ↗", "https://mvsep.com/en/full_api");
+                });
+
+                ui.add_space(10.0);
+                ui.label(
+                    egui::RichText::new("API Limits (per MVSep specification):")
+                        .strong()
+                        .size(13.0),
+                );
+                ui.add_space(2.0);
+                ui.label("• Free accounts: max 10 minutes audio length, 100 MB file size, 1 concurrent job.");
+                ui.label("• Premium accounts: max 100 minutes audio length, 1000 MB file size, unlimited jobs.");
+
+                ui.add_space(12.0);
+                ui.separator();
+                ui.add_space(6.0);
+
+                ui.label(egui::RichText::new("Enter MVSep API Key / Token:").strong());
+                ui.horizontal(|ui| {
+                    let mut input = self.mvsep_api_key.clone();
+                    let resp = ui.add(
+                        egui::TextEdit::singleline(&mut input)
+                            .password(!self.mvsep_api_key_visible)
+                            .hint_text("Paste your MVSep API token here...")
+                            .desired_width(320.0),
+                    );
+                    if resp.changed() || resp.lost_focus() {
+                        self.mvsep_api_key = input;
+                        self.mvsep_verify_message = None;
+                        self.save_state_to_disk();
+                    }
+
+                    let toggle_icon = if self.mvsep_api_key_visible { "Hide" } else { "Show" };
+                    if ui.small_button(toggle_icon).clicked() {
+                        self.mvsep_api_key_visible = !self.mvsep_api_key_visible;
+                    }
+                });
+
+                ui.add_space(4.0);
+                ui.horizontal(|ui| {
+                    if ui.button("Verify Token").clicked() {
+                        self.start_mvsep_verify();
+                    }
+                    self.poll_mvsep_verify();
+
+                    if let Some(ref msg) = self.mvsep_verify_message {
+                        let color = if msg.starts_with("Valid") {
+                            egui::Color32::from_rgb(50, 200, 80)
+                        } else {
+                            egui::Color32::from_rgb(230, 80, 80)
+                        };
+                        ui.colored_label(color, msg);
+                    }
+                });
+
+                ui.add_space(14.0);
+                ui.separator();
+                ui.add_space(6.0);
+
+                ui.horizontal(|ui| {
+                    if ui.button("Save & Close").clicked() {
+                        self.mvsep_api_key = self.mvsep_api_key.trim().to_string();
+                        self.save_state_to_disk();
+                        if let Some(ref err) = self.last_error {
+                            if crate::mvsep::is_invalid_token_error(err) {
+                                self.last_error = None;
+                            }
+                        }
+                        close_requested = true;
+                    }
+
+                    if self.loaded_path.is_some() && !self.is_separating {
+                        if ui.button("Save & Separate Stems").clicked() {
+                            self.mvsep_api_key = self.mvsep_api_key.trim().to_string();
+                            self.save_state_to_disk();
+                            self.last_error = None;
+                            close_requested = true;
+                            run_separation_requested = true;
+                        }
+                    }
+
+                    if ui.button("Cancel").clicked() {
+                        close_requested = true;
+                    }
+                });
+            });
+
+        if close_requested {
+            keep_open = false;
+        }
+        self.show_mvsep_api_key_modal = keep_open;
+
+        if run_separation_requested {
+            self.run_instrument_separation();
+        }
+    }
+
     pub(super) fn top_bar_slider_with_input(
         ui: &mut egui::Ui,
         label: &str,
@@ -825,6 +1207,7 @@ impl KeyScribeApp {
         suffix: &str,
         drag_speed: f64,
         max_decimals: usize,
+        default: f32,
     ) -> bool {
         let mut changed = false;
         let parent_width = ui.max_rect().width().max(0.0);
@@ -836,16 +1219,6 @@ impl KeyScribeApp {
         let compact_layout = slot_width < 420.0;
 
         let dark = ui.visuals().dark_mode;
-        let row_fill = if dark {
-            SLIDER_ROW_BG_DARK
-        } else {
-            SLIDER_ROW_BG_LIGHT
-        };
-        let row_stroke = if dark {
-            SLIDER_ROW_STROKE_DARK
-        } else {
-            SLIDER_ROW_STROKE_LIGHT
-        };
         let rail_fill = if dark {
             SLIDER_RAIL_BG_DARK
         } else {
@@ -866,11 +1239,9 @@ impl KeyScribeApp {
             egui::vec2(slot_width, 0.0),
             egui::Layout::top_down(egui::Align::Min),
             |ui| {
+                // Frameless: the piano-settings sliders read as one flat row
+                // instead of four floating cards.
                 egui::Frame::none()
-                    .fill(row_fill)
-                    .rounding(egui::Rounding::same(8.0))
-                    .stroke(egui::Stroke::new(1.0, row_stroke))
-                    .outer_margin(egui::Margin::symmetric(1.0, 0.0))
                     .inner_margin(egui::Margin::symmetric(9.0, UI_VSPACE_TIGHT))
                     .show(ui, |ui| {
                         ui.spacing_mut().item_spacing.x = 8.0;
@@ -878,20 +1249,14 @@ impl KeyScribeApp {
 
                         let label_color = ui.visuals().text_color();
                         let label_font = egui::TextStyle::Body.resolve(ui.style());
-                        let measured_label_width = ui
-                            .fonts(|fonts| {
-                                fonts
-                                    .layout_no_wrap(
-                                        label.to_owned(),
-                                        label_font.clone(),
-                                        label_color,
-                                    )
-                                    .size()
-                                    .x
-                            })
-                            .max(56.0);
 
                         let mut draw_controls = |ui: &mut egui::Ui| {
+                            // Moved-portion fill matches the synth knobs:
+                            // bipolar ranges (min < 0, e.g. visualization
+                            // offset) fill outward from the middle. The theme
+                            // always points selection at the accent color.
+                            let bipolar = min < 0.0;
+                            let accent = ui.visuals().selection.bg_fill;
                             let controls_row_width = ui.available_width().max(0.0);
                             ui.allocate_ui_with_layout(
                                 egui::vec2(controls_row_width, row_height),
@@ -906,12 +1271,6 @@ impl KeyScribeApp {
                                         visuals.widgets.inactive.weak_bg_fill = rail_fill;
                                         visuals.widgets.hovered.weak_bg_fill = rail_fill_hover;
                                         visuals.widgets.active.weak_bg_fill = rail_fill_active;
-                                        visuals.widgets.inactive.bg_stroke =
-                                            egui::Stroke::new(1.0, row_stroke);
-                                        visuals.widgets.hovered.bg_stroke =
-                                            egui::Stroke::new(1.0, row_stroke);
-                                        visuals.widgets.active.bg_stroke =
-                                            egui::Stroke::new(1.0, row_stroke);
 
                                         let controls_w = ui.available_width().max(0.0);
                                         let spacing = ui.spacing().item_spacing.x;
@@ -922,15 +1281,18 @@ impl KeyScribeApp {
                                             < (min_slider_width + min_input_width);
 
                                         if stacked_controls {
-                                            ui.spacing_mut().slider_width = controls_w;
-                                            changed |= ui
-                                                .add_sized(
-                                                    [controls_w, row_height],
-                                                    egui::Slider::new(value, min..=max)
-                                                        .show_value(false)
-                                                        .suffix(suffix),
-                                                )
-                                                .changed();
+                                            changed |=
+                                                crate::ui::widgets::accent_slider(
+                                                    ui,
+                                                    ("piano_setting", label),
+                                                    value,
+                                                    min,
+                                                    max,
+                                                    default,
+                                                    bipolar,
+                                                    egui::vec2(controls_w, row_height),
+                                                    accent,
+                                                );
 
                                             let compact_input_width = controls_w
                                                 .min(96.0)
@@ -976,14 +1338,18 @@ impl KeyScribeApp {
                                                 .max(min_slider_width);
 
                                             ui.spacing_mut().slider_width = slider_width;
-                                            changed |= ui
-                                                .add_sized(
-                                                    [slider_width, row_height],
-                                                    egui::Slider::new(value, min..=max)
-                                                        .show_value(false)
-                                                        .suffix(suffix),
-                                                )
-                                                .changed();
+                                            changed |=
+                                                crate::ui::widgets::accent_slider(
+                                                    ui,
+                                                    ("piano_setting", label),
+                                                    value,
+                                                    min,
+                                                    max,
+                                                    default,
+                                                    bipolar,
+                                                    egui::vec2(slider_width, row_height),
+                                                    accent,
+                                                );
 
                                             changed |= ui
                                                 .scope(|ui| {
@@ -1013,7 +1379,15 @@ impl KeyScribeApp {
                         };
 
                         if compact_layout {
-                            ui.label(egui::RichText::new(label).color(label_color));
+                            // Single-line truncated label: every box keeps the
+                            // same height so the slider rails below line up
+                            // even when labels would wrap differently.
+                            ui.add(
+                                egui::Label::new(
+                                    egui::RichText::new(label).color(label_color),
+                                )
+                                .truncate(true),
+                            );
                             draw_controls(ui);
                         } else {
                             let row_width = ui.available_width().max(0.0);
@@ -1021,8 +1395,12 @@ impl KeyScribeApp {
                                 egui::vec2(row_width, row_height),
                                 egui::Layout::left_to_right(egui::Align::Center),
                                 |ui| {
-                                    let max_label_width = (ui.available_width() * 0.45).max(56.0);
-                                    let label_width = measured_label_width.min(max_label_width);
+                                    // Fixed label zone (not measured per box):
+                                    // all four boxes start their controls at
+                                    // the same x so rails line up across boxes.
+                                    let max_label_width =
+                                        (ui.available_width() * 0.45).max(56.0);
+                                    let label_width = max_label_width;
                                     let (label_rect, _) = ui.allocate_exact_size(
                                         egui::vec2(label_width, row_height),
                                         egui::Sense::hover(),
@@ -1046,99 +1424,161 @@ impl KeyScribeApp {
         changed
     }
 
-    pub(super) fn draw_speed_pitch_controls(&mut self, ui: &mut egui::Ui) {
-        let mut speed_changed = false;
-        let mut pitch_changed = false;
-        let pair_gap = 12.0;
-        let pair_w = ui.available_width().max(0.0);
-        let stack_controls = pair_w < 560.0;
-        let col_w = ((pair_w - pair_gap).max(0.0)) * 0.5;
-        let slider_row_h =
-            ui.spacing().interact_size.y.clamp(22.0, 30.0) + UI_VSPACE_TIGHT * 2.0 + 2.0;
-        let default_item_spacing_y = ui.spacing().item_spacing.y;
-        ui.spacing_mut().item_spacing.y = default_item_spacing_y.min(SLIDER_PAIR_VERTICAL_SPACING);
-        ui.add_space(UI_VSPACE_COMPACT);
-        if stack_controls {
+    /// Compact Speed + Pitch synth knobs used inside the merged top row.
+    /// Values shown under each knob; drag to change, Shift-drag for fine
+    /// steps, double-click resets to the default. Commits go through the
+    /// same pending-param debounce as the previous sliders.
+    /// Speed/Pitch controls: desktop gets a pair of sliders; compact widths
+    /// get two knobs evenly distributed across the space left of the view
+    /// cluster.
+    pub(super) fn draw_speed_pitch_controls(&mut self, ui: &mut egui::Ui, compact: bool) -> bool {
+        let accent = self.highlight_color;
+        let mut changed = false;
+        // Captured before the widgets below mutate self in place.
+        let pre_speed = self.speed;
+        let pre_pitch = self.pitch_semitones;
+
+        if compact {
+            let knob_size: f32 = 30.0;
+            let cell_h = 11.0 + knob_size + 12.0 + 8.0;
+            let rest = ui.available_width().max(0.0);
+            // Content-width cells packed from the left so the cluster starts
+            // flush with the pane below instead of floating centered in
+            // halves with dead space on the left.
+            let cell_w = (rest * 0.5).clamp(40.0, 64.0);
+            let gap = ui.spacing().item_spacing.x;
             ui.allocate_ui_with_layout(
-                egui::vec2(pair_w, 0.0),
-                egui::Layout::top_down(egui::Align::Center),
-                |ui| {
-                    speed_changed = Self::top_bar_slider_with_input(
-                        ui,
-                        "Speed",
-                        &mut self.speed,
-                        0.5,
-                        2.0,
-                        "x",
-                        0.01,
-                        2,
-                    );
-                    ui.add_space(UI_VSPACE_TIGHT);
-                    pitch_changed = Self::top_bar_slider_with_input(
-                        ui,
-                        "Pitch",
-                        &mut self.pitch_semitones,
-                        -12.0,
-                        12.0,
-                        " st",
-                        0.1,
-                        1,
-                    );
-                },
-            );
-        } else {
-            ui.allocate_ui_with_layout(
-                egui::vec2(pair_w, slider_row_h),
+                egui::vec2(cell_w * 2.0 + gap, cell_h),
                 egui::Layout::left_to_right(egui::Align::Center),
                 |ui| {
-                    ui.spacing_mut().item_spacing.x = pair_gap;
-
-                    ui.allocate_ui_with_layout(
-                        egui::vec2(col_w, slider_row_h),
-                        egui::Layout::top_down(egui::Align::Center),
-                        |ui| {
-                            speed_changed = Self::top_bar_slider_with_input(
-                                ui,
-                                "Speed",
-                                &mut self.speed,
-                                0.5,
-                                2.0,
-                                "x",
-                                0.01,
-                                2,
-                            );
+                    for ci in 0..2 {
+                        ui.allocate_ui_with_layout(
+                            egui::vec2(cell_w, cell_h),
+                            egui::Layout::top_down(egui::Align::Center),
+                            |ui| {
+                            ui.spacing_mut().item_spacing.y = 2.0;
+                            if ci == 0 {
+                                ui.label(egui::RichText::new("Speed").size(11.0));
+                                changed |= synth_knob(
+                                    ui,
+                                    ("top_param_knob", "speed"),
+                                    &mut self.speed,
+                                    0.5,
+                                    2.0,
+                                    1.0,
+                                    knob_size,
+                                    accent,
+                                    false,
+                                    true,
+                                    false,
+                                    0.01,
+                                );
+                                ui.label(
+                                    egui::RichText::new(format!("{:.2}x", self.speed))
+                                        .monospace()
+                                        .size(10.0),
+                                );
+                            } else {
+                                ui.label(egui::RichText::new("Pitch").size(11.0));
+                                changed |= synth_knob(
+                                    ui,
+                                    ("top_param_knob", "pitch"),
+                                    &mut self.pitch_semitones,
+                                    -12.0,
+                                    12.0,
+                                    0.0,
+                                    knob_size,
+                                    accent,
+                                    true,
+                                    true,
+                                    false,
+                                    0.1,
+                                );
+                                ui.label(
+                                    egui::RichText::new(format!("{:+.1} st", self.pitch_semitones))
+                                        .monospace()
+                                        .size(10.0),
+                                );
+                            }
                         },
                     );
+                }
+            });
+        } else {
+            // Desktop: label above a slider with a live value readout.
+            // The chip starts flush with the pane below (no leading gap).
+            // One chip behind both sliders: keeps their rails visible on the
+            // transparent wallpaper and stops them stretching into the
+            // cluster's space.
+            let chip_fill = if self.dark_mode {
+                MEDIA_PANEL_BG_DARK
+            } else {
+                MEDIA_PANEL_BG_LIGHT
+            };
+            egui::Frame::none()
+                .fill(chip_fill)
+                .rounding(egui::Rounding::same(8.0))
+                .inner_margin(egui::Margin::symmetric(8.0, 6.0))
+                .show(ui, |ui| {
+                    ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
+                        ui.spacing_mut().item_spacing.x = 8.0;
 
-                    ui.allocate_ui_with_layout(
-                        egui::vec2(col_w, slider_row_h),
-                        egui::Layout::top_down(egui::Align::Center),
-                        |ui| {
-                            pitch_changed = Self::top_bar_slider_with_input(
-                                ui,
-                                "Pitch",
-                                &mut self.pitch_semitones,
-                                -12.0,
-                                12.0,
-                                " st",
-                                0.1,
-                                1,
-                            );
-                        },
-                    );
-                },
-            );
+                        ui.label(egui::RichText::new("Speed").size(10.0));
+                        changed |= crate::ui::widgets::accent_slider(
+                            ui,
+                            ("top_param_slider", "speed"),
+                            &mut self.speed,
+                            0.5,
+                            2.0,
+                            1.0,
+                            false,
+                            egui::vec2(100.0, 18.0),
+                            accent,
+                        );
+                        ui.label(
+                            egui::RichText::new(format!("{:.2}x", self.speed))
+                                .monospace()
+                                .size(10.0),
+                        );
+
+                        ui.add_space(6.0);
+
+                        ui.label(egui::RichText::new("Pitch").size(10.0));
+                        changed |= crate::ui::widgets::accent_slider(
+                            ui,
+                            ("top_param_slider", "pitch"),
+                            &mut self.pitch_semitones,
+                            -12.0,
+                            12.0,
+                            0.0,
+                            true,
+                            egui::vec2(100.0, 18.0),
+                            accent,
+                        );
+                        ui.label(
+                            egui::RichText::new(format!("{:+.1} st", self.pitch_semitones))
+                                .monospace()
+                                .size(10.0),
+                        );
+                    });
+                });
+
         }
-        ui.add_space(UI_VSPACE_COMPACT);
-        ui.spacing_mut().item_spacing.y = default_item_spacing_y;
 
-        if speed_changed || pitch_changed {
+        if changed {
+            let pd = ui.input(|i| i.pointer.primary_down());
+            // The knobs/sliders above wrote straight into self: rebuild the
+            // pre-change snapshot from the values captured before drawing.
+            let mut snap = MixSnapshot::capture(self);
+            snap.speed = pre_speed;
+            snap.pitch_semitones = pre_pitch;
+            self.push_mix_undo_with(pd, snap);
             self.pending_param_change = true;
             self.last_param_change_at = Some(Instant::now());
         }
-
         let pointer_down = ui.input(|i| i.pointer.primary_down());
         self.maybe_commit_pending_param_change(pointer_down);
+        changed
     }
 
     pub(super) fn draw_top_controls_panel(&mut self, ctx: &egui::Context) {
@@ -1223,27 +1663,37 @@ impl KeyScribeApp {
                         ui.colored_label(ERROR_RED, err);
                     }
 
-                    if self.is_processing {
+                    if self.is_processing && !self.param_tweak_rebuild {
+                        // No status text for the full speed/pitch rebuild: it
+                        // fires on every knob/slider tweak and the message is
+                        // just noise.
                         let msg = match self.active_rebuild_mode {
                             RebuildMode::Full if self.preprocess_audio => {
-                                "Analyzing track in background... waveform and playback stay available."
+                                Some("Analyzing track in background... waveform and playback stay available.")
                             }
-                            RebuildMode::ParametersPreview => "Buffering speed/pitch preview...",
+                            RebuildMode::ParametersPreview => {
+                                Some("Buffering speed/pitch preview...")
+                            }
                             _ if speed_pitch_is_identity(self.speed, self.pitch_semitones) => {
-                                "Building playback buffer..."
+                                Some("Building playback buffer...")
                             }
-                            _ => "Rendering full speed/pitch update...",
+                            _ => None,
                         };
-                        let processing_color = egui::Color32::from_rgb(
-                            self.highlight_color.r().saturating_add(12),
-                            self.highlight_color.g().saturating_add(12),
-                            self.highlight_color.b().saturating_add(12),
-                        );
-                        ui.colored_label(processing_color, msg);
+                        if let Some(msg) = msg {
+                            let processing_color = egui::Color32::from_rgb(
+                                self.highlight_color.r().saturating_add(12),
+                                self.highlight_color.g().saturating_add(12),
+                                self.highlight_color.b().saturating_add(12),
+                            );
+                            ui.colored_label(processing_color, msg);
+                        }
                     }
 
                     if let Some(cache_msg) = self.cache_status_message.as_deref() {
-                        let show_cache_msg = self.is_processing
+                        // A stale message (e.g. "Stem analysis complete.")
+                        // must not resurface just because a silent
+                        // param-tweak rebuild is running.
+                        let show_cache_msg = (self.is_processing && !self.param_tweak_rebuild)
                             || self
                                 .cache_status_message_at
                                 .map(|at| at.elapsed() <= Duration::from_secs(8))
@@ -1434,5 +1884,6 @@ impl KeyScribeApp {
         });
 
         self.draw_keyboard_shortcuts_modal(ctx);
+        self.draw_mvsep_api_key_modal(ctx);
     }
 }

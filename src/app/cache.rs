@@ -1,5 +1,34 @@
 use super::*;
 
+#[derive(Default)]
+pub(super) struct CachePrecheckDiagnostics {
+    total_candidates: usize,
+    existing_files: usize,
+    parsed_blobs: usize,
+    read_failures: usize,
+    decompress_failures: usize,
+    deserialize_failures: usize,
+    shared_param_mismatches: usize,
+    strict_len_mismatches: usize,
+    invalid_timeline_blobs: usize,
+}
+
+/// Result of the background analysis-cache precheck (see
+/// [`KeyScribeApp::maybe_precheck_analysis_cache`]). Everything needed to
+/// apply the outcome is captured at spawn time so the poll side never
+/// touches the filesystem.
+pub(super) struct CachePrecheckResult {
+    song_hash: String,
+    raw_sample_len_opt: Option<usize>,
+    sample_rate: u32,
+    cached: Option<(
+        Arc<Vec<Vec<f32>>>,
+        f32,
+        Option<Vec<[f64; 2]>>,
+    )>,
+    diag: CachePrecheckDiagnostics,
+}
+
 impl KeyScribeApp {
     #[allow(clippy::too_many_arguments)]
     pub(super) fn load_cached_timeline_for_variant(
@@ -125,6 +154,16 @@ impl KeyScribeApp {
         (None, diag)
     }
 
+    /// Kick off the analysis-cache precheck on a worker thread.
+    ///
+    /// The precheck reads candidate cache blobs from disk and runs zstd
+    /// decompression + bincode deserialization over them. On a warm cache
+    /// that is tens of milliseconds; on a cold/wrong-variant cache it can
+    /// chew through megabytes of blobs — either way it must never run on
+    /// the event loop, where a stall of a few seconds makes the compositor
+    /// declare the app hung ("Application Not Responding"), typically first
+    /// noticed right after minimizing or switching workspaces. The outcome
+    /// is applied in [`Self::poll_cache_precheck_result`].
     pub(super) fn maybe_precheck_analysis_cache(&mut self) {
         if self.cache_precheck_done || !self.is_audio_loading || !self.preprocess_audio {
             return;
@@ -133,32 +172,77 @@ impl KeyScribeApp {
         let Some(song_hash) = self.loaded_audio_hash.as_deref() else {
             return;
         };
-        let raw_sample_len_opt = self.loading_total_samples;
-        let raw_sample_len = raw_sample_len_opt.unwrap_or(0);
         if self.loading_sample_rate == 0 {
             return;
         }
 
         self.cache_precheck_done = true;
 
-        let (cached_timeline, precheck_diag) = Self::load_cached_timeline_for_variant(
-            song_hash,
-            self.loading_sample_rate,
-            raw_sample_len,
-            self.audio_quality_mode,
-            self.speed,
-            self.pitch_semitones,
-            self.use_cqt_analysis,
-            self.preprocess_audio,
-        );
+        let song_hash = song_hash.to_string();
+        let raw_sample_len_opt = self.loading_total_samples;
+        let raw_sample_len = raw_sample_len_opt.unwrap_or(0);
+        let sample_rate = self.loading_sample_rate;
+        let audio_quality_mode = self.audio_quality_mode;
+        let speed = self.speed;
+        let pitch_semitones = self.pitch_semitones;
+        let use_cqt_analysis = self.use_cqt_analysis;
+        let preprocess_audio = self.preprocess_audio;
 
-        if let Some((base_timeline, base_step_sec, cached_waveform)) = cached_timeline {
+        let (tx, rx) = mpsc::channel::<CachePrecheckResult>();
+        self.cache_precheck_rx = Some(rx);
+        thread::spawn(move || {
+            let (cached_timeline, precheck_diag) = Self::load_cached_timeline_for_variant(
+                &song_hash,
+                sample_rate,
+                raw_sample_len,
+                audio_quality_mode,
+                speed,
+                pitch_semitones,
+                use_cqt_analysis,
+                preprocess_audio,
+            );
+            let _ = tx.send(CachePrecheckResult {
+                song_hash,
+                raw_sample_len_opt,
+                sample_rate,
+                cached: cached_timeline,
+                diag: precheck_diag,
+            });
+        });
+    }
+
+    /// Apply a finished background cache precheck, if any. Called once per
+    /// frame; never blocks (single `try_recv`).
+    pub(super) fn poll_cache_precheck_result(&mut self) {
+        let Some(rx) = &self.cache_precheck_rx else {
+            return;
+        };
+        let result = match rx.try_recv() {
+            Ok(result) => result,
+            Err(TryRecvError::Empty) => return,
+            Err(TryRecvError::Disconnected) => {
+                self.cache_precheck_rx = None;
+                return;
+            }
+        };
+        self.cache_precheck_rx = None;
+
+        // A different file may have been loaded while the worker ran; stale
+        // results must not clobber the new load's state.
+        if self.loaded_audio_hash.as_deref() != Some(result.song_hash.as_str()) {
+            return;
+        }
+
+        let song_hash = result.song_hash;
+        let raw_sample_len_opt = result.raw_sample_len_opt;
+        if let Some((base_timeline, base_step_sec, cached_waveform)) = result.cached {
             // If the cached timeline covers a drastically different duration than
             // what the container metadata reports (e.g. a cache from a short
             // alternate audio track vs the real full-length program track),
             // discard the stale blob so a full re-render runs.
-            if raw_sample_len_opt.is_some() && self.loading_sample_rate > 0 {
-                let expected_dur = raw_sample_len as f32 / self.loading_sample_rate as f32;
+            if raw_sample_len_opt.is_some() && result.sample_rate > 0 {
+                let raw_sample_len = raw_sample_len_opt.unwrap_or(0);
+                let expected_dur = raw_sample_len as f32 / result.sample_rate as f32;
                 let cached_dur = base_timeline.len() as f32 * base_step_sec;
                 let drift = if expected_dur > 0.0 {
                     (cached_dur - expected_dur).abs() / expected_dur
@@ -198,6 +282,7 @@ impl KeyScribeApp {
             self.loading_cache_timeline_preloaded = false;
             self.loading_cache_waveform_preloaded = false;
             let hash_short = &song_hash[..song_hash.len().min(8)];
+            let precheck_diag = result.diag;
             let mismatch_total = precheck_diag.shared_param_mismatches
                 + precheck_diag.strict_len_mismatches
                 + precheck_diag.invalid_timeline_blobs;

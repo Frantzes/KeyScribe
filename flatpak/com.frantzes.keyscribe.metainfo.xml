@@ -1,0 +1,44 @@
+<?xml version="1.0" encoding="utf-8"?>
+<component type="desktop-application">
+  <id>com.frantzes.keyscribe</id>
+  <name>KeyScribe</name>
+  <summary>Polyphonic music transcription and stem separation</summary>
+  <developer id="com.frantzeselzaurdia">
+    <name>Frantzes El Zaurdia</name>
+  </developer>
+  <metadata_license>CC0-1.0</metadata_license>
+  <project_license>AGPL-3.0+</project_license>
+  <description>
+    <p>
+      KeyScribe is a desktop application that transcribes polyphonic music
+      from audio files. It detects notes, separates audio stems, generates
+      sheet music, and transcribes videos — all running locally on your
+      machine using ONNX Runtime with optional GPU acceleration.
+    </p>
+    <p>Key features:</p>
+    <ul>
+      <li>Polyphonic note detection from audio files (WAV, MP3, FLAC, OGG, M4A)</li>
+      <li>6-stem source separation (vocals, drums, bass, piano, guitar, other) using Demucs</li>
+      <li>MusicXML sheet music export with in-app engraved preview</li>
+      <li>Video transcription with waveform visualization</li>
+      <li>GPU acceleration via CUDA (NVIDIA) for faster inference</li>
+      <li>All processing runs locally — no cloud API required</li>
+    </ul>
+  </description>
+  <launchable type="desktop-id">com.frantzes.keyscribe.desktop</launchable>
+  <url type="homepage">https://keyscribe.frantzeselzaurdia.com/</url>
+  <url type="donation">https://buymeacoffee.com/frantzeselzaurdia</url>
+  <screenshots>
+    <screenshot type="default">
+      <caption>KeyScribe main interface</caption>
+      <image>https://keyscribe.frantzeselzaurdia.com/screenshot.png</image>
+    </screenshot>
+  </screenshots>
+  <releases>
+    <release version="0.3.1" date="2025-01-01"/>
+  </releases>
+  <content_rating type="oars-1.1"/>
+  <custom>
+    <value key="purplemoon::flatpak::cuda-support">bundled</value>
+  </custom>
+</component>

@@ -1,7 +1,6 @@
 use crate::app::KeyScribeApp;
 use eframe::egui;
 use std::path::Path;
-use crate::leadsheet::NoteEvent;
 
 impl KeyScribeApp {
     pub(crate) fn draw_export_modals(&mut self, ctx: &egui::Context) {
@@ -13,13 +12,23 @@ impl KeyScribeApp {
                 .resizable(false)
                 .open(&mut stems_open)
                 .show(ctx, |ui| {
+                    let current_model = self.current_separation_model_name();
+                    let model_display = self.separation_model_display_name(&current_model);
+                    ui.label(egui::RichText::new(format!("Model: {model_display}")).strong());
+                    ui.add_space(4.0);
+
                     self.draw_export_stem_selection(ui);
                     ui.add_space(8.0);
                     if ui.button("Select Destination & Export").clicked() {
+                        // The folder picker runs on a worker thread (see
+                        // `spawn_file_dialog`): the modal closes immediately
+                        // and the export fires when a folder is chosen, so a
+                        // long browsing session never stalls the event loop.
                         #[cfg(feature = "desktop-ui")]
-                        if let Some(folder) = rfd::FileDialog::new().pick_folder() {
-                            self.execute_export_stems(&folder);
-                        }
+                        self.spawn_file_dialog(
+                            ui.ctx(),
+                            super::runtime::FileDialogRequest::ExportStemsFolder,
+                        );
                         close_modal = true;
                     }
                 });
@@ -50,6 +59,7 @@ impl KeyScribeApp {
                             "",
                             0.01,
                             2,
+                            super::default_key_color_sensitivity() * 0.5,
                         );
                         if changed {
                             self.key_color_sensitivity = (ui_key_sensitivity * 2.0).clamp(0.0, 2.0);
@@ -59,10 +69,13 @@ impl KeyScribeApp {
                     
                     ui.add_space(8.0);
                     if ui.button("Select Destination & Export").clicked() {
+                        // Async folder picker (see above): the modal closes
+                        // now, the export fires on choice.
                         #[cfg(feature = "desktop-ui")]
-                        if let Some(folder) = rfd::FileDialog::new().pick_folder() {
-                            self.execute_export_midi(&folder);
-                        }
+                        self.spawn_file_dialog(
+                            ui.ctx(),
+                            super::runtime::FileDialogRequest::ExportMidiFolder,
+                        );
                         close_modal = true;
                     }
                 });
@@ -86,7 +99,17 @@ impl KeyScribeApp {
         }
     }
 
-    fn execute_export_stems(&self, dest_folder: &Path) {
+    pub(super) fn execute_export_stems(&mut self, dest_folder: &Path) {
+        let current_model = self.current_separation_model_name();
+        if self.separated_stems.is_none() || self.loaded_stems_model_name.as_deref() != Some(&current_model) {
+            self.last_error = Some(
+                "No separated stems available. Run \"Separate Instruments\" before exporting stems."
+                    .to_string(),
+            );
+            return;
+        }
+
+        let mut exported_count = 0;
         if let Some(stems) = &self.separated_stems {
             for stem in stems {
                 if self.export_selected_stems.contains(&stem.stem_type) {
@@ -98,17 +121,32 @@ impl KeyScribeApp {
                         bits_per_sample: 32,
                         sample_format: hound::SampleFormat::Float,
                     };
-                    if let Ok(mut writer) = hound::WavWriter::create(path, spec) {
-                        for &s in stem.samples_interleaved.iter() {
-                            let _ = writer.write_sample(s);
+                    match hound::WavWriter::create(&path, spec) {
+                        Ok(mut writer) => {
+                            for &s in stem.samples_interleaved.iter() {
+                                let _ = writer.write_sample(s);
+                            }
+                            if let Err(e) = writer.finalize() {
+                                self.last_error = Some(format!("Failed to finalize WAV {:?}: {e}", path));
+                            } else {
+                                exported_count += 1;
+                            }
+                        }
+                        Err(e) => {
+                            self.last_error = Some(format!("Failed to create WAV file {:?}: {e}", path));
                         }
                     }
                 }
             }
         }
+
+        if exported_count > 0 {
+            self.cache_status_message = Some(format!("Exported {exported_count} stem(s) to {:?}", dest_folder));
+            self.cache_status_message_at = Some(std::time::Instant::now());
+        }
     }
 
-    fn execute_export_midi(&self, dest_folder: &Path) {
+    pub(super) fn execute_export_midi(&self, dest_folder: &Path) {
         // Export the original/full mix when requested.
         if self.export_full_mix_midi && !self.note_timeline.is_empty() && self.note_timeline_step_sec > 0.0 {
             let mut next_id = 0;
@@ -119,7 +157,7 @@ impl KeyScribeApp {
                 &mut next_id,
             );
             let path = dest_folder.join("Original Mix.mid");
-            write_midi(&notes, &path);
+            let _ = crate::midi::write_midi(&notes, &path, 120.0);
         }
 
         // Export per-stem MIDI when stems are available and selected.
@@ -137,7 +175,7 @@ impl KeyScribeApp {
 
                         let file_name = format!("{}.mid", stem.stem_type.display_name());
                         let path = dest_folder.join(file_name);
-                        write_midi(&notes, &path);
+                        let _ = crate::midi::write_midi(&notes, &path, 120.0);
                     }
                 }
             }
@@ -145,66 +183,3 @@ impl KeyScribeApp {
     }
 }
 
-fn write_midi(notes: &[NoteEvent], path: &Path) {
-    use midly::{Header, Format, Timing, Track, TrackEvent, TrackEventKind, MetaMessage, MidiMessage, Smf};
-    
-    let mut smf = Smf::new(Header::new(Format::SingleTrack, Timing::Metrical(480.into())));
-    let mut track = Track::new();
-    
-    struct Event {
-        time_ticks: u32,
-        is_note_on: bool,
-        pitch: u8,
-        velocity: u8,
-    }
-    
-    let mut events = Vec::new();
-    for note in notes {
-        events.push(Event {
-            time_ticks: (note.start_time * 960.0) as u32,
-            is_note_on: true,
-            pitch: note.pitch,
-            velocity: note.velocity,
-        });
-        events.push(Event {
-            time_ticks: (note.end_time * 960.0) as u32,
-            is_note_on: false,
-            pitch: note.pitch,
-            velocity: 0,
-        });
-    }
-    
-    events.sort_by_key(|e| e.time_ticks);
-    
-    let mut last_tick = 0;
-    for e in events {
-        let delta = e.time_ticks.saturating_sub(last_tick);
-        last_tick = e.time_ticks;
-        
-        let message = if e.is_note_on {
-            TrackEventKind::Midi {
-                channel: 0.into(),
-                message: MidiMessage::NoteOn { key: e.pitch.into(), vel: e.velocity.into() },
-            }
-        } else {
-            TrackEventKind::Midi {
-                channel: 0.into(),
-                message: MidiMessage::NoteOff { key: e.pitch.into(), vel: e.velocity.into() },
-            }
-        };
-        
-        let delta_u28 = midly::num::u28::try_from(delta).unwrap_or(midly::num::u28::max_value());
-        track.push(TrackEvent {
-            delta: delta_u28,
-            kind: message,
-        });
-    }
-    
-    track.push(TrackEvent {
-        delta: 0.into(),
-        kind: TrackEventKind::Meta(MetaMessage::EndOfTrack),
-    });
-    
-    smf.tracks.push(track);
-    let _ = smf.save(path);
-}

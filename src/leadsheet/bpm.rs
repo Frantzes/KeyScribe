@@ -410,7 +410,7 @@ mod tests {
                 start_time: start,
                 end_time: start + 0.1,
                 velocity: 100,
-                channel: None,
+                channel: None, is_rearticulation: false,
             });
         }
         notes

@@ -612,7 +612,7 @@ mod tests {
                 start_time: t,
                 end_time: t + 0.15,
                 velocity: 100,
-                channel: None,
+                channel: None, is_rearticulation: false,
             });
         }
         let base = 8.0;
@@ -624,7 +624,7 @@ mod tests {
                 start_time: t,
                 end_time: t + 0.12,
                 velocity: 96,
-                channel: None,
+                channel: None, is_rearticulation: false,
             });
         }
         out
@@ -678,7 +678,7 @@ mod tests {
                 start_time: t,
                 end_time: t + 0.15,
                 velocity: 118,
-                channel: None,
+                channel: None, is_rearticulation: false,
             });
         }
 

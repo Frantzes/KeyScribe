@@ -16,12 +16,8 @@ use egui_plot::{Line, Plot, PlotBounds, PlotPoints, Polygon, VLine};
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 
-#[cfg(feature = "desktop-ui")]
-use rfd::FileDialog;
-
 use crate::analysis::{
-    analyze_with_full_pipeline, detect_note_probabilities, PIANO_HIGH_MIDI, PIANO_KEY_COUNT,
-    PIANO_LOW_MIDI,
+    analyze_with_full_pipeline, PIANO_HIGH_MIDI, PIANO_KEY_COUNT, PIANO_LOW_MIDI,
 };
 use crate::audio_io::{
     load_audio_file_streaming, load_audio_preview_chunk, AudioData, AudioPreviewChunk,
@@ -54,7 +50,7 @@ mod update;
 mod video_player;
 use media_controls::{draw_media_controls, media_controls_height_for_width, setting_toggle_row};
 
-const STATE_FILE_NAME: &str = ".keyscribe_state.json";
+pub(super) const STATE_FILE_NAME: &str = ".keyscribe_state.json";
 const LEGACY_STATE_FILE_NAME: &str = ".transcriber_state.json";
 const MAX_STATE_FILE_BYTES: u64 = 256 * 1024;
 const PROBABILITY_UPDATE_INTERVAL: Duration = Duration::from_millis(16);
@@ -230,6 +226,10 @@ fn default_auto_separate() -> bool {
     false
 }
 
+fn default_show_piano_settings() -> bool {
+    true
+}
+
 fn assign_stem_colors(stems: &[crate::leadsheet::SeparatedStem]) -> Vec<egui::Color32> {
     stems
         .iter()
@@ -240,6 +240,7 @@ fn assign_stem_colors(stems: &[crate::leadsheet::SeparatedStem]) -> Vec<egui::Co
             StemType::Guitar => egui::Color32::from_rgb(56, 204, 142),
             StemType::Drums => egui::Color32::from_rgb(160, 160, 160),
             StemType::Other => egui::Color32::from_rgb(238, 190, 73),
+            StemType::Instrumental => egui::Color32::from_rgb(238, 190, 73),
             StemType::Custom(_) => egui::Color32::from_rgb(220, 160, 220),
         })
         .collect()
@@ -315,6 +316,9 @@ struct PersistedState {
     show_note_hist_window: bool,
     #[serde(default)]
     show_video_pane: bool,
+    /// Whether the keyboard-settings panel under the piano is expanded.
+    #[serde(default = "default_show_piano_settings")]
+    show_piano_settings: bool,
     #[serde(default = "default_use_cqt_analysis")]
     use_cqt_analysis: bool,
     #[serde(default = "default_preprocess_audio")]
@@ -327,6 +331,10 @@ struct PersistedState {
     audio_output_device_id: Option<String>,
     #[serde(default)]
     loop_enabled: bool,
+    /// A-B loop range the user last left active, so a session can resume the
+    /// same loop. Only restored together with `loop_enabled` and a valid range.
+    #[serde(default)]
+    loop_selection: Option<(f32, f32)>,
     #[serde(default = "default_dark_mode")]
     dark_mode: bool,
     #[serde(default = "default_highlight_hex")]
@@ -347,6 +355,13 @@ struct PersistedState {
     /// resume from where the user left off when reopening a file.
     #[serde(default)]
     file_positions: std::collections::HashMap<String, f32>,
+    /// Per-file stem volumes (keyed by file hash -> stem name -> volume dB offset)
+    #[serde(default)]
+    file_stem_volumes: std::collections::HashMap<String, std::collections::HashMap<String, f32>>,
+    #[serde(default)]
+    pub mvsep_api_key: Option<String>,
+    #[serde(default)]
+    pub selected_separation_model_name: Option<String>,
 }
 
 impl Default for PersistedState {
@@ -369,12 +384,14 @@ impl Default for PersistedState {
             video_panel_height: 300.0,
             show_note_hist_window: true,
             show_video_pane: true,
+            show_piano_settings: default_show_piano_settings(),
             use_cqt_analysis: default_use_cqt_analysis(),
             preprocess_audio: true,
             playback_volume: 0.8,
             audio_quality_mode: AudioQualityMode::Balanced,
             audio_output_device_id: None,
             loop_enabled: false,
+            loop_selection: None,
             dark_mode: true,
             highlight_hex: default_highlight_hex(),
             recent_highlight_hex: Vec::new(),
@@ -384,6 +401,9 @@ impl Default for PersistedState {
             auto_separate: default_auto_separate(),
             file_markers: std::collections::HashMap::new(),
             file_positions: std::collections::HashMap::new(),
+            file_stem_volumes: std::collections::HashMap::new(),
+            mvsep_api_key: None,
+            selected_separation_model_name: Some(crate::mvsep::DEFAULT_MVSEP_MODEL_NAME.to_string()),
         }
     }
 }
@@ -462,7 +482,21 @@ fn app_data_dir() -> PathBuf {
         }
     }
 
-    app_portable_base_dir()
+    let exe_dir = app_portable_base_dir();
+    let is_in_target_dir = std::env::current_exe()
+        .ok()
+        .map(|p| p.to_string_lossy().contains("target"))
+        .unwrap_or(false);
+
+    if !is_in_target_dir && exe_dir.join(STATE_FILE_NAME).exists() {
+        return exe_dir;
+    }
+
+    if let Some(project_dirs) = app_project_dirs() {
+        return project_dirs.data_local_dir().to_path_buf();
+    }
+
+    exe_dir
 }
 
 pub(crate) fn app_cache_base_dir() -> PathBuf {
@@ -472,7 +506,37 @@ pub(crate) fn app_cache_base_dir() -> PathBuf {
         }
     }
 
-    app_portable_base_dir()
+    // Portable layout keeps the cache next to the executable — but only when
+    // that location is actually writable. AppImage squashfs mounts
+    // (/tmp/.mount_*/...), Flatpak's /app, and protected install dirs
+    // (Program Files, /usr/bin) are read-only; writing there fails with
+    // EROFS. Fall back to the OS user cache dir in that case.
+    let portable = app_portable_base_dir();
+    if is_dir_writable(&portable) {
+        return portable;
+    }
+    if let Some(project_dirs) = app_project_dirs() {
+        return project_dirs.cache_dir().to_path_buf();
+    }
+    portable
+}
+
+/// Probe whether `dir` can be created and written to.
+///
+/// Read-only locations (AppImage mounts, Flatpak /app, system install dirs)
+/// fail here, signalling callers to use the OS user dirs instead.
+fn is_dir_writable(dir: &Path) -> bool {
+    if fs::create_dir_all(dir).is_err() {
+        return false;
+    }
+    let probe = dir.join(".keyscribe-write-test");
+    match fs::write(&probe, b"w") {
+        Ok(()) => {
+            let _ = fs::remove_file(&probe);
+            true
+        }
+        Err(_) => false,
+    }
 }
 
 fn ensure_parent_dir(path: &Path) -> bool {
@@ -713,13 +777,47 @@ fn analysis_cache_variant_key(
     format!("{hash:016x}")
 }
 
-fn analysis_cache_decompress_budget(compressed_len: usize) -> usize {
+/// Upper bound on how much a cache blob may decompress to. This is a cap, not
+/// a pre-allocation: the payload is streamed and the buffer grows with the
+/// data, so a small highly-compressible blob does not reserve this much.
+fn analysis_cache_decompress_limit(compressed_len: usize) -> usize {
+    const MIN_LIMIT: usize = 256 * 1024 * 1024;
     compressed_len
         .saturating_mul(ANALYSIS_CACHE_MAX_DECOMPRESS_RATIO)
-        .clamp(
-            ANALYSIS_CACHE_MAX_COMPRESSED_BYTES,
-            ANALYSIS_CACHE_MAX_DECOMPRESSED_BYTES,
-        )
+        .max(MIN_LIMIT)
+        .min(ANALYSIS_CACHE_MAX_DECOMPRESSED_BYTES)
+}
+
+/// Stream-decompress an analysis cache payload, rejecting anything past
+/// [`analysis_cache_decompress_limit`].
+///
+/// `zstd::bulk::decompress` pre-allocates its entire `capacity` up front and,
+/// without zstd's `experimental` feature, cannot read the frame's real output
+/// size, so a large capacity reserved gigabytes per blob and aborted the
+/// process on allocation failure (`rust_oom` -> `0xc0000409`).
+fn decompress_analysis_cache_payload(bytes: &[u8]) -> Option<Vec<u8>> {
+    use std::io::Read;
+
+    if bytes.is_empty() {
+        return None;
+    }
+    let limit = analysis_cache_decompress_limit(bytes.len());
+    let mut decoder = zstd::stream::read::Decoder::new(bytes).ok()?;
+    let mut payload = Vec::new();
+    let mut chunk = [0u8; 64 * 1024];
+    loop {
+        match decoder.read(&mut chunk) {
+            Ok(0) => break,
+            Ok(n) => {
+                if payload.len().saturating_add(n) > limit {
+                    return None;
+                }
+                payload.extend_from_slice(&chunk[..n]);
+            }
+            Err(_) => return None,
+        }
+    }
+    Some(payload)
 }
 
 fn deserialize_analysis_cache_blob(payload: &[u8]) -> Option<AnalysisCacheBlob> {
@@ -773,8 +871,7 @@ fn decode_analysis_cache_blob(bytes: &[u8]) -> Result<AnalysisCacheBlob, CacheBl
         return Err(CacheBlobDecodeFailure::Decompress);
     }
 
-    let decompress_budget = analysis_cache_decompress_budget(bytes.len());
-    if let Ok(payload) = zstd::bulk::decompress(bytes, decompress_budget) {
+    if let Some(payload) = decompress_analysis_cache_payload(bytes) {
         return deserialize_analysis_cache_blob(payload.as_slice())
             .ok_or(CacheBlobDecodeFailure::Deserialize);
     }
@@ -859,8 +956,30 @@ fn legacy_state_file_path() -> PathBuf {
     app_data_dir().join(LEGACY_STATE_FILE_NAME)
 }
 
-fn load_persisted_state() -> PersistedState {
-    for path in [state_file_path(), legacy_state_file_path()] {
+/// Load persisted UI state, reporting whether a state file was actually
+/// found. Callers need the distinction: first-run defaults (e.g. tuned
+/// pipeline parameters) may seed a fresh state but must never clobber
+/// settings the user already saved.
+fn load_persisted_state() -> (PersistedState, bool) {
+    let mut search_paths = vec![
+        state_file_path(),
+        legacy_state_file_path(),
+    ];
+    if let Some(pd) = app_project_dirs() {
+        search_paths.push(pd.data_local_dir().join(STATE_FILE_NAME));
+        search_paths.push(pd.data_local_dir().join(LEGACY_STATE_FILE_NAME));
+    }
+    let portable = app_portable_base_dir();
+    search_paths.push(portable.join(STATE_FILE_NAME));
+    search_paths.push(portable.join(LEGACY_STATE_FILE_NAME));
+    if let Ok(cwd) = std::env::current_dir() {
+        search_paths.push(cwd.join(STATE_FILE_NAME));
+        search_paths.push(cwd.join(LEGACY_STATE_FILE_NAME));
+        search_paths.push(cwd.join("target").join("release").join(STATE_FILE_NAME));
+        search_paths.push(cwd.join("target").join("debug").join(STATE_FILE_NAME));
+    }
+
+    for path in search_paths {
         let Ok(meta) = fs::metadata(&path) else {
             continue;
         };
@@ -873,11 +992,119 @@ fn load_persisted_state() -> PersistedState {
         };
 
         if let Ok(state) = serde_json::from_str::<PersistedState>(&raw) {
-            return state;
+            return (state, true);
         }
     }
 
-    PersistedState::default()
+    (PersistedState::default(), false)
+}
+
+/// Undoable mix + transport params: stem volumes, audibility/piano
+/// visibility sets, Speed/Pitch, master volume. Snapshots are pushed before
+/// each mutation (one step per click or drag gesture) for Ctrl+Z / redo.
+#[derive(Clone, Default)]
+pub(super) struct MixSnapshot {
+    stem_volumes: std::collections::HashMap<String, f32>,
+    enabled_listening_indices: std::collections::BTreeSet<usize>,
+    enabled_stem_indices: std::collections::BTreeSet<usize>,
+    speed: f32,
+    pitch_semitones: f32,
+    playback_volume: f32,
+    key_color_sensitivity: f32,
+    key_highlight_max_sec: f32,
+    visualization_timing_offset_ms: f32,
+    piano_zoom: f32,
+}
+
+impl MixSnapshot {
+    fn capture(app: &KeyScribeApp) -> Self {
+        Self {
+            stem_volumes: app.stem_volumes.clone(),
+            enabled_listening_indices: app.enabled_listening_indices.clone(),
+            enabled_stem_indices: app.enabled_stem_indices.clone(),
+            speed: app.speed,
+            pitch_semitones: app.pitch_semitones,
+            playback_volume: app.playback_volume,
+            key_color_sensitivity: app.key_color_sensitivity,
+            key_highlight_max_sec: app.key_highlight_max_sec,
+            visualization_timing_offset_ms: app.visualization_timing_offset_ms,
+            piano_zoom: app.piano_zoom,
+        }
+    }
+}
+
+impl KeyScribeApp {
+    /// Record the pre-change mix state. Called at every mix mutation site;
+    /// coalesces a whole pointer drag into a single undo step.
+    pub(super) fn push_mix_undo(&mut self, pointer_down: bool) {
+        let snap = MixSnapshot::capture(self);
+        self.push_mix_undo_with(pointer_down, snap);
+    }
+
+    /// Push a caller-built snapshot (for widgets that mutate `self` directly:
+    /// callers capture the pre-change values first, then hand them over).
+    pub(super) fn push_mix_undo_with(&mut self, pointer_down: bool, snap: MixSnapshot) {
+        // Exactly one undo step per discrete action or pointer press: the
+        // first change of a drag pushes; continuations and the release
+        // click after a drag do not.
+        if !self.mix_press_pushed {
+            self.mix_undo.push(snap);
+            if self.mix_undo.len() > 50 {
+                self.mix_undo.remove(0);
+            }
+            self.mix_redo.clear();
+        }
+        self.mix_press_pushed = pointer_down;
+    }
+
+    pub(super) fn undo_mix(&mut self) {
+        if let Some(snap) = self.mix_undo.pop() {
+            self.mix_redo.push(MixSnapshot::capture(self));
+            self.restore_mix_snapshot(&snap);
+        }
+    }
+
+    pub(super) fn redo_mix(&mut self) {
+        if let Some(snap) = self.mix_redo.pop() {
+            self.mix_undo.push(MixSnapshot::capture(self));
+            self.restore_mix_snapshot(&snap);
+        }
+    }
+
+    fn restore_mix_snapshot(&mut self, snap: &MixSnapshot) {
+        self.stem_volumes = snap.stem_volumes.clone();
+        self.enabled_listening_indices = snap.enabled_listening_indices.clone();
+        self.enabled_stem_indices = snap.enabled_stem_indices.clone();
+        self.speed = snap.speed;
+        self.pitch_semitones = snap.pitch_semitones;
+        self.playback_volume = snap.playback_volume;
+        self.key_color_sensitivity = snap.key_color_sensitivity;
+        self.key_highlight_max_sec = snap.key_highlight_max_sec;
+        self.visualization_timing_offset_ms = snap.visualization_timing_offset_ms;
+        self.piano_zoom = snap.piano_zoom;
+        self.update_note_probabilities(true);
+        if let Some(hash) = self.loaded_audio_hash.clone() {
+            self.file_stem_volumes
+                .insert(hash, self.stem_volumes.clone());
+        }
+        let _ = self.sync_all_stem_gains_live();
+        self.stem_playback_cache = None;
+        self.maybe_restart_playback_for_listen_sync();
+        // Piano visibility may have changed: rebuild the note timeline.
+        // Restoring an empty-visible set triggers a silent rebuild job.
+        if self.stem_analyses.is_empty() || self.enabled_stem_indices.is_empty() {
+            self.param_tweak_rebuild = true;
+        }
+        self.note_timeline = std::sync::Arc::new(Vec::new());
+        self.note_timeline_step_sec = 0.0;
+        self.refresh_note_timeline_from_selected_stems_preserving();
+        // Commit Speed/Pitch + volume through the live engines.
+        self.pending_param_change = true;
+        self.last_param_change_at = Some(std::time::Instant::now());
+        if let Some(engine) = &mut self.engine {
+            engine.set_volume(self.playback_volume);
+        }
+    }
 }
 
 pub struct KeyScribeApp {
@@ -888,13 +1115,32 @@ pub struct KeyScribeApp {
     processed_playback_samples: Arc<Vec<f32>>,
     processed_playback_channels: u16,
     separated_stems: Option<Vec<crate::leadsheet::SeparatedStem>>,
+    loaded_stems_model_name: Option<String>,
     selected_separation_model_name: Option<String>,
+    mvsep_api_key: String,
+    mvsep_api_key_visible: bool,
+    mvsep_verify_message: Option<String>,
+    mvsep_verify_rx: Option<std::sync::mpsc::Receiver<String>>,
+    show_mvsep_api_key_modal: bool,
     enabled_listening_indices: std::collections::BTreeSet<usize>,
     enabled_stem_indices: std::collections::BTreeSet<usize>,
     pending_listening_indices: std::collections::BTreeSet<usize>,
-    pending_stem_indices: std::collections::BTreeSet<usize>,
-    show_visualize_selector: bool,
-    show_listen_selector: bool,
+    show_stem_mixer: bool,
+    /// Cog toggle under the piano: reveals the keyboard settings sliders.
+    show_piano_settings: bool,
+    mix_undo: Vec<MixSnapshot>,
+    mix_redo: Vec<MixSnapshot>,
+    /// True once a snapshot was pushed for the ongoing pointer press, so a
+    /// whole drag (and its release click) yields exactly one undo step.
+    mix_press_pushed: bool,
+    /// A processing job triggered by a speed/pitch tweak: no status text.
+    param_tweak_rebuild: bool,
+    undo_z_held: bool,
+    undo_y_held: bool,
+    stem_mixer_anchor: Option<egui::Rect>,
+    pending_seek: Option<f32>,
+    pending_seek_age: u32,
+    show_separation_model_dropdown: bool,
     waveform: Vec<[f64; 2]>,
     waveform_version: u64,
     loop_waveform_cache_version: u64,
@@ -956,6 +1202,11 @@ pub struct KeyScribeApp {
     cache_status_message: Option<String>,
     cache_status_message_at: Option<Instant>,
     cache_precheck_done: bool,
+    /// Background analysis-cache precheck (see `cache.rs`). File reads +
+    /// decompression run off the event loop so the compositor never sees a
+    /// stalled UI while a file loads.
+    cache_precheck_rx:
+        Option<mpsc::Receiver<cache::CachePrecheckResult>>,
     loading_cache_timeline_preloaded: bool,
     loading_cache_waveform_preloaded: bool,
     pending_param_change: bool,
@@ -997,6 +1248,9 @@ pub struct KeyScribeApp {
     separation_attempted: bool,
     separation_progress: Arc<std::sync::atomic::AtomicU32>,
     separation_rx: Option<Receiver<SeparationResult>>,
+    stem_cache_rx: Option<Receiver<Option<Vec<crate::leadsheet::SeparatedStem>>>>,
+    stem_cache_pending_model: Option<String>,
+    stem_cache_miss: bool,
     loading_sample_rate: u32,
     loading_total_samples: Option<usize>,
     loading_decoded_samples: usize,
@@ -1040,6 +1294,20 @@ pub struct KeyScribeApp {
         Option<std::sync::mpsc::Receiver<(SheetPreviewCacheKey, Result<SheetPreviewData, String>)>>,
     stem_playback_cache: Option<StemPlaybackCache>,
     cache_size_bytes: Option<Option<u64>>,
+    /// Background `get_dir_size` computation for the Preferences cache row.
+    /// Recursive directory walks stay off the event loop.
+    cache_size_rx: Option<mpsc::Receiver<u64>>,
+    cache_size_pending: bool,
+    /// In-flight native file dialog (open/save/folder). Portal dialogs can
+    /// stay open for minutes; they run on a worker thread and the result is
+    /// collected in `poll_file_dialog_result` so the event loop — and with
+    /// it compositor pings — never stalls.
+    #[cfg(feature = "desktop-ui")]
+    file_dialog_rx: Option<mpsc::Receiver<runtime::FileDialogResult>>,
+    /// Last MVSep key value persisted to the user `.env` file. The periodic
+    /// state save only touches `.env` when the key actually changed instead
+    /// of rewriting it every 2 seconds.
+    mvsep_key_last_persisted: String,
 
     // Export UI
     export_stems_modal_open: bool,
@@ -1049,6 +1317,12 @@ pub struct KeyScribeApp {
     file_markers: std::collections::HashMap<String, Vec<MarkerData>>,
     /// Per-file playback positions (keyed by file hash) for resume-on-reopen.
     file_positions: std::collections::HashMap<String, f32>,
+    /// Per-file stem volumes (keyed by file hash -> stem name -> dB offset).
+    file_stem_volumes: std::collections::HashMap<String, std::collections::HashMap<String, f32>>,
+    /// Current stem volume offsets in dB (keyed by stem name).
+    stem_volumes: std::collections::HashMap<String, f32>,
+    /// Pending stem volume offsets being edited in the listening selector.
+    pending_stem_volumes: std::collections::HashMap<String, f32>,
     /// When set, the playhead will jump to this position once the audio
     /// hash is known and the per-file position map has been checked.
     pending_restore_position: Option<f32>,
@@ -1077,6 +1351,7 @@ struct StemPlaybackCache {
     channels: u16,
     sample_rate: u32,
     listening_key: Vec<usize>,
+    listening_volumes: Vec<f32>,
     processed_speed: f32,
     processed_pitch: f32,
 }
@@ -1216,8 +1491,11 @@ struct SheetPreviewJob {
     full_mix: Option<Vec<f32>>,
     sample_rate: u32,
     manual_bpm: Option<f32>,
+    swing_override: Option<crate::leadsheet::types::SwingStyle>,
     chord_skip: bool,
     chord_notes: Option<Vec<crate::leadsheet::NoteEvent>>,
+    /// Probability timelines for harmonic (timeline-based) chord detection.
+    chord_timeline: Option<crate::leadsheet::TimelineChordInput>,
     source_duration: f32,
 }
 
@@ -1242,19 +1520,6 @@ struct EngravedSheetPage {
     note_positions: Vec<NotePosition>,
 }
 
-#[derive(Default)]
-struct CachePrecheckDiagnostics {
-    total_candidates: usize,
-    existing_files: usize,
-    parsed_blobs: usize,
-    read_failures: usize,
-    decompress_failures: usize,
-    deserialize_failures: usize,
-    shared_param_mismatches: usize,
-    strict_len_mismatches: usize,
-    invalid_timeline_blobs: usize,
-}
-
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum RebuildMode {
     Full,
@@ -1265,7 +1530,7 @@ enum RebuildMode {
 
 impl KeyScribeApp {
     pub fn new(_cc: &eframe::CreationContext<'_>) -> Self {
-        let persisted = load_persisted_state();
+        let (persisted, had_saved_state) = load_persisted_state();
         let startup_path = persisted.last_file.clone();
         let mut recent_file_paths = persisted.recent_files.clone();
         if recent_file_paths.is_empty() {
@@ -1276,6 +1541,14 @@ impl KeyScribeApp {
         let highlight_color = parse_hex_color(&persisted.highlight_hex).unwrap_or(ACCENT_PURPLE);
         apply_brand_theme(&_cc.egui_ctx, persisted.dark_mode, highlight_color);
 
+        // Only turn the loop button back on when a real A-B range was left
+        // behind; a stray persisted `loop_enabled` with no range would light
+        // the button on startup with nothing to loop.
+        let restored_loop_selection = persisted
+            .loop_selection
+            .filter(|(a, b)| (b - a).abs() > LOOP_MIN_DURATION_SEC);
+        let restored_loop_enabled = persisted.loop_enabled && restored_loop_selection.is_some();
+
         let mut app = Self {
             loaded_path: None,
             loaded_audio_hash: None,
@@ -1284,13 +1557,36 @@ impl KeyScribeApp {
             processed_playback_samples: Arc::new(Vec::new()),
             processed_playback_channels: 1,
             separated_stems: None,
-            selected_separation_model_name: None,
+            loaded_stems_model_name: None,
+            selected_separation_model_name: persisted
+                .selected_separation_model_name
+                .clone()
+                .or_else(|| Some(crate::mvsep::DEFAULT_MVSEP_MODEL_NAME.to_string())),
+            mvsep_api_key: persisted
+                .mvsep_api_key
+                .clone()
+                .filter(|k| !k.trim().is_empty())
+                .or_else(crate::mvsep::find_mvsep_api_key)
+                .unwrap_or_default(),
+            mvsep_api_key_visible: false,
+            mvsep_verify_message: None,
+            mvsep_verify_rx: None,
+            show_mvsep_api_key_modal: false,
             enabled_listening_indices: std::collections::BTreeSet::new(),
             enabled_stem_indices: std::collections::BTreeSet::new(),
             pending_listening_indices: std::collections::BTreeSet::new(),
-            pending_stem_indices: std::collections::BTreeSet::new(),
-            show_visualize_selector: false,
-            show_listen_selector: false,
+            show_stem_mixer: false,
+            show_piano_settings: persisted.show_piano_settings,
+            mix_undo: Vec::new(),
+            mix_redo: Vec::new(),
+            mix_press_pushed: false,
+            param_tweak_rebuild: false,
+            undo_z_held: false,
+            undo_y_held: false,
+            stem_mixer_anchor: None,
+            pending_seek: None,
+            pending_seek_age: 0,
+            show_separation_model_dropdown: false,
             waveform: Vec::new(),
             waveform_version: 0,
             loop_waveform_cache_version: u64::MAX,
@@ -1361,6 +1657,7 @@ impl KeyScribeApp {
             cache_status_message: None,
             cache_status_message_at: None,
             cache_precheck_done: false,
+            cache_precheck_rx: None,
             loading_cache_timeline_preloaded: false,
             loading_cache_waveform_preloaded: false,
             pending_param_change: false,
@@ -1375,7 +1672,7 @@ impl KeyScribeApp {
             audio_quality_mode: persisted.audio_quality_mode,
             audio_output_device_id: persisted.audio_output_device_id.clone(),
             audio_output_devices: Vec::new(),
-            loop_enabled: persisted.loop_enabled,
+            loop_enabled: restored_loop_enabled,
             dark_mode: persisted.dark_mode,
             highlight_color,
             custom_rgb: [
@@ -1388,11 +1685,11 @@ impl KeyScribeApp {
             recent_highlight_hex: persisted.recent_highlight_hex,
             last_state_save_at: Instant::now(),
             waveform_reset_view: true,
-            loop_selection: None,
+            loop_selection: restored_loop_selection,
             loop_start_input_str: String::new(),
             loop_end_input_str: String::new(),
             drag_select_anchor_sec: None,
-            loop_playback_enabled: false,
+            loop_playback_enabled: restored_loop_enabled,
             playing_preview_buffer: false,
             live_stream_playback: false,
             use_cqt_analysis: persisted.use_cqt_analysis,
@@ -1406,6 +1703,9 @@ impl KeyScribeApp {
             separation_attempted: false,
             separation_progress: Arc::new(std::sync::atomic::AtomicU32::new(0)),
             separation_rx: None,
+            stem_cache_rx: None,
+            stem_cache_pending_model: None,
+            stem_cache_miss: false,
             loading_sample_rate: 0,
             loading_total_samples: None,
             loading_decoded_samples: 0,
@@ -1447,12 +1747,20 @@ impl KeyScribeApp {
             sheet_preview_result_rx: None,
             stem_playback_cache: None,
             cache_size_bytes: None,
+            cache_size_rx: None,
+            cache_size_pending: false,
+            #[cfg(feature = "desktop-ui")]
+            file_dialog_rx: None,
+            mvsep_key_last_persisted: String::new(),
             export_stems_modal_open: false,
             export_midi_modal_open: false,
             export_selected_stems: std::collections::HashSet::new(),
             export_full_mix_midi: false,
             file_markers: persisted.file_markers,
             file_positions: persisted.file_positions,
+            file_stem_volumes: persisted.file_stem_volumes,
+            stem_volumes: std::collections::HashMap::new(),
+            pending_stem_volumes: std::collections::HashMap::new(),
             pending_restore_position: None,
             dragging_marker: None,
             context_menu_marker_idx: None,
@@ -1462,7 +1770,41 @@ impl KeyScribeApp {
             streaming_stretch: None,
         };
 
+        // Apply tuned pipeline parameters (written by `keyscribe-cli tune`)
+        // ONLY on first run (no saved state found), so the GUI matches the
+        // tuned CLI behavior out of the box. On later launches the user's
+        // saved settings win: applying unconditionally here used to reset
+        // e.g. key color sensitivity back to the tuned value on every start,
+        // which is why configured values seemingly never persisted.
+        if !had_saved_state {
+            if let Ok(Some(tuned)) = crate::headless::TunedConfig::load_default() {
+            app.key_color_sensitivity = tuned.key_sensitivity.clamp(0.0, 2.0);
+            app.manual_bpm = tuned.bpm;
+            match tuned.melody.as_str() {
+                "poly" | "polyphonic" => {
+                    app.melody_mode = MelodyMode::Polyphonic;
+                }
+                "skyline" => {
+                    app.melody_mode = MelodyMode::Monophonic;
+                    app.melody_heuristic = false;
+                }
+                "heuristic" => {
+                    app.melody_mode = MelodyMode::Monophonic;
+                    app.melody_heuristic = true;
+                }
+                _ => {}
+            }
+            app.chord_skip = false;
+            eprintln!(
+                "[keyscribe] applied tuned pipeline parameters from keyscribe.tuned.json"
+            );
+            }
+        }
+
         app.refresh_audio_output_devices();
+        // Seed the `.env` write tracker so the periodic autosave doesn't
+        // rewrite the key file on the first tick when nothing changed.
+        app.mvsep_key_last_persisted = app.mvsep_api_key.trim().to_string();
         if let Some(selected) = app.audio_output_device_id.clone() {
             let exists = app.audio_output_devices.iter().any(|d| d.id == selected);
             if !exists {

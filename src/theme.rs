@@ -57,6 +57,23 @@ fn configure_fonts_once(ctx: &egui::Context) {
     defs.families
         .insert(egui::FontFamily::Name("icons".into()), icon_family);
 
+    // Bundled Jost (OFL, see assets/fonts/OFL.txt) so every platform renders
+    // the brand font with no system dependency. A system-installed Jost, when
+    // present, takes precedence below.
+    defs.font_data.insert(
+        "jost_bundled".to_owned(),
+        egui::FontData::from_static(include_bytes!("../assets/fonts/Jost-Variable.ttf")).into(),
+    );
+    for family in [
+        egui::FontFamily::Proportional,
+        egui::FontFamily::Monospace,
+    ] {
+        defs.families
+            .entry(family)
+            .or_default()
+            .insert(0, "jost_bundled".to_owned());
+    }
+
     let mut candidates = vec![
         "C:/Windows/Fonts/Jost-Regular.ttf".to_string(),
         "C:/Windows/Fonts/jost-regular.ttf".to_string(),

@@ -24,6 +24,14 @@ target
 #.idea/
 .transcriber_state.json
 .transcriber_cache/
+.env
+*.env
+
+# Headless CLI test-loop artifacts
+out/
+out2/
+out3/
+tests/data/
 
 # ONNX model files - downloaded by build scripts from GitHub Releases, not committed
 models/*.onnx
@@ -34,3 +42,9 @@ vendor/cudnn/*.zip
 vendor/ort-gpu/*.dll
 vendor/ort-gpu/*.whl
 vendor/onnxruntime/*.dll
+
+# Flatpak build cache (downloaded sources, build trees, ccache) — generated
+# by flatpak-builder in the repo root, not committed
+.flatpak-builder/
+# Flatpak bundle outputs
+*.flatpak

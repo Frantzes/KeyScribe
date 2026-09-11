@@ -231,6 +231,7 @@ impl KeyScribeApp {
             && (self.base_note_timeline.is_empty() || self.base_note_timeline_step_sec <= 0.0);
         if needs_full_rebuild {
             let was_playing = self.stop_if_playing();
+            self.param_tweak_rebuild = true;
             self.request_rebuild(was_playing, RebuildMode::Full);
             return;
         }
@@ -309,6 +310,7 @@ impl KeyScribeApp {
 
     pub(super) fn clear_processing_job(&mut self) {
         self.is_processing = false;
+        self.param_tweak_rebuild = false;
         self.processing_rx = None;
         self.active_job_id = None;
         self.active_rebuild_mode = RebuildMode::Full;
@@ -427,6 +429,10 @@ impl KeyScribeApp {
         self.selected_time_sec = self.selected_time_sec.min(self.source_duration());
 
         if let Some(err) = result.analysis_error {
+            // Mirror to stderr: otherwise headless/terminal diagnosis of a
+            // failed transcription is impossible (the message only shows in
+            // the UI's error label).
+            eprintln!("[keyscribe] analysis failed: {err}");
             self.last_error = Some(err);
         }
         self.update_note_probabilities(true);
@@ -443,7 +449,7 @@ impl KeyScribeApp {
         } else if let Some(source_pos) = handoff_pos {
             if let Some(loop_end) = handoff_loop_end {
                 if loop_end - source_pos > LOOP_MIN_DURATION_SEC {
-                    self.play_range(source_pos, Some(loop_end));
+                    self.play_range(source_pos, None);
                 } else {
                     self.play_from_selected();
                 }
@@ -532,10 +538,6 @@ impl KeyScribeApp {
         0.0
     }
 
-    pub(super) fn source_to_output_time(&self, source_sec: f32) -> f32 {
-        source_sec / self.playback_rate()
-    }
-
     pub(super) fn timeline_duration_sec(&self) -> f32 {
         if self.is_audio_loading
             && (self.loading_cache_waveform_preloaded || self.loading_cache_timeline_preloaded)
@@ -612,15 +614,7 @@ impl KeyScribeApp {
 
     #[cfg(feature = "desktop-ui")]
     pub(super) fn import_audio_with_ctx(&mut self, ctx: &egui::Context) {
-        let picked = FileDialog::new()
-            .add_filter("Media", &["wav", "mp3", "flac", "ogg", "m4a", "aac", "mp4", "mkv", "avi", "mov", "webm"])
-            .pick_file();
-
-        if let Some(path) = picked {
-            if let Err(err) = self.start_audio_loading_from_path(path.to_path_buf(), ctx) {
-                self.last_error = Some(err);
-            }
-        }
+        self.spawn_file_dialog(ctx, FileDialogRequest::OpenAudio);
     }
 
     #[cfg(not(feature = "desktop-ui"))]
@@ -655,5 +649,137 @@ impl KeyScribeApp {
         let color_image = egui::ColorImage::from_rgba_unmultiplied(size, image.as_raw());
 
         Some(ctx.load_texture("album-art", color_image, egui::TextureOptions::LINEAR))
+    }
+}
+
+#[cfg(feature = "desktop-ui")]
+pub(super) enum FileDialogRequest {
+    OpenAudio,
+    ExportStemsFolder,
+    ExportMidiFolder,
+    SaveMusicXml(String),
+    SavePdf(String),
+}
+
+#[cfg(feature = "desktop-ui")]
+pub(super) enum FileDialogResult {
+    OpenAudio(Option<PathBuf>),
+    ExportStemsFolder(Option<PathBuf>),
+    ExportMidiFolder(Option<PathBuf>),
+    SaveMusicXml(Option<PathBuf>),
+    SavePdf(Option<PathBuf>),
+}
+
+#[cfg(feature = "desktop-ui")]
+impl KeyScribeApp {
+    /// Open a native file dialog without blocking the event loop.
+    ///
+    /// The portal file chooser (`xdg-desktop-portal` / Zenity fallback) can
+    /// stay open for minutes, and its synchronous API parks the calling
+    /// thread the whole time. Called on the UI thread that wedges the event
+    /// loop: compositor pings go unanswered and the desktop raises
+    /// "Application Not Responding" after a few seconds of browsing files.
+    /// Instead the dialog runs on a worker thread (via
+    /// `rfd::AsyncFileDialog`) and the choice is applied in
+    /// [`Self::poll_file_dialog_result`]. One dialog at a time; extra
+    /// requests while one is open are ignored.
+    pub(super) fn spawn_file_dialog(&mut self, ctx: &egui::Context, request: FileDialogRequest) {
+        if self.file_dialog_rx.is_some() {
+            return;
+        }
+        const MEDIA_EXTENSIONS: &[&str] = &[
+            "wav", "mp3", "flac", "ogg", "m4a", "aac", "mp4", "mkv", "avi", "mov", "webm",
+        ];
+        let (tx, rx) = mpsc::channel::<FileDialogResult>();
+        self.file_dialog_rx = Some(rx);
+        let repaint = ctx.clone();
+        thread::spawn(move || {
+            let result = match request {
+                FileDialogRequest::OpenAudio => FileDialogResult::OpenAudio(
+                    pollster::block_on(
+                        rfd::AsyncFileDialog::new()
+                            .add_filter("Media", MEDIA_EXTENSIONS)
+                            .pick_file(),
+                    )
+                    .map(|handle| handle.path().to_path_buf()),
+                ),
+                FileDialogRequest::ExportStemsFolder => {
+                    FileDialogResult::ExportStemsFolder(
+                        pollster::block_on(rfd::AsyncFileDialog::new().pick_folder())
+                            .map(|handle| handle.path().to_path_buf()),
+                    )
+                }
+                FileDialogRequest::ExportMidiFolder => FileDialogResult::ExportMidiFolder(
+                    pollster::block_on(rfd::AsyncFileDialog::new().pick_folder())
+                        .map(|handle| handle.path().to_path_buf()),
+                ),
+                FileDialogRequest::SaveMusicXml(stem) => FileDialogResult::SaveMusicXml(
+                    pollster::block_on(
+                        rfd::AsyncFileDialog::new()
+                            .add_filter("MusicXML", &["musicxml", "xml"])
+                            .set_file_name(&format!("{stem}.musicxml"))
+                            .save_file(),
+                    )
+                    .map(|handle| handle.path().to_path_buf()),
+                ),
+                FileDialogRequest::SavePdf(stem) => FileDialogResult::SavePdf(
+                    pollster::block_on(
+                        rfd::AsyncFileDialog::new()
+                            .add_filter("PDF", &["pdf"])
+                            .set_file_name(&format!("{stem}.pdf"))
+                            .save_file(),
+                    )
+                    .map(|handle| handle.path().to_path_buf()),
+                ),
+            };
+            let _ = tx.send(result);
+            repaint.request_repaint();
+        });
+    }
+
+    /// Apply a finished native file dialog, if any. Called once per frame;
+    /// never blocks (single `try_recv`).
+    pub(super) fn poll_file_dialog_result(&mut self, ctx: &egui::Context) {
+        let result = match &self.file_dialog_rx {
+            Some(rx) => match rx.try_recv() {
+                Ok(result) => result,
+                Err(TryRecvError::Empty) => return,
+                Err(TryRecvError::Disconnected) => {
+                    self.file_dialog_rx = None;
+                    return;
+                }
+            },
+            None => return,
+        };
+        self.file_dialog_rx = None;
+        match result {
+            FileDialogResult::OpenAudio(Some(path)) => {
+                match self.start_audio_loading_from_path(path, ctx) {
+                    Ok(()) => {
+                        self.last_error = None;
+                    }
+                    Err(err) => {
+                        self.last_error = Some(err);
+                    }
+                }
+            }
+            FileDialogResult::OpenAudio(None) => {}
+            FileDialogResult::ExportStemsFolder(Some(folder)) => {
+                self.execute_export_stems(folder.as_path());
+            }
+            FileDialogResult::ExportStemsFolder(None) => {}
+            FileDialogResult::ExportMidiFolder(Some(folder)) => {
+                self.execute_export_midi(folder.as_path());
+            }
+            FileDialogResult::ExportMidiFolder(None) => {}
+            FileDialogResult::SaveMusicXml(Some(path)) => {
+                self.finish_musicxml_export(path.as_path());
+            }
+            FileDialogResult::SaveMusicXml(None) => {}
+            FileDialogResult::SavePdf(Some(path)) => {
+                self.finish_pdf_export(path.as_path());
+            }
+            FileDialogResult::SavePdf(None) => {}
+        }
     }
 }

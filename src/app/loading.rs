@@ -148,6 +148,7 @@ impl KeyScribeApp {
         self.cache_status_message = None;
         self.cache_status_message_at = None;
         self.cache_precheck_done = false;
+        self.cache_precheck_rx = None;
         self.loading_cache_timeline_preloaded = false;
         self.loading_cache_waveform_preloaded = false;
         self.loading_preview_cache.clear();
@@ -172,13 +173,20 @@ impl KeyScribeApp {
             self.loop_playback_enabled = false;
             self.drag_select_anchor_sec = None;
 
+            if let Some(hash) = &self.loaded_audio_hash {
+                if !self.stem_volumes.is_empty() {
+                    self.file_stem_volumes.insert(hash.clone(), self.stem_volumes.clone());
+                }
+            }
+
             // Clear all stem state from previous song
             self.saved_visualize_stem_indices = None;
             self.saved_listen_stem_indices = None;
-            self.pending_stem_indices.clear();
             self.pending_listening_indices.clear();
-            self.show_visualize_selector = false;
-            self.show_listen_selector = false;
+            self.stem_volumes.clear();
+            self.pending_stem_volumes.clear();
+            self.show_stem_mixer = false;
+            self.stem_mixer_anchor = None;
             self.melody_stem_indices.clear();
             self.chord_stem_indices.clear();
             self.current_chord = None;
@@ -190,11 +198,15 @@ impl KeyScribeApp {
         }
         // Clear all stem state from previous song
         self.separated_stems = None;
+        self.loaded_stems_model_name = None;
         self.stem_analyses.clear();
         self.stem_colors.clear();
         self.stem_analysis_rx = None;
         self.is_separating = false;
         self.separation_attempted = false;
+        self.stem_cache_miss = false;
+        self.stem_cache_pending_model = None;
+        self.stem_cache_rx = None;
         self.separation_rx = None;
         self.enabled_stem_indices.clear();
         self.enabled_listening_indices.clear();
@@ -238,6 +250,13 @@ impl KeyScribeApp {
         event: StreamingAudioEvent,
         ctx: &egui::Context,
     ) {
+        // While minimized the surface is hidden: skip the streaming waveform
+        // rebuild (a full-buffer scan per chunk). The delta accumulator keeps
+        // counting, so the first visible frame after restore rebuilds once.
+        // This keeps hidden wake-ups cheap for the compositor.
+        // (Linux/Wayland never reports minimized — see update.rs — so this
+        // only fires where the backend supports it; harmless elsewhere.)
+        let minimized = ctx.input(|i| i.viewport().minimized.unwrap_or(false));
         match event {
             StreamingAudioEvent::SourceHash(source_hash) => {
                 self.loaded_audio_hash = source_hash;
@@ -253,6 +272,12 @@ impl KeyScribeApp {
                             self.pending_restore_position = Some(saved);
                         }
                     }
+                    if let Some(saved_vols) = self.file_stem_volumes.get(hash) {
+                        self.stem_volumes = saved_vols.clone();
+                    } else {
+                        self.stem_volumes.clear();
+                    }
+                    self.pending_stem_volumes = self.stem_volumes.clone();
                 }
 
                 // Apply the pending restore position now that the hash is
@@ -329,7 +354,8 @@ impl KeyScribeApp {
                     self.loading_total_samples,
                     self.loading_sample_rate,
                 );
-                let should_rebuild = !self.loading_cache_waveform_preloaded
+                let should_rebuild = !minimized
+                    && !self.loading_cache_waveform_preloaded
                     && self.should_rebuild_streaming_waveform(processed_len);
                 if should_rebuild {
                     let waveform = build_waveform_for_processed(
@@ -422,12 +448,14 @@ impl KeyScribeApp {
             }
             StreamingAudioEvent::Error(message) => {
                 self.is_audio_loading = false;
-                self.audio_loading_rx = None;
-                self.audio_loading_cancel = None;
-                self.live_stream_playback = false;
-                self.loading_cache_timeline_preloaded = false;
-                self.loading_cache_waveform_preloaded = false;
-                self.loading_preview_cache.clear();
+        self.audio_loading_rx = None;
+        self.audio_loading_cancel = None;
+        self.is_audio_loading = false;
+        self.live_stream_playback = false;
+        self.loading_cache_timeline_preloaded = false;
+        self.loading_cache_waveform_preloaded = false;
+        self.loading_preview_cache.clear();
+        self.cache_precheck_rx = None;
                 self.last_error = Some(message);
             }
         }
@@ -471,7 +499,12 @@ impl KeyScribeApp {
                 // More work is likely queued; request immediate redraw but keep each frame bounded.
                 ctx.request_repaint();
             }
-            ctx.request_repaint_after(Duration::from_millis(33));
+            // While minimized the outer update loop already paces wake-ups;
+            // don't defeat its backoff with a 30 Hz timer here.
+            let minimized = ctx.input(|i| i.viewport().minimized.unwrap_or(false));
+            if !minimized {
+                ctx.request_repaint_after(Duration::from_millis(33));
+            }
         }
     }
 }

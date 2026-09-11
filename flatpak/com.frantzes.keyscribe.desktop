@@ -1,0 +1,10 @@
+[Desktop Entry]
+Name=KeyScribe
+Comment=Polyphonic music note detection, stem separation, sheet music generation, and video transcription from recorded audio
+Exec=keyscribe
+Icon=com.frantzes.keyscribe
+Terminal=false
+Type=Application
+StartupWMClass=com.frantzes.keyscribe
+Categories=Audio;AudioVideo;Music;
+MimeType=audio/flac;audio/mpeg;audio/mp4;audio/ogg;audio/wav;audio/x-wav;video/mp4;video/mpeg;video/webm;video/ogg;

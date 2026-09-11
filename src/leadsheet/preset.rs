@@ -1,14 +1,15 @@
 use crate::leadsheet::beat_association::associate_note_events;
 use crate::leadsheet::bpm::{BpmDetectionConfig, TempoEstimate};
 use crate::leadsheet::chord::{debug_chord_notes_to_json, detect_chord_changes, detect_chord_changes_per_bar, ChordAnalysisConfig};
+use crate::leadsheet::harmony::{detect_chords_from_timeline, TimelineChordInput};
 use crate::leadsheet::instrument_separation::{
     extract_melodic_audio, SeparationConfig, StemType,
 };
 use crate::leadsheet::joint_tracker::JointRhythmConfig;
 use crate::leadsheet::quantize::{
-    detect_swing, quantize_aligned_notes,
+    coarsen_rhythm, detect_swing, quantize_aligned_notes, quantize_aligned_notes_learned,
     quantize_notes_with_rhythm_map, quantize_notes_with_ties, QuantizationConfig,
-    SwingDetectionConfig,
+    RhythmCoarsenConfig, SwingDetectionConfig,
 };
 use crate::leadsheet::tempo_map::{
     beat_at_time, detect_tempo_map, detect_time_signature_segments, TempoMapConfig,
@@ -31,6 +32,15 @@ pub struct LeadSheetPresetConfig {
     pub use_instrument_separation: bool,
     pub separation: SeparationConfig,
     pub swing_override: Option<crate::leadsheet::types::SwingStyle>,
+    /// Rhythm-quantization engine for the melody. `LearnedOnnx` falls back to
+    /// the rule grid when `melody_quantizer.onnx` is absent.
+    pub quantizer: crate::leadsheet::QuantizerEngine,
+    /// Optional explicit path to `melody_quantizer.onnx` (defaults to the
+    /// resolver in `quantize::resolve_quantizer_model_path`).
+    pub quantizer_model_path: Option<std::path::PathBuf>,
+    /// Post-quantization rhythm merge & coarsening pass (Tier A1). Disabled by
+    /// `--no-rhythm-coarsen`.
+    pub rhythm_coarsen: RhythmCoarsenConfig,
 }
 
 impl Default for LeadSheetPresetConfig {
@@ -46,6 +56,9 @@ impl Default for LeadSheetPresetConfig {
             use_instrument_separation: false,
             separation: SeparationConfig::default(),
             swing_override: None,
+            quantizer: crate::leadsheet::QuantizerEngine::default(),
+            quantizer_model_path: None,
+            rhythm_coarsen: RhythmCoarsenConfig::default(),
         }
     }
 }
@@ -274,6 +287,28 @@ pub fn generate_lead_sheet_enhanced(
     beats_per_bar: u32,
     config: &LeadSheetPresetConfig,
 ) -> Option<LeadSheetFoundation> {
+    generate_lead_sheet_enhanced_with_timeline(
+        notes,
+        beat_times,
+        downbeat_times,
+        beats_per_bar,
+        config,
+        None,
+    )
+}
+
+/// Same as [`generate_lead_sheet_enhanced`], but chord detection uses the soft
+/// probability timeline (harmonic analysis: key estimate + Viterbi over bars)
+/// when `timeline` is provided; otherwise it falls back to the legacy
+/// binary-note per-bar scan.
+pub fn generate_lead_sheet_enhanced_with_timeline(
+    notes: &[NoteEvent],
+    beat_times: &[f32],
+    downbeat_times: &[f32],
+    beats_per_bar: u32,
+    config: &LeadSheetPresetConfig,
+    timeline: Option<&TimelineChordInput>,
+) -> Option<LeadSheetFoundation> {
     if beat_times.len() < 2 || notes.is_empty() {
         return None;
     }
@@ -324,10 +359,32 @@ pub fn generate_lead_sheet_enhanced(
         sections
     };
 
-    let quantized = quantize_aligned_notes(&aligned, &swing_sections, beats_per_bar);
+    let mut quantized = match config.quantizer {
+        crate::leadsheet::QuantizerEngine::LegacyGrid => {
+            quantize_aligned_notes(&aligned, &swing_sections, beats_per_bar)
+        }
+        crate::leadsheet::QuantizerEngine::LearnedOnnx => quantize_aligned_notes_learned(
+            &aligned,
+            &swing_sections,
+            beats_per_bar,
+            config.quantizer_model_path.as_deref(),
+        ),
+    };
     if quantized.is_empty() {
         return None;
     }
+
+    // Rhythm alternative 1: monophonic duration fill-to-next-onset. Detected
+    // note ends are noisier than onsets; extend each note to the next snapped
+    // onset unless there is substantial audible silence after it (rest
+    // evidence). Applies to both quantizer engines. Disable with
+    // KEYSCRIBE_FILL_GAP=0.
+    crate::leadsheet::fill_melody_durations(&mut quantized, &aligned);
+
+    // Tier A1: merge 16th over-segmentation fragments back onto the 8th-note
+    // grid per-bar (disableable). Genuine 16th bars are left untouched by the
+    // vote.
+    let quantized = coarsen_rhythm(quantized, beats_per_bar, &config.rhythm_coarsen);
 
     // ---- per-bar tempo map from actual beat positions ----
     let (tempo_map, tempo) = tempo_map_from_beats_and_downbeats(
@@ -375,8 +432,16 @@ pub fn generate_lead_sheet_enhanced(
         meter_class: MeterClass::from_signature(time_sig_numerator, time_sig_denominator),
     }];
 
-    let chord_changes =
-        detect_chord_changes_per_bar(quantized.as_slice(), beats_per_bar, config.chord_analysis);
+    let chord_changes = match timeline {
+        Some(tl) => {
+            detect_chords_from_timeline(tl, beat_times, beats_per_bar, config.chord_analysis)
+        }
+        None => detect_chord_changes_per_bar(
+            quantized.as_slice(),
+            beats_per_bar,
+            config.chord_analysis,
+        ),
+    };
     debug_chord_notes_to_json(quantized.as_slice(), beats_per_bar, config.chord_analysis);
     let rhythm_confidence = if swing_sections.is_empty() {
         0.8
@@ -444,7 +509,7 @@ fn extract_melody_from_separated_stems(
     (melody_notes, None, separation_confidence)
 }
 
-fn identify_melodic_stem_from_stems(stems: &[crate::leadsheet::SeparatedStem]) -> Option<StemType> {
+pub fn identify_melodic_stem_from_stems(stems: &[crate::leadsheet::SeparatedStem]) -> Option<StemType> {
     let melodic_candidates: Vec<&crate::leadsheet::SeparatedStem> = stems
         .iter()
         .filter(|stem| stem.stem_type.is_melodic())
@@ -461,7 +526,28 @@ fn identify_melodic_stem_from_stems(stems: &[crate::leadsheet::SeparatedStem]) -
     for stem in candidates {
         let pitch_variance = compute_pitch_variance(&stem.samples_mono);
         let spectral_energy = compute_spectral_energy(&stem.samples_mono);
-        let score = (pitch_variance * 0.5 + spectral_energy * 0.5) * stem.confidence.max(0.1);
+        // Onset density: the melody re-articulates more than the comp (mirrors
+        // the skyline logic), so it biases stem identification toward the line
+        // that carries the tune.
+        let onset_density = compute_onset_density(&stem.samples_mono);
+        // Spectral energy + onset density dominate. `pitch_variance` is
+        // actually a zero-crossing *instability* measure (high for sparse
+        // noise bursts in near-silent stems), so it's energy-weighted: a
+        // near-silent stem (demucs "vocals"/"other" leakage on instrumentals)
+        // can never win via it.
+        let score = (spectral_energy * 0.5 + onset_density * 0.4 + pitch_variance * spectral_energy * 0.1)
+            * stem.confidence.max(0.1);
+        if std::env::var_os("KEYSCRIBE_STEM_DEBUG").is_some() {
+            eprintln!(
+                "[stem] {} pv={:.3} se={:.3} od={:.3} conf={:.3} score={:.3}",
+                stem.stem_type.display_name(),
+                pitch_variance,
+                spectral_energy,
+                onset_density,
+                stem.confidence,
+                score
+            );
+        }
 
         if score > best_score {
             best_score = score;
@@ -519,6 +605,38 @@ fn compute_spectral_energy(audio: &[f32]) -> f32 {
     (rms * 10.0).clamp(0.0, 1.0)
 }
 
+/// Onset density: mean positive spectral flux per analysis window, normalized
+/// to 0..1. A melodic line onsets notes far more often than a comp/pad, so this
+/// discriminates the tune-carrying stem.
+fn compute_onset_density(audio: &[f32]) -> f32 {
+    if audio.len() < 1024 {
+        return 0.5;
+    }
+
+    let window_size = 1024;
+    let hop = 512;
+    let mut flux = 0.0f32;
+    let mut prev_rms = 0.0f32;
+    let mut windows = 0usize;
+
+    for i in (0..audio.len() - window_size).step_by(hop) {
+        let window = &audio[i..i + window_size];
+        let sum_sq: f32 = window.iter().map(|&x| x * x).sum();
+        let rms = (sum_sq / window.len() as f32).sqrt();
+        if rms > prev_rms {
+            flux += rms - prev_rms;
+        }
+        prev_rms = rms;
+        windows += 1;
+    }
+
+    if windows == 0 {
+        return 0.5;
+    }
+
+    (flux / windows as f32 * 50.0).clamp(0.0, 1.0)
+}
+
 fn audio_to_note_events(audio: &[f32], tempo_map: &[TempoSegment]) -> Vec<NoteEvent> {
     if audio.is_empty() || tempo_map.is_empty() {
         return Vec::new();
@@ -568,7 +686,7 @@ fn audio_to_note_events(audio: &[f32], tempo_map: &[TempoSegment]) -> Vec<NoteEv
                     start_time,
                     end_time,
                     velocity: ((max_rms * 127.0).round() as u8).clamp(1, 127),
-                    channel: None,
+                    channel: None, is_rearticulation: false,
                 });
             }
         }
@@ -584,7 +702,7 @@ fn audio_to_note_events(audio: &[f32], tempo_map: &[TempoSegment]) -> Vec<NoteEv
                 start_time,
                 end_time,
                 velocity: ((max_rms * 127.0).round() as u8).clamp(1, 127),
-                channel: None,
+                channel: None, is_rearticulation: false,
             });
         }
     }
@@ -688,7 +806,7 @@ fn extract_melody_events(notes: &[NoteEvent]) -> Vec<NoteEvent> {
                         start_time: segment_start,
                         end_time: t,
                         velocity: current_melody_velocity,
-                        channel: None,
+                        channel: None, is_rearticulation: false,
                     });
                 }
             }
@@ -704,7 +822,7 @@ fn extract_melody_events(notes: &[NoteEvent]) -> Vec<NoteEvent> {
                     start_time: t,
                     end_time: t,
                     velocity: ev.velocity,
-                    channel: None,
+                    channel: None, is_rearticulation: false,
                 });
             } else if let Some(pos) = active.iter().position(|n| n.pitch == ev.pitch) {
                 active.swap_remove(pos);
@@ -789,7 +907,7 @@ mod tests {
                 start_time: t,
                 end_time: t + 0.2,
                 velocity: 100,
-                channel: None,
+                channel: None, is_rearticulation: false,
             });
         }
 
@@ -813,7 +931,7 @@ mod tests {
                 start_time: 0.0,
                 end_time: 0.24,
                 velocity: 110,
-                channel: None,
+                channel: None, is_rearticulation: false,
             },
             NoteEvent {
                 id: 2,
@@ -821,7 +939,7 @@ mod tests {
                 start_time: 0.26,
                 end_time: 0.48,
                 velocity: 108,
-                channel: None,
+                channel: None, is_rearticulation: false,
             },
             NoteEvent {
                 id: 3,
@@ -829,7 +947,7 @@ mod tests {
                 start_time: 0.50,
                 end_time: 0.98,
                 velocity: 112,
-                channel: None,
+                channel: None, is_rearticulation: false,
             },
             NoteEvent {
                 id: 4,
@@ -837,7 +955,7 @@ mod tests {
                 start_time: 1.00,
                 end_time: 1.24,
                 velocity: 105,
-                channel: None,
+                channel: None, is_rearticulation: false,
             },
             NoteEvent {
                 id: 5,
@@ -845,7 +963,7 @@ mod tests {
                 start_time: 1.26,
                 end_time: 1.98,
                 velocity: 118,
-                channel: None,
+                channel: None, is_rearticulation: false,
             },
         ];
 

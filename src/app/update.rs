@@ -1,7 +1,24 @@
 use super::*;
 
+/// Repaint pacing.
+///
+/// `ACTIVE_REPAINT_INTERVAL` / `IDLE_REPAINT_INTERVAL` (in `app.rs`) drive
+/// the visible window. A minimized window skips drawing entirely and just
+/// pumps background channels (playback, loading, analysis, loop handling,
+/// autosave) at a low wake rate: presenting into a hidden surface is pure
+/// waste, and on some drivers (notably NVIDIA egl-wayland with vsync on) a
+/// hidden swap can stall the main thread, tripping the compositor's
+/// "not responding" dialog. The NVIDIA + Wayland case is additionally
+/// covered by defaulting vsync off there (see `main.rs`).
+const MINIMIZED_REPAINT_INTERVAL: Duration = Duration::from_millis(500);
+
 impl eframe::App for KeyScribeApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        // Visibility first: the minimized branch below depends on this.
+        // (Note: on Linux/Wayland this is always `Some(false)`/None — winit
+        // reports minimized on Windows/macOS only — so workspace-hidden
+        // windows are handled via the vsync default in `main.rs` instead.)
+        let minimized = ctx.input(|i| i.viewport().minimized.unwrap_or(false));
         apply_brand_theme(ctx, self.dark_mode, self.highlight_color);
         self.lock_startup_min_window_size_once(ctx);
         self.apply_mobile_ui_tweaks_once(ctx);
@@ -37,14 +54,7 @@ impl eframe::App for KeyScribeApp {
             }
         }
         if l_pressed {
-            self.loop_enabled = !self.loop_enabled;
-            if !self.loop_enabled {
-                self.loop_selection = None;
-                self.loop_playback_enabled = false;
-                if self.is_playing() {
-                    self.play_from_selected();
-                }
-            }
+            self.toggle_loop();
         }
         if left_pressed {
             if ctrl_held && self.shift_loop_by_seconds(-1.0) {
@@ -114,14 +124,20 @@ impl eframe::App for KeyScribeApp {
             && !self.is_separating
             && !self.separation_attempted
         {
-            let duration = self.source_duration() as f64;
-            let cache_exists = self.stem_cache_exists_for_current_song();
-
-            if cache_exists {
-                // Cached stems exist — load them instantly regardless of the
-                // auto_separate setting.
-                self.run_instrument_separation();
-            } else if self.auto_separate {
+            let current_model = self.current_separation_model_name();
+            if self.loaded_stems_model_name.as_deref() == Some(&current_model)
+                && self.separated_stems.is_some()
+            {
+                self.separation_attempted = true;
+            } else if !self.stem_cache_miss {
+                // Kick off the background cache load (idempotent); the result
+                // applies in poll_stem_cache_result without blocking the UI.
+                // Auto-separation waits for a confirmed miss (no double work,
+                // and no re-request loop after a miss).
+                self.request_cached_stems(&current_model);
+            }
+            if self.separated_stems.is_none() && self.stem_cache_miss && self.auto_separate {
+                let duration = self.source_duration() as f64;
                 if duration > super::AUTO_SEPARATE_MAX_DURATION_SEC {
                     self.separation_attempted = true;
                     self.cache_status_message = Some("Stem separation is manual for this source since it is longer than 10 minutes.".to_string());
@@ -138,11 +154,40 @@ impl eframe::App for KeyScribeApp {
 
         self.poll_processing_result();
         self.poll_separation_result();
+        self.poll_stem_cache_result();
         self.poll_stem_analysis_result();
+        self.poll_cache_precheck_result();
+        #[cfg(feature = "desktop-ui")]
+        self.poll_file_dialog_result(ctx);
         self.poll_streaming_playback();
         self.poll_sheet_preview(ctx);
         self.poll_sheet_rendering(ctx);
         self.sync_playhead_from_engine();
+
+        // Undo coalescing reset: release EVENTS queue in winit until the
+        // next update, so this observes every release (a level-state check
+        // can miss one and then swallow all later pushes).
+        if ctx.input(|i| i.pointer.any_released() || !i.pointer.primary_down()) {
+            self.mix_press_pushed = false;
+        }
+
+        // Minimized: the surface is hidden, so skip every draw call and only
+        // pump background state above. Playback, loading, analysis, loop
+        // handling and autosave all continue via the polls above; drawing
+        // resumes on restore with state already current.
+        // (Note: on Linux/Wayland winit cannot report minimized, and egui
+        // 0.27 has no occlusion flag, so workspace-hidden windows keep
+        // rendering — made safe on NVIDIA + Wayland by defaulting vsync off
+        // in `main.rs`, since a vsync'd hidden swap is what wedged the main
+        // thread and tripped the hang dialog.)
+        if minimized {
+            ctx.request_repaint_after(MINIMIZED_REPAINT_INTERVAL);
+            if self.last_state_save_at.elapsed() >= Duration::from_secs(2) {
+                self.save_state_to_disk();
+                self.last_state_save_at = Instant::now();
+            }
+            return;
+        }
 
         self.draw_top_controls_panel(ctx);
 
@@ -335,7 +380,55 @@ impl eframe::App for KeyScribeApp {
                 }
 
                 ui.add_space(UI_VSPACE_TIGHT);
+                ui.add_space(UI_VSPACE_TIGHT);
+                // Cog toggle (bottom-right under the piano): reveals/hides
+                // the keyboard settings sliders below. Hand-painted in a
+                // fixed-height row: a with_layout child Ui here makes the
+                // bottom panel's auto-height run away.
+                let cog_size = 30.0_f32;
+                let row_w = ui.available_width();
+                let (cog_row_rect, _) =
+                    ui.allocate_exact_size(egui::vec2(row_w, cog_size), egui::Sense::hover());
+                let cog_rect = egui::Rect::from_min_size(
+                    egui::pos2(
+                        // Flush with the row's right edge (which already
+                        // aligns with the piano above): no extra margin.
+                        cog_row_rect.right() - cog_size,
+                        cog_row_rect.center().y - cog_size * 0.5,
+                    ),
+                    egui::vec2(cog_size, cog_size),
+                );
+                let cog = ui
+                    .interact(
+                        cog_rect,
+                        egui::Id::new("piano_settings_cog"),
+                        egui::Sense::click(),
+                    )
+                    .on_hover_text(if self.show_piano_settings {
+                        "Hide keyboard settings"
+                    } else {
+                        "Keyboard settings"
+                    });
+                let cog_visuals = ui.style().interact(&cog);
+                ui.painter().rect(
+                    cog_rect,
+                    6.0,
+                    cog_visuals.bg_fill,
+                    cog_visuals.bg_stroke,
+                );
+                ui.painter().text(
+                    cog_rect.center(),
+                    egui::Align2::CENTER_CENTER,
+                    egui_phosphor::regular::GEAR,
+                    crate::ui::widgets::icon_font_id(16.0),
+                    cog_visuals.text_color(),
+                );
+                if cog.clicked() {
+                    self.show_piano_settings = !self.show_piano_settings;
+                }
+                ui.add_space(UI_VSPACE_TIGHT);
                 ui.spacing_mut().item_spacing.y = default_item_spacing_y.min(UI_VSPACE_TIGHT);
+                if self.show_piano_settings {
                 egui::Frame::none()
                     .inner_margin(egui::Margin::symmetric(12.0, UI_VSPACE_TIGHT))
                     .show(ui, |ui| {
@@ -363,13 +456,17 @@ impl eframe::App for KeyScribeApp {
                                         "",
                                         0.01,
                                         2,
+                                        default_key_color_sensitivity() * 0.5,
                                     ) {
+                                        let pd = ui.input(|i| i.pointer.primary_down());
+                                        self.push_mix_undo(pd);
                                         self.key_color_sensitivity =
                                             (ui_key_sensitivity * 2.0).clamp(0.0, 2.0);
                                         visuals_changed = true;
                                     }
 
                                     ui.add_space(UI_VSPACE_TIGHT);
+                                    let pre_highlight_max = self.key_highlight_max_sec;
                                     if Self::top_bar_slider_with_input(
                                         ui,
                                         "Max Key Highlight Time",
@@ -379,7 +476,12 @@ impl eframe::App for KeyScribeApp {
                                         " s",
                                         0.005,
                                         2,
+                                        default_key_highlight_max_sec(),
                                     ) {
+                                        let pd = ui.input(|i| i.pointer.primary_down());
+                                        let mut snap = MixSnapshot::capture(self);
+                                        snap.key_highlight_max_sec = pre_highlight_max;
+                                        self.push_mix_undo_with(pd, snap);
                                         self.key_highlight_max_sec = self
                                             .key_highlight_max_sec
                                             .clamp(KEY_HIGHLIGHT_MAX_SEC_MIN, KEY_HIGHLIGHT_MAX_SEC_MAX);
@@ -387,6 +489,7 @@ impl eframe::App for KeyScribeApp {
                                     }
 
                                     ui.add_space(UI_VSPACE_TIGHT);
+                                    let pre_vis_offset = self.visualization_timing_offset_ms;
                                     if Self::top_bar_slider_with_input(
                                         ui,
                                         "Visualization Offset",
@@ -396,7 +499,12 @@ impl eframe::App for KeyScribeApp {
                                         " ms",
                                         1.0,
                                         0,
+                                        default_visualization_timing_offset_ms(),
                                     ) {
+                                        let pd = ui.input(|i| i.pointer.primary_down());
+                                        let mut snap = MixSnapshot::capture(self);
+                                        snap.visualization_timing_offset_ms = pre_vis_offset;
+                                        self.push_mix_undo_with(pd, snap);
                                         self.visualization_timing_offset_ms = self
                                             .visualization_timing_offset_ms
                                             .clamp(
@@ -407,7 +515,8 @@ impl eframe::App for KeyScribeApp {
                                     }
 
                                     ui.add_space(UI_VSPACE_TIGHT);
-                                    let _ = Self::top_bar_slider_with_input(
+                                    let pre_piano_zoom = self.piano_zoom;
+                                    if Self::top_bar_slider_with_input(
                                         ui,
                                         "Piano Zoom",
                                         &mut self.piano_zoom,
@@ -416,14 +525,22 @@ impl eframe::App for KeyScribeApp {
                                         "x",
                                         0.01,
                                         2,
-                                    );
+                                        1.0,
+                                    ) {
+                                        let pd = ui.input(|i| i.pointer.primary_down());
+                                        let mut snap = MixSnapshot::capture(self);
+                                        snap.piano_zoom = pre_piano_zoom;
+                                        self.push_mix_undo_with(pd, snap);
+                                    }
                                 },
                             );
                         } else {
                             let col_w = ((trio_w - trio_gap * 3.0).max(0.0)) / 4.0;
                             ui.allocate_ui_with_layout(
                                 egui::vec2(trio_w, slider_row_h),
-                                egui::Layout::left_to_right(egui::Align::Center),
+                                // Cross Min (top-aligned): egui's cross-Center layout
+                                // shifts each subsequent item downward (staircase).
+                                egui::Layout::left_to_right(egui::Align::Min),
                                 |ui| {
                                     ui.spacing_mut().item_spacing.x = trio_gap;
 
@@ -442,7 +559,10 @@ impl eframe::App for KeyScribeApp {
                                                 "",
                                                 0.01,
                                                 2,
+                                                default_key_color_sensitivity() * 0.5,
                                             ) {
+                                                let pd = ui.input(|i| i.pointer.primary_down());
+                                                self.push_mix_undo(pd);
                                                 self.key_color_sensitivity =
                                                     (ui_key_sensitivity * 2.0).clamp(0.0, 2.0);
                                                 visuals_changed = true;
@@ -454,6 +574,7 @@ impl eframe::App for KeyScribeApp {
                                         egui::vec2(col_w, slider_row_h),
                                         egui::Layout::top_down(egui::Align::Center),
                                         |ui| {
+                                            let pre_highlight_max = self.key_highlight_max_sec;
                                             if Self::top_bar_slider_with_input(
                                                 ui,
                                                 "Max Key Highlight Time",
@@ -463,7 +584,12 @@ impl eframe::App for KeyScribeApp {
                                                 " s",
                                                 0.005,
                                                 2,
+                                                default_key_highlight_max_sec(),
                                             ) {
+                                                let pd = ui.input(|i| i.pointer.primary_down());
+                                                let mut snap = MixSnapshot::capture(self);
+                                                snap.key_highlight_max_sec = pre_highlight_max;
+                                                self.push_mix_undo_with(pd, snap);
                                                 self.key_highlight_max_sec = self
                                                     .key_highlight_max_sec
                                                     .clamp(
@@ -479,6 +605,7 @@ impl eframe::App for KeyScribeApp {
                                         egui::vec2(col_w, slider_row_h),
                                         egui::Layout::top_down(egui::Align::Center),
                                         |ui| {
+                                            let pre_vis_offset = self.visualization_timing_offset_ms;
                                             if Self::top_bar_slider_with_input(
                                                 ui,
                                                 "Visualization Offset",
@@ -488,7 +615,12 @@ impl eframe::App for KeyScribeApp {
                                                 " ms",
                                                 1.0,
                                                 0,
+                                                default_visualization_timing_offset_ms(),
                                             ) {
+                                                let pd = ui.input(|i| i.pointer.primary_down());
+                                                let mut snap = MixSnapshot::capture(self);
+                                                snap.visualization_timing_offset_ms = pre_vis_offset;
+                                                self.push_mix_undo_with(pd, snap);
                                                 self.visualization_timing_offset_ms = self
                                                     .visualization_timing_offset_ms
                                                     .clamp(
@@ -504,7 +636,8 @@ impl eframe::App for KeyScribeApp {
                                         egui::vec2(col_w, slider_row_h),
                                         egui::Layout::top_down(egui::Align::Center),
                                         |ui| {
-                                            let _ = Self::top_bar_slider_with_input(
+                                            let pre_piano_zoom = self.piano_zoom;
+                                            if Self::top_bar_slider_with_input(
                                                 ui,
                                                 "Piano Zoom",
                                                 &mut self.piano_zoom,
@@ -513,7 +646,13 @@ impl eframe::App for KeyScribeApp {
                                                 "x",
                                                 0.01,
                                                 2,
-                                            );
+                                                1.0,
+                                            ) {
+                                                let pd = ui.input(|i| i.pointer.primary_down());
+                                                let mut snap = MixSnapshot::capture(self);
+                                                snap.piano_zoom = pre_piano_zoom;
+                                                self.push_mix_undo_with(pd, snap);
+                                            }
                                         },
                                     );
                                 },
@@ -534,6 +673,7 @@ impl eframe::App for KeyScribeApp {
                         }
 
                     });
+                }
                 ui.add_space(UI_VSPACE_TIGHT);
                 ui.spacing_mut().item_spacing.y = default_item_spacing_y;
             });
@@ -549,7 +689,9 @@ impl eframe::App for KeyScribeApp {
         }
 
         let waveform_central = egui::CentralPanel::default()
-            .frame(egui::Frame::none().inner_margin(egui::Margin::symmetric(UI_VSPACE_MEDIUM, 0.0)))
+            // The waveform runs edge-to-edge; the rows above it apply the
+            // panel gutter themselves (see below) and the footer keeps it too.
+            .frame(egui::Frame::none())
             .show(ctx, |ui| {
                 if self.audio_raw.is_none() && !self.is_audio_loading {
                     let import_surface_rect = ui.max_rect();
@@ -596,48 +738,52 @@ impl eframe::App for KeyScribeApp {
                 let default_stack_spacing_y = ui.spacing().item_spacing.y;
                 ui.spacing_mut().item_spacing.y = 0.0;
 
-                ui.scope(|ui| {
-                    ui.spacing_mut().item_spacing.y = default_stack_spacing_y.min(UI_VSPACE_TIGHT);
-                    self.draw_speed_pitch_controls(ui);
-                });
+                // Rows above the waveform keep the panel gutter; only the
+                // waveform itself is full-bleed.
+                let gutter = UI_VSPACE_MEDIUM;
+                egui::Frame::none()
+                    .inner_margin(egui::Margin::symmetric(gutter, 0.0))
+                    .show(ui, |ui| {
+                        // Merged top row: compact Speed/Pitch + Separate
+                        // Instruments action + view switcher icons.
+                        self.draw_view_switcher_row(ui);
 
-                ui.add_space(UI_VSPACE_TIGHT);
-                if !self.auto_separate || (self.separation_attempted && self.separated_stems.is_none()) {
-                    ui.horizontal_wrapped(|ui| {
-                        if ui
-                            .add_enabled(
-                                self.audio_raw.is_some(),
-                                egui::Button::new("Separate Instruments"),
-                            )
-                            .clicked()
-                        {
-                            self.run_instrument_separation();
-                        }
+                        ui.add_space(UI_VSPACE_TIGHT);
+                        draw_horizontal_separator(ui, 0.0);
+                        ui.add_space(UI_VSPACE_TIGHT);
 
-                        if self.separated_stems.is_some() {
-                            ui.label(egui::RichText::new("Stem audio is loaded. Use the waveform tab controls to preview or enable instruments.").weak());
-                        }
+                        // Stem mixer strip (toggled from the top bar): sits
+                        // between the top row and the waveform; its height
+                        // shrinks the content area below automatically.
+                        self.draw_stem_strip(ui);
                     });
-                }
-
-                self.draw_main_content_tabs(ui);
-                ui.add_space(UI_VSPACE_TIGHT);
-                draw_horizontal_separator(ui, 0.0);
-                ui.add_space(UI_VSPACE_TIGHT);
 
                 // Absolute layout stability: calculate exact rects for content and footer
                 let full_avail_h = ui.available_height().max(0.0);
                 let full_avail_w = ui.available_width();
-                let media_h = media_controls_height_for_width(full_avail_w);
+                let footer_w = (full_avail_w - gutter * 2.0).max(0.0);
+                let media_h = media_controls_height_for_width(footer_w);
                 let gap = waveform_visual_gap;
                 let footer_total_h = media_h + gap * 2.0;
                 let content_h = (full_avail_h - footer_total_h).max(0.0);
 
                 let start_pos = ui.cursor().min;
-                let content_rect = egui::Rect::from_min_size(start_pos, egui::vec2(full_avail_w, content_h));
+                // The waveform spans the full window width; the sheet-music
+                // view keeps the gutter so its pages stay readable.
+                let content_full_bleed = self.main_content_tab != MainContentTab::SheetMusic;
+                let content_left = if content_full_bleed {
+                    start_pos.x
+                } else {
+                    start_pos.x + gutter
+                };
+                let content_w = if content_full_bleed { full_avail_w } else { footer_w };
+                let content_rect = egui::Rect::from_min_size(
+                    egui::pos2(content_left, start_pos.y),
+                    egui::vec2(content_w, content_h),
+                );
                 let footer_rect = egui::Rect::from_min_size(
-                    egui::pos2(start_pos.x, content_rect.bottom() + gap),
-                    egui::vec2(full_avail_w, media_h)
+                    egui::pos2(start_pos.x + gutter, content_rect.bottom() + gap),
+                    egui::vec2(footer_w, media_h)
                 );
 
                 // 1. Content Area (Strictly bounded)
@@ -692,6 +838,8 @@ impl eframe::App for KeyScribeApp {
                             content_h,
                         );
                     } else {
+                        // Full-bleed waveform: no frame border around the plot.
+                        ui.visuals_mut().widgets.noninteractive.bg_stroke = egui::Stroke::NONE;
                         let plot_resp = Plot::new("waveform_plot")
                             .height(remaining_h)
                             .allow_scroll(false)
@@ -728,49 +876,53 @@ impl eframe::App for KeyScribeApp {
                                     highlight.b().saturating_add(18),
                                 );
 
-                                if let Some((a, b)) = self.loop_selection {
-                                    let start = a.min(b) as f64;
-                                    let end = a.max(b) as f64;
+                                if self.loop_enabled {
+                                    if let Some((a, b)) = self.loop_selection {
+                                        let start = a.min(b) as f64;
+                                        let end = a.max(b) as f64;
 
-                                    let highlight = Polygon::new(PlotPoints::from(vec![
-                                        [start, -1.05],
-                                        [end, -1.05],
-                                        [end, 1.05],
-                                        [start, 1.05],
-                                    ]))
-                                    .fill_color(loop_bg)
-                                    .stroke(egui::Stroke::new(1.0, loop_edge));
-                                    plot_ui.polygon(highlight);
+                                        let highlight = Polygon::new(PlotPoints::from(vec![
+                                            [start, -1.05],
+                                            [end, -1.05],
+                                            [end, 1.05],
+                                            [start, 1.05],
+                                        ]))
+                                        .fill_color(loop_bg)
+                                        .stroke(egui::Stroke::new(1.0, loop_edge));
+                                        plot_ui.polygon(highlight);
+                                    }
                                 }
 
-                                if let Some((a, b)) = self.loop_selection {
-                                    let start = a.min(b);
-                                    let end = a.max(b);
-                                    self.refresh_loop_waveform_cache(start, end);
+                                if self.loop_enabled && self.loop_selection.is_some() {
+                                    if let Some((a, b)) = self.loop_selection {
+                                        let start = a.min(b);
+                                        let end = a.max(b);
+                                        self.refresh_loop_waveform_cache(start, end);
 
-                                    if !self.loop_waveform_cache_pre.is_empty() {
-                                        plot_ui.line(
-                                            Line::new(PlotPoints::from_iter(
-                                                self.loop_waveform_cache_pre.iter().copied(),
-                                            ))
-                                            .color(loop_wave_dim),
-                                        );
-                                    }
-                                    if !self.loop_waveform_cache_mid.is_empty() {
-                                        plot_ui.line(
-                                            Line::new(PlotPoints::from_iter(
-                                                self.loop_waveform_cache_mid.iter().copied(),
-                                            ))
-                                            .color(loop_wave_active),
-                                        );
-                                    }
-                                    if !self.loop_waveform_cache_post.is_empty() {
-                                        plot_ui.line(
-                                            Line::new(PlotPoints::from_iter(
-                                                self.loop_waveform_cache_post.iter().copied(),
-                                            ))
-                                            .color(loop_wave_dim),
-                                        );
+                                        if !self.loop_waveform_cache_pre.is_empty() {
+                                            plot_ui.line(
+                                                Line::new(PlotPoints::from_iter(
+                                                    self.loop_waveform_cache_pre.iter().copied(),
+                                                ))
+                                                .color(loop_wave_dim),
+                                            );
+                                        }
+                                        if !self.loop_waveform_cache_mid.is_empty() {
+                                            plot_ui.line(
+                                                Line::new(PlotPoints::from_iter(
+                                                    self.loop_waveform_cache_mid.iter().copied(),
+                                                ))
+                                                .color(loop_wave_active),
+                                            );
+                                        }
+                                        if !self.loop_waveform_cache_post.is_empty() {
+                                            plot_ui.line(
+                                                Line::new(PlotPoints::from_iter(
+                                                    self.loop_waveform_cache_post.iter().copied(),
+                                                ))
+                                                .color(loop_wave_dim),
+                                            );
+                                        }
                                     }
                                 } else {
                                     let line = Line::new(PlotPoints::from_iter(
@@ -825,11 +977,13 @@ impl eframe::App for KeyScribeApp {
                                     }
                                 }
 
-                                if let Some((a, b)) = self.loop_selection {
-                                    let start = a.min(b);
-                                    let end = a.max(b);
-                                    plot_ui.vline(VLine::new(start as f64).color(loop_edge));
-                                    plot_ui.vline(VLine::new(end as f64).color(loop_edge));
+                                if self.loop_enabled {
+                                    if let Some((a, b)) = self.loop_selection {
+                                        let start = a.min(b);
+                                        let end = a.max(b);
+                                        plot_ui.vline(VLine::new(start as f64).color(loop_edge));
+                                        plot_ui.vline(VLine::new(end as f64).color(loop_edge));
+                                    }
                                 }
 
                                 // Keep Y scale fixed and clamp X so navigation stays within audio bounds.
@@ -1018,7 +1172,7 @@ impl eframe::App for KeyScribeApp {
                                             self.selected_time_sec = start;
                                             self.loop_enabled = true;
                                             self.loop_playback_enabled = true;
-                                            self.play_range(start, Some(end));
+                                            self.play_range(start, None);
                                         }
                                     }
                                     self.drag_select_anchor_sec = None;
@@ -1203,6 +1357,11 @@ impl eframe::App for KeyScribeApp {
                     }
                 });
 
+                // Loop editor pill floats over the waveform's bottom edge,
+                // centered; the media footer below tucks over its lower
+                // pixels so it reads as pinned to the waveform.
+                crate::app::media_controls::draw_loop_pill(ui, self, content_rect.bottom(), start_pos.x, full_avail_w);
+
                 // 2. Media Footer (Pinned to bottom)
                 ui.allocate_ui_at_rect(footer_rect, |ui| {
                     ui.scope(|ui| {
@@ -1252,10 +1411,46 @@ impl eframe::App for KeyScribeApp {
 
         self.draw_export_modals(ctx);
 
+        // Mix undo/redo, read after all widgets ran: a focused TextEdit
+        // consumes Ctrl+Z/Y for its own undo (protecting typing), while
+        // knob/slider/button focus does not block mix undo.
+        // Edge-triggered (physical press, not OS repeat): holding Ctrl+Z
+        // must undo exactly one step, not machine-gun the whole stack.
+        let (cmd_held, shift_held, z_pressed, y_pressed, z_down, y_down) = ctx.input(|i| {
+            (
+                i.modifiers.ctrl || i.modifiers.command,
+                i.modifiers.shift,
+                i.key_pressed(egui::Key::Z),
+                i.key_pressed(egui::Key::Y),
+                i.key_down(egui::Key::Z),
+                i.key_down(egui::Key::Y),
+            )
+        });
+        if cmd_held && z_pressed && !shift_held && !self.undo_z_held {
+            self.undo_mix();
+            ctx.request_repaint();
+        }
+        let redo_z = cmd_held && z_pressed && shift_held && !self.undo_z_held;
+        let redo_y = cmd_held && y_pressed && !self.undo_y_held;
+        if redo_z || redo_y {
+            self.redo_mix();
+            ctx.request_repaint();
+        }
+        self.undo_z_held = z_down;
+        self.undo_y_held = y_down;
+
         if self.last_state_save_at.elapsed() >= Duration::from_secs(2) {
             self.save_state_to_disk();
             self.last_state_save_at = Instant::now();
         }
+    }
+
+    fn save(&mut self, _storage: &mut dyn eframe::Storage) {
+        self.save_state_to_disk();
+    }
+
+    fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
+        self.save_state_to_disk();
     }
 }
 

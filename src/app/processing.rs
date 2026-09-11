@@ -11,10 +11,64 @@ struct StemAnalysisCacheBlob {
     timeline: Vec<Vec<f32>>,
 }
 
+/// Express each stem's confidence as its fraction of total stem energy.
+///
+/// Worker-thread helper: for minutes-long stems this scans hundreds of
+/// millions of samples, which stalls the event loop for seconds when run on
+/// the UI thread (the compositor then reports the app as hung). Callers on
+/// the event loop must never do this inline — normalize in the worker that
+/// produced the stems instead.
+pub(super) fn normalize_stem_confidences(stems: &mut [crate::leadsheet::SeparatedStem]) {
+    let mut total_energy = 0.0f32;
+    let mut energies: Vec<f32> = Vec::with_capacity(stems.len());
+    for stem in stems.iter() {
+        let e = stem.samples_mono.iter().map(|s| s * s).sum::<f32>()
+            / stem.samples_mono.len().max(1) as f32;
+        total_energy += e;
+        energies.push(e);
+    }
+    for (stem, &e) in stems.iter_mut().zip(energies.iter()) {
+        stem.confidence = (e / total_energy.max(1e-10)).clamp(0.0, 1.0);
+    }
+}
+
+/// Check the version stamp and decode cached stems. Worker-thread only:
+/// decoding minutes of audio on the event loop stalls it for seconds.
+fn load_cached_stems_for_model(
+    song_hash: &str,
+    model_name: &str,
+) -> Option<Vec<crate::leadsheet::SeparatedStem>> {
+    const STEM_CACHE_VERSION: u32 = 3;
+    let stem_cache_root = app_cache_base_dir()
+        .join("stems")
+        .join(song_hash)
+        .join(model_name);
+    let version_path = stem_cache_root.join(".cache_version");
+    let cache_valid = stem_cache_root.exists()
+        && std::fs::read_to_string(&version_path)
+            .ok()
+            .and_then(|s| s.trim().parse::<u32>().ok())
+            .map_or(false, |v| v == STEM_CACHE_VERSION);
+    if !cache_valid {
+        return None;
+    }
+    match crate::leadsheet::load_stems_from_dir(&stem_cache_root) {
+        Ok(stems) if !stems.is_empty() => Some(stems),
+        _ => None,
+    }
+}
+
 impl KeyScribeApp {
     pub(super) fn request_rebuild(&mut self, restart_playback: bool, mode: RebuildMode) {
         if self.is_audio_loading {
             return;
+        }
+
+        // Parameter-only/preview jobs come from speed/pitch tweaks: silent.
+        // (Set-only: the param path may have already marked a Full rebuild.
+        // Cleared when the job ends.)
+        if matches!(mode, RebuildMode::ParametersOnly | RebuildMode::ParametersPreview) {
+            self.param_tweak_rebuild = true;
         }
 
         let (raw_sample_rate, raw_samples_mono, raw_samples_interleaved, raw_channels) = {
@@ -110,8 +164,15 @@ impl KeyScribeApp {
                 return;
             }
 
-            let is_original_mix = enabled_indices.is_empty();
-            let sample_rate = if is_original_mix {
+            let is_analysis_original_mix = enabled_indices.is_empty();
+            let analysis_sample_rate = if is_analysis_original_mix {
+                raw_sample_rate
+            } else {
+                processing_sample_rate
+            };
+
+            let is_listen_original_mix = listening_indices.is_empty();
+            let playback_sample_rate = if is_listen_original_mix {
                 raw_sample_rate
             } else {
                 processing_sample_rate
@@ -137,7 +198,7 @@ impl KeyScribeApp {
 
                 let mono_analysis = if !melodic_stems.is_empty() {
                     crate::leadsheet::blend_for_chords(melodic_stems.as_slice())
-                } else if is_original_mix {
+                } else if is_analysis_original_mix {
                     raw_samples_mono.clone()
                 } else {
                     let total_mono_len = stems
@@ -149,9 +210,9 @@ impl KeyScribeApp {
                 };
 
                 let source_interleaved_ref = Arc::clone(&raw_samples_interleaved);
-                let (interleaved, channels) = if is_original_mix {
+                let (interleaved, channels) = if is_listen_original_mix {
                     (raw_samples_interleaved, raw_channels)
-                } else if !listening_indices.is_empty() {
+                } else {
                     let listen_stems: Vec<_> = listening_indices
                         .iter()
                         .copied()
@@ -159,19 +220,16 @@ impl KeyScribeApp {
                         .collect();
 
                     if listen_stems.is_empty() {
-                        crate::leadsheet::blend_interleaved_stems(stems.as_slice())
+                        (raw_samples_interleaved, raw_channels)
                     } else if listen_stems.len() == 1 {
                         let s = &listen_stems[0];
                         (Arc::clone(&s.samples_interleaved), s.channels)
                     } else {
                         crate::leadsheet::blend_interleaved_stems(listen_stems.as_slice())
                     }
-                } else {
-                    // "Blend / All" -> use all stems for playback
-                    crate::leadsheet::blend_interleaved_stems(stems.as_slice())
                 };
 
-                let interleaved = if !is_original_mix {
+                let interleaved = if !is_listen_original_mix {
                     super::playback::loudness_match_to_source(
                         interleaved,
                         Some(source_interleaved_ref.as_slice()),
@@ -180,9 +238,9 @@ impl KeyScribeApp {
                     interleaved
                 };
 
-                let mono_render = if is_original_mix {
+                let mono_render = if is_listen_original_mix {
                     raw_samples_mono.clone()
-                } else if !listening_indices.is_empty() {
+                } else {
                     let listen_stems: Vec<_> = listening_indices
                         .iter()
                         .copied()
@@ -193,8 +251,6 @@ impl KeyScribeApp {
                     } else {
                         crate::leadsheet::blend_for_chords(listen_stems.as_slice())
                     }
-                } else {
-                    raw_samples_mono.clone()
                 };
 
                 (mono_analysis, mono_render, interleaved, channels)
@@ -216,8 +272,8 @@ impl KeyScribeApp {
                 let playback_channels_usize = playback_channels as usize;
                 let total_playback_frames = raw_playback_samples.len() / playback_channels_usize;
                 let preview_start_frame =
-                    (selected_time_sec.max(0.0) * sample_rate as f32) as usize;
-                let preview_len_frames = (PARAM_UPDATE_PREVIEW_SEC * sample_rate as f32) as usize;
+                    (selected_time_sec.max(0.0) * playback_sample_rate as f32) as usize;
+                let preview_len_frames = (PARAM_UPDATE_PREVIEW_SEC * playback_sample_rate as f32) as usize;
                 let preview_end_frame = (preview_start_frame.saturating_add(preview_len_frames))
                     .min(total_playback_frames);
 
@@ -227,7 +283,7 @@ impl KeyScribeApp {
                     match apply_speed_and_pitch_interleaved_with_cancel(
                         &raw_playback_samples[preview_start_idx..preview_end_idx],
                         playback_channels,
-                        sample_rate,
+                        playback_sample_rate,
                         speed,
                         pitch_semitones,
                         &cancel_flag,
@@ -260,7 +316,7 @@ impl KeyScribeApp {
                     preview_playback: Some(PreviewPlayback {
                         samples: preview_samples,
                         channels: playback_channels,
-                        sample_rate,
+                        sample_rate: playback_sample_rate,
                         timeline_start_sec: selected_time_sec.max(0.0),
                     }),
                 });
@@ -273,7 +329,7 @@ impl KeyScribeApp {
                     .and_then(|path| compute_file_hash(path.as_path()))
             });
             let content_hash =
-                compute_audio_content_hash(sample_rate, raw_analysis_samples.as_slice());
+                compute_audio_content_hash(analysis_sample_rate, raw_analysis_samples.as_slice());
 
             let mut cache_hash_candidates = Vec::<String>::new();
             if let Some(hash) = file_hash {
@@ -301,7 +357,7 @@ impl KeyScribeApp {
                         cached_waveform,
                     )) = Self::load_analysis_cache_for_variant(
                         song_hash,
-                        sample_rate,
+                        analysis_sample_rate,
                         raw_analysis_samples.len(),
                         raw_analysis_samples.as_slice(),
                         audio_quality_mode,
@@ -330,7 +386,7 @@ impl KeyScribeApp {
                             waveform = cached_waveform.unwrap_or_else(|| {
                                 build_waveform_for_processed(
                                     &cached_processed_samples,
-                                    sample_rate,
+                                    analysis_sample_rate,
                                     audio_quality_mode.waveform_points(),
                                     speed,
                                 )
@@ -343,7 +399,7 @@ impl KeyScribeApp {
                                     match apply_speed_and_pitch_interleaved_with_cancel(
                                         raw_playback_samples.as_slice(),
                                         raw_playback_channels,
-                                        sample_rate,
+                                        playback_sample_rate,
                                         speed,
                                         pitch_semitones,
                                         &cancel_flag,
@@ -357,7 +413,7 @@ impl KeyScribeApp {
                             if !had_cached_waveform {
                                 Self::persist_analysis_cache(
                                     song_hash,
-                                    sample_rate,
+                                    analysis_sample_rate,
                                     raw_analysis_samples.len(),
                                     audio_quality_mode,
                                     speed,
@@ -377,7 +433,7 @@ impl KeyScribeApp {
                                 }
                                 Self::persist_analysis_cache(
                                     candidate_hash,
-                                    sample_rate,
+                                    analysis_sample_rate,
                                     raw_analysis_samples.len(),
                                     audio_quality_mode,
                                     speed,
@@ -425,7 +481,7 @@ impl KeyScribeApp {
                 } else {
                     match apply_speed_and_pitch_with_cancel(
                         raw_render_samples.as_slice(),
-                        sample_rate,
+                        playback_sample_rate,
                         speed,
                         pitch_semitones,
                         &cancel_flag,
@@ -449,7 +505,7 @@ impl KeyScribeApp {
                     match apply_speed_and_pitch_interleaved_with_cancel(
                         raw_playback_samples.as_slice(),
                         raw_playback_channels,
-                        sample_rate,
+                        playback_sample_rate,
                         speed,
                         pitch_semitones,
                         &cancel_flag,
@@ -488,7 +544,7 @@ impl KeyScribeApp {
                 RebuildMode::Full | RebuildMode::VisualizationOnly => {
                     let (timeline, step, err) = Self::build_note_timeline(
                         raw_analysis_samples.as_slice(),
-                        sample_rate,
+                        analysis_sample_rate,
                         audio_quality_mode.fft_window_size(),
                         use_cqt,
                         preprocess_audio,
@@ -515,7 +571,7 @@ impl KeyScribeApp {
                 if let Some(ps) = &processed_samples {
                     Self::persist_analysis_cache(
                         song_hash,
-                        sample_rate,
+                        analysis_sample_rate,
                         raw_analysis_samples.len(),
                         audio_quality_mode,
                         speed,
@@ -535,7 +591,7 @@ impl KeyScribeApp {
                             }
                             Self::persist_analysis_cache(
                                 candidate_hash,
-                                sample_rate,
+                                analysis_sample_rate,
                                 raw_analysis_samples.len(),
                                 audio_quality_mode,
                                 speed,
@@ -579,6 +635,126 @@ impl KeyScribeApp {
         });
     }
 
+    pub(super) fn apply_separation_stems(
+        &mut self,
+        stems: Vec<crate::leadsheet::SeparatedStem>,
+        model_name: String,
+    ) {
+        self.separated_stems = Some(stems);
+        self.loaded_stems_model_name = Some(model_name);
+        self.stem_playback_cache = None;
+
+        // NOTE: stem confidences arrive pre-normalized (energy fractions)
+        // from the worker that produced the stems. They must NOT be
+        // recomputed here: the scan is O(total samples) and stalls the event
+        // loop for seconds on long files.
+
+        self.stem_colors = assign_stem_colors(self.separated_stems.as_ref().unwrap());
+        self.stem_analyses.clear();
+
+        // Restore saved stem selections or use defaults
+        let stems = self.separated_stems.as_ref().unwrap();
+        if let Some(hash) = &self.loaded_audio_hash {
+            if let Some(saved_vols) = self.file_stem_volumes.get(hash) {
+                self.stem_volumes = saved_vols.clone();
+                self.pending_stem_volumes = self.stem_volumes.clone();
+            }
+        }
+        self.enabled_stem_indices = self.restore_saved_stem_selection(
+            &self.saved_visualize_stem_indices,
+            stems,
+            |_| true,
+        );
+        let restored_listen = self.restore_saved_stem_selection(
+            &self.saved_listen_stem_indices,
+            stems,
+            |_| true,
+        );
+        let has_custom_volumes = self.stem_volumes.values().any(|&v| v.abs() > 0.01);
+        if (self.saved_listen_stem_indices.is_none()
+            || restored_listen.len() == stems.len())
+            && !has_custom_volumes
+        {
+            self.enabled_listening_indices.clear();
+        } else {
+            self.enabled_listening_indices = restored_listen;
+        }
+
+        // Always sync export selection to include all stems of the active model
+        self.export_selected_stems = stems.iter().map(|s| s.stem_type.clone()).collect();
+
+        self.cache_status_message = Some("Analyzing individual stems...".to_string());
+        self.cache_status_message_at = Some(Instant::now());
+        self.refresh_note_timeline_from_selected_stems();
+        self.sync_all_stem_gains_live();
+        self.start_stem_analysis();
+    }
+
+    /// Load cached stems on a worker thread. Decoding minutes of stems on
+    /// the event loop stalls it for seconds (the compositor then reports the
+    /// app as hung), so callers use this and read the result in
+    /// [`Self::poll_stem_cache_result`]. Idempotent per model.
+    pub(super) fn request_cached_stems(&mut self, model_name: &str) {
+        if self.loaded_stems_model_name.as_deref() == Some(model_name)
+            && self.separated_stems.is_some()
+        {
+            return;
+        }
+        if self.stem_cache_pending_model.as_deref() == Some(model_name) {
+            return;
+        }
+        let Some(song_hash) = self.loaded_audio_hash.clone() else {
+            return;
+        };
+        let model_name_owned = model_name.to_string();
+        let (tx, rx) = mpsc::channel();
+        self.stem_cache_rx = Some(rx);
+        self.stem_cache_pending_model = Some(model_name_owned.clone());
+        self.stem_cache_miss = false;
+        std::thread::spawn(move || {
+            let stems = load_cached_stems_for_model(&song_hash, &model_name_owned).map(|mut s| {
+                normalize_stem_confidences(&mut s);
+                s
+            });
+            let _ = tx.send(stems);
+        });
+    }
+
+    pub(super) fn poll_stem_cache_result(&mut self) {
+        let Some(rx) = &self.stem_cache_rx else {
+            return;
+        };
+        match rx.try_recv() {
+            Ok(result) => {
+                let model = self.stem_cache_pending_model.clone().unwrap_or_default();
+                self.stem_cache_rx = None;
+                self.stem_cache_pending_model = None;
+                match result {
+                    Some(stems) if !stems.is_empty() => {
+                        self.apply_separation_stems(stems, model);
+                        self.separation_attempted = true;
+                    }
+                    _ => {
+                        // Cache miss: same end state as the old sync path.
+                        // stem_cache_miss lets the auto-separate flow proceed.
+                        self.separated_stems = None;
+                        self.loaded_stems_model_name = None;
+                        self.enabled_listening_indices.clear();
+                        self.enabled_stem_indices.clear();
+                        self.export_selected_stems.clear();
+                        self.stem_cache_miss = true;
+                        self.refresh_note_timeline_from_selected_stems();
+                    }
+                }
+            }
+            Err(TryRecvError::Empty) => {}
+            Err(TryRecvError::Disconnected) => {
+                self.stem_cache_rx = None;
+                self.stem_cache_pending_model = None;
+            }
+        }
+    }
+
     pub(super) fn poll_separation_result(&mut self) {
         let Some(rx) = &self.separation_rx else {
             return;
@@ -590,55 +766,13 @@ impl KeyScribeApp {
                 self.separation_attempted = true;
                 self.separation_rx = None;
                 if let Some(err) = result.error {
+                    if crate::mvsep::is_invalid_token_error(&err) {
+                        self.show_mvsep_api_key_modal = true;
+                    }
                     self.last_error = Some(err);
                 } else {
-                    self.separated_stems = Some(result.stems);
-                    self.stem_playback_cache = None;
-
-                    // Compute confidence as each stem's fraction of total stem energy.
-                    // Comparing vs the summed original mix unfairly penalizes transient-
-                    // heavy stems (drums) whose RMS appears low despite being very audible.
-                    if let Some(stems) = self.separated_stems.as_mut() {
-                        let mut total_energy = 0.0f32;
-                        let mut energies: Vec<f32> = Vec::with_capacity(stems.len());
-                        for stem in stems.iter() {
-                            let e = stem.samples_mono.iter().map(|s| s * s).sum::<f32>()
-                                / stem.samples_mono.len().max(1) as f32;
-                            total_energy += e;
-                            energies.push(e);
-                        }
-                        for (stem, &e) in stems.iter_mut().zip(energies.iter()) {
-                            stem.confidence = (e / total_energy.max(1e-10)).clamp(0.0, 1.0);
-                        }
-                    }
-
-                    self.stem_colors = assign_stem_colors(self.separated_stems.as_ref().unwrap());
-                    self.stem_analyses.clear();
-
-                    // Restore saved stem selections or use defaults
-                    let stems = self.separated_stems.as_ref().unwrap();
-                    self.enabled_stem_indices = self.restore_saved_stem_selection(
-                        &self.saved_visualize_stem_indices,
-                        stems,
-                        |_| true,
-                    );
-                    let restored_listen = self.restore_saved_stem_selection(
-                        &self.saved_listen_stem_indices,
-                        stems,
-                        |_| true,
-                    );
-                    if self.saved_listen_stem_indices.is_none()
-                        || restored_listen.len() == stems.len()
-                    {
-                        self.enabled_listening_indices.clear();
-                    } else {
-                        self.enabled_listening_indices = restored_listen;
-                    }
-
-                    self.cache_status_message = Some("Analyzing individual stems...".to_string());
-                    self.cache_status_message_at = Some(Instant::now());
-                    self.refresh_note_timeline_from_selected_stems();
-                    self.start_stem_analysis();
+                    let model_name = self.current_separation_model_name();
+                    self.apply_separation_stems(result.stems, model_name);
                 }
             }
             Err(TryRecvError::Empty) => {}
@@ -678,10 +812,7 @@ impl KeyScribeApp {
         let Some(ref song_hash) = self.loaded_audio_hash.clone() else {
             return;
         };
-        let model_id: String = self
-            .selected_separation_model_path()
-            .and_then(|p| p.file_stem().map(|s| s.to_string_lossy().to_string()))
-            .unwrap_or_else(|| "htdemucs_6s".to_string());
+        let model_id: String = self.current_separation_model_name();
 
         let (tx, rx) = mpsc::channel::<StemAnalysisResult>();
         self.stem_analysis_rx = Some(rx);
@@ -762,8 +893,7 @@ impl KeyScribeApp {
         if bytes.is_empty() || bytes.len() > ANALYSIS_CACHE_MAX_COMPRESSED_BYTES {
             return None;
         }
-        let decompress_budget = analysis_cache_decompress_budget(bytes.len());
-        let payload = zstd::bulk::decompress(&bytes, decompress_budget).ok()?;
+        let payload = decompress_analysis_cache_payload(&bytes)?;
         let blob: StemAnalysisCacheBlob =
             bincode::DefaultOptions::new().deserialize(&payload).ok()?;
         if blob.version != STEM_ANALYSIS_CACHE_VERSION {
@@ -806,8 +936,6 @@ impl KeyScribeApp {
                     self.last_error = Some(err);
                 } else {
                     self.stem_analyses = result.analyses;
-                    self.cache_status_message = Some("Stem analysis complete.".to_string());
-                    self.cache_status_message_at = Some(Instant::now());
                     self.update_note_probabilities(true);
                 }
             }
@@ -836,12 +964,19 @@ impl KeyScribeApp {
         }
     }
 
-    pub(super) fn save_state_to_disk(&self) {
+    pub(super) fn save_state_to_disk(&mut self) {
         // Save the current playback position into the per-file map so we
         // can resume from where the user left off when reopening this file.
         let mut file_positions = self.file_positions.clone();
         if let Some(hash) = &self.loaded_audio_hash {
             file_positions.insert(hash.clone(), self.selected_time_sec.max(0.0));
+        }
+
+        let mut file_stem_volumes = self.file_stem_volumes.clone();
+        if let Some(hash) = &self.loaded_audio_hash {
+            if !self.stem_volumes.is_empty() {
+                file_stem_volumes.insert(hash.clone(), self.stem_volumes.clone());
+            }
         }
 
         let state = PersistedState {
@@ -865,12 +1000,14 @@ impl KeyScribeApp {
             video_panel_height: self.video_panel_height,
             show_note_hist_window: self.show_note_hist_window,
             show_video_pane: self.show_video_pane,
+            show_piano_settings: self.show_piano_settings,
             use_cqt_analysis: self.use_cqt_analysis,
             preprocess_audio: self.preprocess_audio,
             playback_volume: self.playback_volume,
             audio_quality_mode: self.audio_quality_mode,
             audio_output_device_id: self.audio_output_device_id.clone(),
             loop_enabled: self.loop_enabled,
+            loop_selection: self.loop_selection,
             dark_mode: self.dark_mode,
             highlight_hex: color_to_hex(self.highlight_color),
             recent_highlight_hex: self.recent_highlight_hex.clone(),
@@ -888,12 +1025,43 @@ impl KeyScribeApp {
             auto_separate: self.auto_separate,
             file_markers: self.file_markers.clone(),
             file_positions,
+            file_stem_volumes,
+            // The API key lives in the user-local `.env` file (see
+            // `mvsep::save_mvsep_api_key_to_dotenv`), not in the JSON state:
+            // the state file is portable/shared, the key must stay local.
+            // A successful `.env` write clears the JSON field (one-way
+            // migration for keys saved by older versions); clearing the
+            // settings field removes the `.env` entry too.
+            //
+            // The autosave runs every 2 s, so the `.env` file is only
+            // touched when the key actually changed — never rewritten
+            // unconditionally on the event loop.
+            mvsep_api_key: {
+                let trimmed = self.mvsep_api_key.trim().to_string();
+                if trimmed == self.mvsep_key_last_persisted {
+                    None
+                } else if trimmed.is_empty() {
+                    let _ = crate::mvsep::save_mvsep_api_key_to_dotenv("");
+                    self.mvsep_key_last_persisted = String::new();
+                    None
+                } else if crate::mvsep::save_mvsep_api_key_to_dotenv(&trimmed).is_ok() {
+                    self.mvsep_key_last_persisted = trimmed;
+                    None
+                } else {
+                    Some(trimmed)
+                }
+            },
+            selected_separation_model_name: self.selected_separation_model_name.clone(),
         };
 
         if let Ok(raw) = serde_json::to_string_pretty(&state) {
             let path = state_file_path();
             if ensure_parent_dir(path.as_path()) {
-                let _ = fs::write(path, raw);
+                let _ = fs::write(&path, &raw);
+            }
+            let portable_path = app_portable_base_dir().join(STATE_FILE_NAME);
+            if portable_path != path && portable_path.exists() {
+                let _ = fs::write(portable_path, &raw);
             }
         }
     }
@@ -1039,48 +1207,31 @@ impl KeyScribeApp {
             self.note_probs = self.note_timeline[idx].clone();
             self.note_stem_colors = vec![self.highlight_color; note_count];
         }
-        // 3. Live analysis fallback
-        // Skip expensive ONNX inference during playback — the visualization
-        // isn't worth the UI-thread freeze. Full analysis will populate the
-        // timeline shortly, at which point path 2 (cheap lookup) is used.
+        // 3. Live analysis fallback: never run ONNX inference (or touch
+        // the shared inference engine) on the UI thread. A single call can
+        // stall the event loop for seconds — long enough for the compositor
+        // to declare the app hung ("Application Not Responding") — and it can
+        // block behind the background analysis worker holding the engine.
+        // The timeline fills in shortly via path 2; until then, silence.
         else if self.is_playing() {
             self.note_probs = vec![0.0; note_count];
             self.note_stem_colors = vec![self.highlight_color; note_count];
-        } else if let Some((stem_audio, stem_sample_rate)) = self.visualizing_stem_audio() {
+        } else if let Some((_stem_audio, _stem_sample_rate)) = self.visualizing_stem_audio() {
             if self.audio_raw.is_none() {
                 return;
             }
 
-            if stem_audio.len() >= 64 {
-                let center = (current_time.max(0.0) * stem_sample_rate as f32) as usize;
-                let fft_window_size = self.audio_quality_mode.fft_window_size();
-                self.note_probs = detect_note_probabilities(
-                    &stem_audio,
-                    stem_sample_rate,
-                    center.min(stem_audio.len().saturating_sub(1)),
-                    fft_window_size,
-                );
-            } else {
-                self.note_probs = vec![0.0; note_count];
-            }
+            self.note_probs = vec![0.0; note_count];
             self.note_stem_colors = vec![self.highlight_color; note_count];
         } else {
-            let Some(raw) = &self.audio_raw else {
+            let Some(_raw) = &self.audio_raw else {
                 return;
             };
             if self.processed_samples.is_empty() {
                 return;
             }
 
-            let output_time_sec = self.source_to_output_time(current_time.max(0.0));
-            let center = (output_time_sec * raw.sample_rate as f32) as usize;
-            let fft_window_size = self.audio_quality_mode.fft_window_size();
-            self.note_probs = detect_note_probabilities(
-                &self.processed_samples,
-                raw.sample_rate,
-                center,
-                fft_window_size,
-            );
+            self.note_probs = vec![0.0; note_count];
             self.note_stem_colors = vec![self.highlight_color; note_count];
         }
 
@@ -1119,8 +1270,17 @@ impl KeyScribeApp {
     }
 
     pub(super) fn refresh_note_timeline_from_selected_stems_preserving(&mut self) {
+        // Stem-selection toggles are user-driven and often clicked repeatedly.
+        // A status line appearing/disappearing here makes the panel jump under
+        // the cursor, so keep it quiet and mark any needed rebuild as silent.
+        self.cache_status_message = None;
+        self.cache_status_message_at = None;
         if self.stem_analyses.is_empty() || self.enabled_stem_indices.is_empty() {
+            self.param_tweak_rebuild = true;
             self.request_rebuild_preserving_playback_and_waveform();
+            if !self.is_processing {
+                self.param_tweak_rebuild = false;
+            }
         } else {
             self.update_note_probabilities(true);
         }
