@@ -402,6 +402,24 @@ fn draw_seek_bar_row(ui: &mut egui::Ui, app: &mut KeyScribeApp, duration: f32) {
             };
             ui.painter().rect_filled(rail, rail.height() * 0.5, bg);
 
+            // Commit seeks on click and on drag release *before* painting so
+            // the handle and time readout show the new spot on the same frame
+            // (otherwise they flash back to the old position for one frame).
+            let playing = app.is_playing();
+            let mut seek_target: Option<f32> = None;
+            if enabled && (resp.clicked() || resp.drag_stopped()) {
+                if let Some(pos) = resp.interact_pointer_pos() {
+                    let f = ((pos.x - rail.left()) / rail.width().max(1.0)).clamp(0.0, 1.0);
+                    seek_target = Some(f * duration);
+                }
+            }
+            if let Some(target) = seek_target {
+                app.request_seek(target);
+                if playing {
+                    app.play_from_selected();
+                }
+            }
+
             let frac = if duration > 0.0 {
                 (app.selected_time_sec / duration).clamp(0.0, 1.0)
             } else {
@@ -466,22 +484,6 @@ fn draw_seek_bar_row(ui: &mut egui::Ui, app: &mut KeyScribeApp, duration: f32) {
                 time_font.clone(),
                 time_color,
             );
-
-            // Commit seeks on click and on drag release.
-            let playing = app.is_playing();
-            let mut seek_target: Option<f32> = None;
-            if enabled && (resp.clicked() || resp.drag_stopped()) {
-                if let Some(pos) = resp.interact_pointer_pos() {
-                    let f = ((pos.x - rail.left()) / rail.width().max(1.0)).clamp(0.0, 1.0);
-                    seek_target = Some(f * duration);
-                }
-            }
-            if let Some(target) = seek_target {
-                app.request_seek(target);
-                if playing {
-                    app.play_from_selected();
-                }
-            }
 
             // Total duration pinned to the right edge.
             let rest_w = ui.available_width().max(time_w);
