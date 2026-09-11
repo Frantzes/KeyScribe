@@ -6,7 +6,10 @@ use egui_phosphor::regular::{EYE, EYE_SLASH, MUSIC_NOTE, SLIDERS, SPEAKER_HIGH, 
 
 use super::*;
 use crate::theme::{MEDIA_PANEL_BG_DARK, MEDIA_PANEL_BG_LIGHT};
-use crate::ui::widgets::{icon_button, icon_toggle_button, responsive_icon_button_size, synth_knob};
+use crate::ui::widgets::{
+    icon_button, icon_toggle_button, responsive_icon_button_size, synth_knob,
+    toggle_switch_with_label,
+};
 
 /// Build the stem-strip value row (mute icon + dB number + eye icon) as one
 /// text job so all three sections share a single baseline.
@@ -342,7 +345,9 @@ impl KeyScribeApp {
         egui::Frame::none()
             .fill(frame_fill)
             .rounding(egui::Rounding::same(8.0))
-            .inner_margin(egui::Margin::symmetric(10.0, UI_VSPACE_COMPACT))
+            // Even vertical padding top and bottom so the content sits
+            // symmetrically inside the rounded panel.
+            .inner_margin(egui::Margin::symmetric(10.0, UI_VSPACE_MEDIUM))
             // No outer gutter: the parent panel already insets its content,
             // so the fill spans exactly the same width as the waveform pane.
             .show(ui, |ui| {
@@ -364,43 +369,60 @@ impl KeyScribeApp {
                     return;
                 }
 
-        // Header: global listening presets.
-        ui.horizontal(|ui| {
-            if ui
-                .add(egui::Button::new(egui::RichText::new("All").size(11.0)))
-                .clicked()
-            {
+        // Header: master toggles. "Stem audio" routes playback through the
+        // separated stems or the original mix; "Stem transcriptions" routes
+        // the piano notes through the stem analyses or the original full-mix
+        // transcription. They are independent so audio and visualization can
+        // be mixed freely.
+        let master_text_color = ui.visuals().text_color();
+        let master_dim_color = master_text_color.gamma_multiply(0.45);
+        let stem_audio_on = !self.enabled_listening_indices.is_empty();
+        let stem_transcriptions_on = !self.enabled_stem_indices.is_empty();
+
+        ui.horizontal_wrapped(|ui| {
+            ui.spacing_mut().item_spacing.x = 18.0;
+
+            let mut audio_on = stem_audio_on;
+            let audio_color = if audio_on { master_text_color } else { master_dim_color };
+            if toggle_switch_with_label(
+                ui,
+                "stem_audio_master",
+                &mut audio_on,
+                true,
+                self.highlight_color,
+                "Stem audio",
+                audio_color,
+            ) {
                 let pd = ui.input(|i| i.pointer.primary_down());
                 self.push_mix_undo(pd);
-                self.enabled_listening_indices = (0..stems.len()).collect();
-                self.stem_playback_cache = None;
-                let live = self.sync_all_stem_gains_live();
-                if !live {
-                    self.maybe_restart_playback_for_listen_sync();
-                }
-                self.enabled_stem_indices = (0..stems.len()).collect();
-                self.note_timeline = Arc::new(Vec::new());
-                self.note_timeline_step_sec = 0.0;
-                self.refresh_note_timeline_from_selected_stems_preserving();
+                self.set_stem_audio_enabled(audio_on, stems.len());
             }
-            if ui
-                .add(
-                    egui::Button::new(egui::RichText::new("Original Mix").size(11.0)),
-                )
-                .clicked()
-            {
+
+            let mut transcriptions_on = stem_transcriptions_on;
+            let transcriptions_color = if transcriptions_on {
+                master_text_color
+            } else {
+                master_dim_color
+            };
+            if toggle_switch_with_label(
+                ui,
+                "stem_transcriptions_master",
+                &mut transcriptions_on,
+                true,
+                self.highlight_color,
+                "Stem transcriptions",
+                transcriptions_color,
+            ) {
                 let pd = ui.input(|i| i.pointer.primary_down());
                 self.push_mix_undo(pd);
-                self.enabled_listening_indices.clear();
-                self.stem_playback_cache = None;
-                self.maybe_restart_playback_for_listen_sync();
-                self.enabled_stem_indices.clear();
-                self.note_timeline = Arc::new(Vec::new());
-                self.note_timeline_step_sec = 0.0;
-                self.refresh_note_timeline_from_selected_stems_preserving();
+                self.set_stem_transcriptions_enabled(transcriptions_on, stems.len());
             }
         });
-        ui.add_space(UI_VSPACE_TIGHT);
+        // Clearly separate the master toggles from the stem rows below them.
+        ui.add_space(UI_VSPACE_MEDIUM);
+
+        let stem_audio_on = !self.enabled_listening_indices.is_empty();
+        let stem_transcriptions_on = !self.enabled_stem_indices.is_empty();
 
         // Stem knobs: wrapping rows that stay balanced (3+3 rather than
         // 4+2) so no row leaves a wide empty stretch; cells distribute
@@ -424,8 +446,10 @@ impl KeyScribeApp {
                             .get(idx)
                             .copied()
                             .unwrap_or(self.highlight_color);
-                        let audible = self.enabled_listening_indices.contains(&idx);
-                        let visible = self.enabled_stem_indices.contains(&idx);
+                        let audible =
+                            stem_audio_on && self.enabled_listening_indices.contains(&idx);
+                        let visible = stem_transcriptions_on
+                            && self.enabled_stem_indices.contains(&idx);
                         let mut vol = self
                             .stem_volumes
                             .get(label.as_ref())
@@ -433,6 +457,9 @@ impl KeyScribeApp {
                             .unwrap_or(0.0);
                         let text_color = ui.visuals().text_color();
                         let dim_color = text_color.gamma_multiply(0.4);
+                        // The instrument name is only dimmed when the stem is
+                        // neither contributing audio nor transcription.
+                        let stem_label_active = stem_audio_on || stem_transcriptions_on;
 
                         // Cell: name above the knob, then a value row with
                         // mute/eye flanking the dB number — all centered.
@@ -442,7 +469,7 @@ impl KeyScribeApp {
                             ui.label(
                                 egui::RichText::new(label.as_ref())
                                     .size(11.0)
-                                    .color(if audible { text_color } else { dim_color }),
+                                    .color(if stem_label_active { text_color } else { dim_color }),
                             );
                             let vol_changed = synth_knob(
                                 ui,
@@ -512,14 +539,20 @@ impl KeyScribeApp {
                                 .interact(
                                     mute_rect,
                                     egui::Id::new(("stem_mute", idx)),
-                                    egui::Sense::click(),
+                                    if stem_audio_on {
+                                        egui::Sense::click()
+                                    } else {
+                                        egui::Sense::hover()
+                                    },
                                 )
-                                .on_hover_text(if audible {
+                                .on_hover_text(if !stem_audio_on {
+                                    "Turn on Stem audio to mix individual stems"
+                                } else if audible {
                                     "Audible in playback — click to mute"
                                 } else {
                                     "Muted — click to unmute"
                                 });
-                            if mute_resp.clicked() {
+                            if stem_audio_on && mute_resp.clicked() {
                                 let pd = ui.input(|i| i.pointer.primary_down());
                                 self.push_mix_undo(pd);
                                 self.toggle_stem_mute(idx, label.as_ref());
@@ -535,14 +568,20 @@ impl KeyScribeApp {
                                 .interact(
                                     eye_rect,
                                     egui::Id::new(("stem_eye", idx)),
-                                    egui::Sense::click(),
+                                    if stem_transcriptions_on {
+                                        egui::Sense::click()
+                                    } else {
+                                        egui::Sense::hover()
+                                    },
                                 )
-                                .on_hover_text(if visible {
+                                .on_hover_text(if !stem_transcriptions_on {
+                                    "Turn on Stem transcriptions to show individual stems"
+                                } else if visible {
                                     "Shown on piano — click to hide"
                                 } else {
                                     "Hidden from piano — click to show"
                                 });
-                            if eye_resp.clicked() {
+                            if stem_transcriptions_on && eye_resp.clicked() {
                                 let pd = ui.input(|i| i.pointer.primary_down());
                                 self.push_mix_undo(pd);
                                 self.toggle_stem_piano_visibility(idx);
@@ -578,6 +617,35 @@ impl KeyScribeApp {
         if !live_synced {
             self.maybe_restart_playback_for_listen_sync();
         }
+    }
+
+    /// Master switch: route playback through the separated stems (on) or the
+    /// original mix (off, represented by an empty listening set).
+    fn set_stem_audio_enabled(&mut self, enabled: bool, stems_len: usize) {
+        self.stem_playback_cache = None;
+        if enabled {
+            self.enabled_listening_indices = (0..stems_len).collect();
+            let live = self.sync_all_stem_gains_live();
+            if !live {
+                self.maybe_restart_playback_for_listen_sync();
+            }
+        } else {
+            self.enabled_listening_indices.clear();
+            self.maybe_restart_playback_for_listen_sync();
+        }
+    }
+
+    /// Master switch: show the notes from the individual stem analyses (on) or
+    /// the original full-mix transcription (off, an empty visible set).
+    fn set_stem_transcriptions_enabled(&mut self, enabled: bool, stems_len: usize) {
+        if enabled {
+            self.enabled_stem_indices = (0..stems_len).collect();
+        } else {
+            self.enabled_stem_indices.clear();
+        }
+        self.note_timeline = Arc::new(Vec::new());
+        self.note_timeline_step_sec = 0.0;
+        self.refresh_note_timeline_from_selected_stems_preserving();
     }
 
     /// Show/hide a stem's notes on the piano from the under-keyboard strip.

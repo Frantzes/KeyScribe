@@ -443,9 +443,7 @@ fn draw_seek_bar_row(ui: &mut egui::Ui, app: &mut KeyScribeApp, duration: f32) {
                 ui.visuals().widgets.inactive.fg_stroke,
             );
 
-            if enabled {
-                resp = resp.on_hover_text("Seek — click or drag");
-            } else {
+            if !enabled {
                 resp = resp.on_hover_text("Load a track to seek");
             }
 

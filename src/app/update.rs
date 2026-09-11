@@ -689,7 +689,9 @@ impl eframe::App for KeyScribeApp {
         }
 
         let waveform_central = egui::CentralPanel::default()
-            .frame(egui::Frame::none().inner_margin(egui::Margin::symmetric(UI_VSPACE_MEDIUM, 0.0)))
+            // The waveform runs edge-to-edge; the rows above it apply the
+            // panel gutter themselves (see below) and the footer keeps it too.
+            .frame(egui::Frame::none())
             .show(ctx, |ui| {
                 if self.audio_raw.is_none() && !self.is_audio_loading {
                     let import_surface_rect = ui.max_rect();
@@ -736,32 +738,52 @@ impl eframe::App for KeyScribeApp {
                 let default_stack_spacing_y = ui.spacing().item_spacing.y;
                 ui.spacing_mut().item_spacing.y = 0.0;
 
-                // Merged top row: compact Speed/Pitch + Separate Instruments
-                // action + view switcher icons.
-                self.draw_view_switcher_row(ui);
+                // Rows above the waveform keep the panel gutter; only the
+                // waveform itself is full-bleed.
+                let gutter = UI_VSPACE_MEDIUM;
+                egui::Frame::none()
+                    .inner_margin(egui::Margin::symmetric(gutter, 0.0))
+                    .show(ui, |ui| {
+                        // Merged top row: compact Speed/Pitch + Separate
+                        // Instruments action + view switcher icons.
+                        self.draw_view_switcher_row(ui);
 
-                ui.add_space(UI_VSPACE_TIGHT);
-                draw_horizontal_separator(ui, 0.0);
-                ui.add_space(UI_VSPACE_TIGHT);
+                        ui.add_space(UI_VSPACE_TIGHT);
+                        draw_horizontal_separator(ui, 0.0);
+                        ui.add_space(UI_VSPACE_TIGHT);
 
-                // Stem mixer strip (toggled from the top bar): sits between
-                // the top row and the waveform; its height shrinks the
-                // content area below automatically.
-                self.draw_stem_strip(ui);
+                        // Stem mixer strip (toggled from the top bar): sits
+                        // between the top row and the waveform; its height
+                        // shrinks the content area below automatically.
+                        self.draw_stem_strip(ui);
+                    });
 
                 // Absolute layout stability: calculate exact rects for content and footer
                 let full_avail_h = ui.available_height().max(0.0);
                 let full_avail_w = ui.available_width();
-                let media_h = media_controls_height_for_width(full_avail_w);
+                let footer_w = (full_avail_w - gutter * 2.0).max(0.0);
+                let media_h = media_controls_height_for_width(footer_w);
                 let gap = waveform_visual_gap;
                 let footer_total_h = media_h + gap * 2.0;
                 let content_h = (full_avail_h - footer_total_h).max(0.0);
 
                 let start_pos = ui.cursor().min;
-                let content_rect = egui::Rect::from_min_size(start_pos, egui::vec2(full_avail_w, content_h));
+                // The waveform spans the full window width; the sheet-music
+                // view keeps the gutter so its pages stay readable.
+                let content_full_bleed = self.main_content_tab != MainContentTab::SheetMusic;
+                let content_left = if content_full_bleed {
+                    start_pos.x
+                } else {
+                    start_pos.x + gutter
+                };
+                let content_w = if content_full_bleed { full_avail_w } else { footer_w };
+                let content_rect = egui::Rect::from_min_size(
+                    egui::pos2(content_left, start_pos.y),
+                    egui::vec2(content_w, content_h),
+                );
                 let footer_rect = egui::Rect::from_min_size(
-                    egui::pos2(start_pos.x, content_rect.bottom() + gap),
-                    egui::vec2(full_avail_w, media_h)
+                    egui::pos2(start_pos.x + gutter, content_rect.bottom() + gap),
+                    egui::vec2(footer_w, media_h)
                 );
 
                 // 1. Content Area (Strictly bounded)
@@ -816,6 +838,8 @@ impl eframe::App for KeyScribeApp {
                             content_h,
                         );
                     } else {
+                        // Full-bleed waveform: no frame border around the plot.
+                        ui.visuals_mut().widgets.noninteractive.bg_stroke = egui::Stroke::NONE;
                         let plot_resp = Plot::new("waveform_plot")
                             .height(remaining_h)
                             .allow_scroll(false)

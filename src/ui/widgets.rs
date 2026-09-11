@@ -12,6 +12,133 @@ pub fn icon_button(ui: &mut egui::Ui, icon: &str, tooltip: &str, enabled: bool) 
     icon_button_with_fill(ui, icon, tooltip, enabled, None, None)
 }
 
+/// Paint the pill track and knob for a toggle switch into `rect`. The knob
+/// and track share the rect's vertical center so callers can align the switch
+/// with text by centering both boxes on the same axis.
+fn paint_toggle_switch(
+    ui: &egui::Ui,
+    rect: egui::Rect,
+    on: bool,
+    enabled: bool,
+    accent: egui::Color32,
+) {
+    let visuals = ui.visuals();
+    let dim = if enabled { 1.0 } else { 0.4 };
+    let radius = rect.height() * 0.5;
+    let track_color = if on {
+        accent.gamma_multiply(dim)
+    } else {
+        visuals.widgets.inactive.bg_fill.gamma_multiply(dim)
+    };
+    ui.painter()
+        .rect_filled(rect, egui::Rounding::same(radius), track_color);
+
+    let knob_radius = radius - 2.5;
+    let travel = rect.width() - 2.0 * radius;
+    let knob_x = rect.left() + radius + if on { travel } else { 0.0 };
+    let knob_color = if on {
+        egui::Color32::WHITE.gamma_multiply(dim)
+    } else {
+        visuals.widgets.inactive.fg_stroke.color.gamma_multiply(dim)
+    };
+    ui.painter()
+        .circle_filled(egui::pos2(knob_x, rect.center().y), knob_radius, knob_color);
+}
+
+const TOGGLE_SWITCH_SIZE: egui::Vec2 = egui::vec2(36.0, 18.0);
+const TOGGLE_SWITCH_GAP: f32 = 6.0;
+
+/// Pill-shaped on/off switch. Toggles `value` on click and returns `true`
+/// when it changed this frame. A disabled switch is drawn dimmed and ignores
+/// clicks.
+pub fn toggle_switch(
+    ui: &mut egui::Ui,
+    id_salt: impl std::hash::Hash,
+    value: &mut bool,
+    enabled: bool,
+    accent: egui::Color32,
+) -> bool {
+    let _id = ui.make_persistent_id(id_salt);
+    let (rect, resp) = ui.allocate_exact_size(
+        TOGGLE_SWITCH_SIZE,
+        if enabled {
+            egui::Sense::click()
+        } else {
+            egui::Sense::hover()
+        },
+    );
+    let resp = if enabled {
+        resp.on_hover_cursor(egui::CursorIcon::PointingHand)
+    } else {
+        resp
+    };
+
+    let mut changed = false;
+    if enabled && resp.clicked() {
+        *value = !*value;
+        changed = true;
+    }
+
+    paint_toggle_switch(ui, rect, *value, enabled, accent);
+    changed
+}
+
+/// A toggle switch with a label to its right. The switch and the text are
+/// centered on a shared vertical axis (and the whole row is clickable), so
+/// they line up exactly rather than relying on the text galley's baseline.
+pub fn toggle_switch_with_label(
+    ui: &mut egui::Ui,
+    id_salt: impl std::hash::Hash,
+    value: &mut bool,
+    enabled: bool,
+    accent: egui::Color32,
+    label: &str,
+    text_color: egui::Color32,
+) -> bool {
+    let _id = ui.make_persistent_id(id_salt);
+    let galley = ui.ctx().fonts(|fonts| {
+        fonts.layout_no_wrap(
+            label.to_owned(),
+            egui::FontId::proportional(11.0),
+            text_color,
+        )
+    });
+    let row_h = TOGGLE_SWITCH_SIZE.y.max(galley.size().y);
+    let total_w = TOGGLE_SWITCH_SIZE.x + TOGGLE_SWITCH_GAP + galley.size().x;
+    let (rect, resp) = ui.allocate_exact_size(
+        egui::vec2(total_w, row_h),
+        if enabled {
+            egui::Sense::click()
+        } else {
+            egui::Sense::hover()
+        },
+    );
+
+    let mut changed = false;
+    if enabled && resp.clicked() {
+        *value = !*value;
+        changed = true;
+    }
+    if enabled && resp.hovered() {
+        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+    }
+
+    let center_y = rect.center().y;
+    let switch_rect = egui::Rect::from_min_size(
+        egui::pos2(rect.left(), center_y - TOGGLE_SWITCH_SIZE.y * 0.5),
+        TOGGLE_SWITCH_SIZE,
+    );
+    paint_toggle_switch(ui, switch_rect, *value, enabled, accent);
+
+    let label_pos = egui::pos2(
+        switch_rect.right() + TOGGLE_SWITCH_GAP,
+        center_y - galley.size().y * 0.5,
+    );
+    ui.painter().galley(label_pos, galley, text_color);
+
+    changed
+}
+
 pub fn icon_toggle_button(
     ui: &mut egui::Ui,
     icon: &str,

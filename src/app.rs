@@ -227,6 +227,10 @@ fn default_auto_separate() -> bool {
     false
 }
 
+fn default_show_piano_settings() -> bool {
+    true
+}
+
 fn assign_stem_colors(stems: &[crate::leadsheet::SeparatedStem]) -> Vec<egui::Color32> {
     stems
         .iter()
@@ -313,6 +317,9 @@ struct PersistedState {
     show_note_hist_window: bool,
     #[serde(default)]
     show_video_pane: bool,
+    /// Whether the keyboard-settings panel under the piano is expanded.
+    #[serde(default = "default_show_piano_settings")]
+    show_piano_settings: bool,
     #[serde(default = "default_use_cqt_analysis")]
     use_cqt_analysis: bool,
     #[serde(default = "default_preprocess_audio")]
@@ -378,6 +385,7 @@ impl Default for PersistedState {
             video_panel_height: 300.0,
             show_note_hist_window: true,
             show_video_pane: true,
+            show_piano_settings: default_show_piano_settings(),
             use_cqt_analysis: default_use_cqt_analysis(),
             preprocess_audio: true,
             playback_volume: 0.8,
@@ -1570,7 +1578,7 @@ impl KeyScribeApp {
             enabled_stem_indices: std::collections::BTreeSet::new(),
             pending_listening_indices: std::collections::BTreeSet::new(),
             show_stem_mixer: false,
-            show_piano_settings: false,
+            show_piano_settings: persisted.show_piano_settings,
             mix_undo: Vec::new(),
             mix_redo: Vec::new(),
             mix_press_pushed: false,

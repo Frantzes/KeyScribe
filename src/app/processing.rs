@@ -936,8 +936,6 @@ impl KeyScribeApp {
                     self.last_error = Some(err);
                 } else {
                     self.stem_analyses = result.analyses;
-                    self.cache_status_message = Some("Stem analysis complete.".to_string());
-                    self.cache_status_message_at = Some(Instant::now());
                     self.update_note_probabilities(true);
                 }
             }
@@ -1002,6 +1000,7 @@ impl KeyScribeApp {
             video_panel_height: self.video_panel_height,
             show_note_hist_window: self.show_note_hist_window,
             show_video_pane: self.show_video_pane,
+            show_piano_settings: self.show_piano_settings,
             use_cqt_analysis: self.use_cqt_analysis,
             preprocess_audio: self.preprocess_audio,
             playback_volume: self.playback_volume,
@@ -1271,8 +1270,17 @@ impl KeyScribeApp {
     }
 
     pub(super) fn refresh_note_timeline_from_selected_stems_preserving(&mut self) {
+        // Stem-selection toggles are user-driven and often clicked repeatedly.
+        // A status line appearing/disappearing here makes the panel jump under
+        // the cursor, so keep it quiet and mark any needed rebuild as silent.
+        self.cache_status_message = None;
+        self.cache_status_message_at = None;
         if self.stem_analyses.is_empty() || self.enabled_stem_indices.is_empty() {
+            self.param_tweak_rebuild = true;
             self.request_rebuild_preserving_playback_and_waveform();
+            if !self.is_processing {
+                self.param_tweak_rebuild = false;
+            }
         } else {
             self.update_note_probabilities(true);
         }
