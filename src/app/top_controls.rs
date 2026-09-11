@@ -884,11 +884,7 @@ impl KeyScribeApp {
 
             ui.menu_button("Export", |ui| {
                 ui.set_min_width(Self::responsive_menu_min_width(ui));
-                
-                let current_model = self.current_separation_model_name();
-                if self.separated_stems.is_none() || self.loaded_stems_model_name.as_deref() != Some(&current_model) {
-                    self.request_cached_stems(&current_model);
-                }
+
                 let has_stems = self.separated_stems.is_some();
                 let can_export_midi = has_stems || !self.note_timeline.is_empty();
                 if ui.add_enabled(has_stems, egui::Button::new("Export Stems...")).clicked() {

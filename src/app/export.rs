@@ -13,9 +13,6 @@ impl KeyScribeApp {
                 .open(&mut stems_open)
                 .show(ctx, |ui| {
                     let current_model = self.current_separation_model_name();
-                    if self.separated_stems.is_none() || self.loaded_stems_model_name.as_deref() != Some(&current_model) {
-                        self.request_cached_stems(&current_model);
-                    }
                     let model_display = self.separation_model_display_name(&current_model);
                     ui.label(egui::RichText::new(format!("Model: {model_display}")).strong());
                     ui.add_space(4.0);
@@ -105,9 +102,8 @@ impl KeyScribeApp {
     pub(super) fn execute_export_stems(&mut self, dest_folder: &Path) {
         let current_model = self.current_separation_model_name();
         if self.separated_stems.is_none() || self.loaded_stems_model_name.as_deref() != Some(&current_model) {
-            self.request_cached_stems(&current_model);
             self.last_error = Some(
-                "Loading cached stems in the background — try the export again in a moment."
+                "No separated stems available. Run \"Separate Instruments\" before exporting stems."
                     .to_string(),
             );
             return;

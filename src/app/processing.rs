@@ -893,8 +893,7 @@ impl KeyScribeApp {
         if bytes.is_empty() || bytes.len() > ANALYSIS_CACHE_MAX_COMPRESSED_BYTES {
             return None;
         }
-        let decompress_budget = analysis_cache_decompress_budget(bytes.len());
-        let payload = zstd::bulk::decompress(&bytes, decompress_budget).ok()?;
+        let payload = decompress_analysis_cache_payload(&bytes)?;
         let blob: StemAnalysisCacheBlob =
             bincode::DefaultOptions::new().deserialize(&payload).ok()?;
         if blob.version != STEM_ANALYSIS_CACHE_VERSION {
@@ -1009,6 +1008,7 @@ impl KeyScribeApp {
             audio_quality_mode: self.audio_quality_mode,
             audio_output_device_id: self.audio_output_device_id.clone(),
             loop_enabled: self.loop_enabled,
+            loop_selection: self.loop_selection,
             dark_mode: self.dark_mode,
             highlight_hex: color_to_hex(self.highlight_color),
             recent_highlight_hex: self.recent_highlight_hex.clone(),

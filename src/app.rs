@@ -325,6 +325,10 @@ struct PersistedState {
     audio_output_device_id: Option<String>,
     #[serde(default)]
     loop_enabled: bool,
+    /// A-B loop range the user last left active, so a session can resume the
+    /// same loop. Only restored together with `loop_enabled` and a valid range.
+    #[serde(default)]
+    loop_selection: Option<(f32, f32)>,
     #[serde(default = "default_dark_mode")]
     dark_mode: bool,
     #[serde(default = "default_highlight_hex")]
@@ -380,6 +384,7 @@ impl Default for PersistedState {
             audio_quality_mode: AudioQualityMode::Balanced,
             audio_output_device_id: None,
             loop_enabled: false,
+            loop_selection: None,
             dark_mode: true,
             highlight_hex: default_highlight_hex(),
             recent_highlight_hex: Vec::new(),
@@ -765,13 +770,47 @@ fn analysis_cache_variant_key(
     format!("{hash:016x}")
 }
 
-fn analysis_cache_decompress_budget(compressed_len: usize) -> usize {
+/// Upper bound on how much a cache blob may decompress to. This is a cap, not
+/// a pre-allocation: the payload is streamed and the buffer grows with the
+/// data, so a small highly-compressible blob does not reserve this much.
+fn analysis_cache_decompress_limit(compressed_len: usize) -> usize {
+    const MIN_LIMIT: usize = 256 * 1024 * 1024;
     compressed_len
         .saturating_mul(ANALYSIS_CACHE_MAX_DECOMPRESS_RATIO)
-        .clamp(
-            ANALYSIS_CACHE_MAX_COMPRESSED_BYTES,
-            ANALYSIS_CACHE_MAX_DECOMPRESSED_BYTES,
-        )
+        .max(MIN_LIMIT)
+        .min(ANALYSIS_CACHE_MAX_DECOMPRESSED_BYTES)
+}
+
+/// Stream-decompress an analysis cache payload, rejecting anything past
+/// [`analysis_cache_decompress_limit`].
+///
+/// `zstd::bulk::decompress` pre-allocates its entire `capacity` up front and,
+/// without zstd's `experimental` feature, cannot read the frame's real output
+/// size, so a large capacity reserved gigabytes per blob and aborted the
+/// process on allocation failure (`rust_oom` -> `0xc0000409`).
+fn decompress_analysis_cache_payload(bytes: &[u8]) -> Option<Vec<u8>> {
+    use std::io::Read;
+
+    if bytes.is_empty() {
+        return None;
+    }
+    let limit = analysis_cache_decompress_limit(bytes.len());
+    let mut decoder = zstd::stream::read::Decoder::new(bytes).ok()?;
+    let mut payload = Vec::new();
+    let mut chunk = [0u8; 64 * 1024];
+    loop {
+        match decoder.read(&mut chunk) {
+            Ok(0) => break,
+            Ok(n) => {
+                if payload.len().saturating_add(n) > limit {
+                    return None;
+                }
+                payload.extend_from_slice(&chunk[..n]);
+            }
+            Err(_) => return None,
+        }
+    }
+    Some(payload)
 }
 
 fn deserialize_analysis_cache_blob(payload: &[u8]) -> Option<AnalysisCacheBlob> {
@@ -825,8 +864,7 @@ fn decode_analysis_cache_blob(bytes: &[u8]) -> Result<AnalysisCacheBlob, CacheBl
         return Err(CacheBlobDecodeFailure::Decompress);
     }
 
-    let decompress_budget = analysis_cache_decompress_budget(bytes.len());
-    if let Ok(payload) = zstd::bulk::decompress(bytes, decompress_budget) {
+    if let Some(payload) = decompress_analysis_cache_payload(bytes) {
         return deserialize_analysis_cache_blob(payload.as_slice())
             .ok_or(CacheBlobDecodeFailure::Deserialize);
     }
@@ -1497,6 +1535,14 @@ impl KeyScribeApp {
         let highlight_color = parse_hex_color(&persisted.highlight_hex).unwrap_or(ACCENT_PURPLE);
         apply_brand_theme(&_cc.egui_ctx, persisted.dark_mode, highlight_color);
 
+        // Only turn the loop button back on when a real A-B range was left
+        // behind; a stray persisted `loop_enabled` with no range would light
+        // the button on startup with nothing to loop.
+        let restored_loop_selection = persisted
+            .loop_selection
+            .filter(|(a, b)| (b - a).abs() > LOOP_MIN_DURATION_SEC);
+        let restored_loop_enabled = persisted.loop_enabled && restored_loop_selection.is_some();
+
         let mut app = Self {
             loaded_path: None,
             loaded_audio_hash: None,
@@ -1620,7 +1666,7 @@ impl KeyScribeApp {
             audio_quality_mode: persisted.audio_quality_mode,
             audio_output_device_id: persisted.audio_output_device_id.clone(),
             audio_output_devices: Vec::new(),
-            loop_enabled: persisted.loop_enabled,
+            loop_enabled: restored_loop_enabled,
             dark_mode: persisted.dark_mode,
             highlight_color,
             custom_rgb: [
@@ -1633,11 +1679,11 @@ impl KeyScribeApp {
             recent_highlight_hex: persisted.recent_highlight_hex,
             last_state_save_at: Instant::now(),
             waveform_reset_view: true,
-            loop_selection: None,
+            loop_selection: restored_loop_selection,
             loop_start_input_str: String::new(),
             loop_end_input_str: String::new(),
             drag_select_anchor_sec: None,
-            loop_playback_enabled: false,
+            loop_playback_enabled: restored_loop_enabled,
             playing_preview_buffer: false,
             live_stream_playback: false,
             use_cqt_analysis: persisted.use_cqt_analysis,
