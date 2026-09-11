@@ -365,13 +365,13 @@ pub fn synth_knob(
         center,
         disc_r,
         visuals.widgets.inactive.bg_fill.gamma_multiply(dim),
-        egui::Stroke::new(1.0, stroke_color),
+        egui::Stroke::new(1.0_f32, stroke_color),
     );
     let p0 = knob_angle_pos(center, disc_r * 0.30, angle);
     let p1 = knob_angle_pos(center, disc_r * 0.80, angle);
     painter.line_segment(
         [p0, p1],
-        egui::Stroke::new(2.0, visuals.text_color().gamma_multiply(dim)),
+        egui::Stroke::new(2.0_f32, visuals.text_color().gamma_multiply(dim)),
     );
 
     changed

@@ -78,7 +78,7 @@ pub fn draw_piano_view(
         painter.rect_stroke(
             key_rect,
             0.0,
-            egui::Stroke::new(1.0, PIANO_WHITE_KEY_STROKE),
+            egui::Stroke::new(1.0_f32, PIANO_WHITE_KEY_STROKE),
         );
 
         let idx = (midi - PIANO_LOW_MIDI) as usize;
@@ -92,7 +92,7 @@ pub fn draw_piano_view(
             painter.rect_stroke(
                 key_rect,
                 0.0,
-                egui::Stroke::new(1.0, PIANO_WHITE_KEY_STROKE),
+                egui::Stroke::new(1.0_f32, PIANO_WHITE_KEY_STROKE),
             );
         }
 
@@ -121,7 +121,7 @@ pub fn draw_piano_view(
         painter.rect_stroke(
             key_rect,
             2.0,
-            egui::Stroke::new(1.0, PIANO_BLACK_KEY_STROKE),
+            egui::Stroke::new(1.0_f32, PIANO_BLACK_KEY_STROKE),
         );
 
         let idx = (midi - PIANO_LOW_MIDI) as usize;
@@ -135,7 +135,7 @@ pub fn draw_piano_view(
             painter.rect_stroke(
                 key_rect,
                 2.0,
-                egui::Stroke::new(1.0, PIANO_BLACK_KEY_STROKE),
+                egui::Stroke::new(1.0_f32, PIANO_BLACK_KEY_STROKE),
             );
         }
     }
@@ -203,7 +203,7 @@ pub fn draw_probability_pane(
         painter.rect_stroke(
             key_rect,
             0.0,
-            egui::Stroke::new(1.0, PROBABILITY_PANE_WHITE_KEY_STROKE),
+            egui::Stroke::new(1.0_f32, PROBABILITY_PANE_WHITE_KEY_STROKE),
         );
 
         let idx = (midi - PIANO_LOW_MIDI) as usize;
@@ -265,7 +265,7 @@ pub fn draw_probability_pane(
         painter.rect_stroke(
             key_rect,
             2.0,
-            egui::Stroke::new(1.0, PROBABILITY_PANE_BLACK_KEY_STROKE),
+            egui::Stroke::new(1.0_f32, PROBABILITY_PANE_BLACK_KEY_STROKE),
         );
 
         let idx = (midi - PIANO_LOW_MIDI) as usize;

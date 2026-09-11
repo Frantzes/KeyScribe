@@ -888,7 +888,7 @@ impl eframe::App for KeyScribeApp {
                                             [start, 1.05],
                                         ]))
                                         .fill_color(loop_bg)
-                                        .stroke(egui::Stroke::new(1.0, loop_edge));
+                                        .stroke(egui::Stroke::new(1.0_f32, loop_edge));
                                         plot_ui.polygon(highlight);
                                     }
                                 }
@@ -1491,7 +1491,7 @@ fn paint_audio_import_overlay(
         highlight_color.b().saturating_add(20),
     );
     let frame_rect = overlay_rect.shrink(22.0);
-    painter.rect_stroke(frame_rect, 12.0, egui::Stroke::new(2.0, border_color));
+    painter.rect_stroke(frame_rect, 12.0, egui::Stroke::new(2.0_f32, border_color));
 
     painter.text(
         frame_rect.center() + egui::vec2(0.0, -10.0),

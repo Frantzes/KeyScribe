@@ -132,7 +132,7 @@ fn draw_vertical_separator(ui: &mut egui::Ui, row_h: f32) {
             egui::pos2(center.x, center.y - h * 0.5),
             egui::pos2(center.x, center.y + h * 0.5),
         ],
-        egui::Stroke::new(1.0, color),
+        egui::Stroke::new(1.0_f32, color),
     );
 }
 use crate::leadsheet::{
@@ -710,7 +710,7 @@ impl KeyScribeApp {
                     rect,
                     egui::Rounding::same(8.0),
                     ui.visuals().extreme_bg_color,
-                    egui::Stroke::new(2.0, ui.visuals().widgets.noninteractive.bg_stroke.color),
+                    egui::Stroke::new(2.0_f32, ui.visuals().widgets.noninteractive.bg_stroke.color),
                 );
 
                 if self.sheet_preview_result_rx.is_some() {
@@ -2328,7 +2328,7 @@ fn draw_scrollable_engraved_preview(
                     let y1 = response.rect.top() + sy1 * target_height;
                     ui.painter().line_segment(
                         [egui::pos2(x, y0), egui::pos2(x, y1)],
-                        egui::Stroke::new(2.0, cursor_color),
+                        egui::Stroke::new(2.0_f32, cursor_color),
                     );
                 }
 
@@ -2412,7 +2412,7 @@ fn bipolar_db_slider(
             egui::pos2(center_x, rail.top() - 2.0),
             egui::pos2(center_x, rail.bottom() + 2.0),
         ],
-        egui::Stroke::new(1.5, ui.visuals().weak_text_color()),
+        egui::Stroke::new(1.5_f32, ui.visuals().weak_text_color()),
     );
 
     // Accent fill from center to handle.
