@@ -12,9 +12,11 @@ pub mod leadsheet;
 pub mod midi;
 pub mod musicxml;
 pub mod mvsep;
+pub mod platform;
 pub mod pipeline;
 pub mod preprocessing;
 pub mod ring_buffer;
+pub mod secrets;
 pub mod sheet_compare;
 pub mod synth;
 pub mod tune;
@@ -22,6 +24,8 @@ pub mod viterbi;
 
 #[cfg(feature = "native-ui")]
 pub mod app;
+#[cfg(all(feature = "native-ui", target_os = "android"))]
+pub mod android;
 #[cfg(feature = "native-ui")]
 pub mod playback;
 #[cfg(feature = "native-ui")]

@@ -30,25 +30,5 @@ pub fn create_tracker() -> Result<beat_this::BeatThis<impl beat_this::Model>> {
 }
 
 fn resolve_model_path(filename: &str) -> Option<PathBuf> {
-    if let Ok(exe) = std::env::current_exe() {
-        if let Some(parent) = exe.parent() {
-            let p = parent.join("models").join(filename);
-            if p.exists() {
-                return Some(p);
-            }
-            let p2 = parent.join(filename);
-            if p2.exists() {
-                return Some(p2);
-            }
-        }
-    }
-    let cwd = PathBuf::from("models").join(filename);
-    if cwd.exists() {
-        return Some(cwd);
-    }
-    let cwd2 = PathBuf::from(filename);
-    if cwd2.exists() {
-        return Some(cwd2);
-    }
-    None
+    crate::platform::resolve_model_path(filename)
 }

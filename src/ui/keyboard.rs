@@ -7,8 +7,9 @@ use crate::theme::{
     PROBABILITY_PANE_BLACK_KEY_STROKE, PROBABILITY_PANE_WHITE_KEY_STROKE,
 };
 
-pub const PIANO_ZOOM_MIN: f32 = 0.35;
-pub const PIANO_ZOOM_MAX: f32 = 1.0;
+/// 1.0 = fit-to-width; values above 1.0 zoom *in* (and enable panning).
+pub const PIANO_ZOOM_MIN: f32 = 1.0;
+pub const PIANO_ZOOM_MAX: f32 = 2.5;
 pub const WHITE_KEY_LENGTH_TO_WIDTH: f32 = 6.3;
 pub const MIN_PIANO_KEY_HEIGHT: f32 = 16.0;
 pub const MIN_PROBABILITY_STRIP_HEIGHT: f32 = 20.0;
@@ -40,6 +41,7 @@ pub fn draw_piano_view(
     key_height: f32,
     scroll_px: f32,
     _highlight_color: egui::Color32,
+    c4_marker_radius: f32,
 ) -> KeyboardDrawResult {
     let desired_size = egui::vec2(
         ui.available_width(),
@@ -144,7 +146,7 @@ pub fn draw_piano_view(
         let c4_white_idx = white_index_before_midi(60);
         let cx = x_start + c4_white_idx as f32 * white_w + white_w * 0.5;
         if cx >= rect.left() && cx <= rect.right() {
-            let marker_radius = 4.0;
+            let marker_radius = c4_marker_radius.max(1.0);
             let marker_y = (rect.bottom() - marker_radius - 2.0).max(rect.top() + marker_radius);
             painter.circle_filled(egui::pos2(cx, marker_y), marker_radius, PIANO_C4_MARKER);
         }

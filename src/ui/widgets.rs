@@ -1,12 +1,24 @@
 use eframe::egui;
 
 pub fn responsive_icon_button_size(ui: &egui::Ui) -> f32 {
-    ui.spacing().interact_size.y.clamp(30.0, 42.0)
+    // Touch platforms get noticeably larger hit targets.
+    let (min, max) = if cfg!(any(target_os = "android", target_os = "ios")) {
+        (40.0, 52.0)
+    } else {
+        (34.0, 46.0)
+    };
+    ui.spacing().interact_size.y.clamp(min, max)
 }
 
 fn responsive_icon_font_size(button_size: f32) -> f32 {
     (button_size * 0.52).clamp(16.0, 22.0)
 }
+
+/// Fraction of the icon size to nudge the glyph *up* so it lands on the
+/// button's optical centre: the Phosphor font's baseline sits ~0.075 em below
+/// the line centre, so a plain `CENTER_CENTER` renders slightly low. Applied
+/// only to icon buttons (not inline/baseline-aligned icons like the mixer).
+pub(crate) const ICON_BUTTON_TEXT_Y_NUDGE: f32 = 0.075;
 
 pub fn icon_button(ui: &mut egui::Ui, icon: &str, tooltip: &str, enabled: bool) -> egui::Response {
     icon_button_with_fill(ui, icon, tooltip, enabled, None, None)
@@ -199,7 +211,7 @@ fn icon_button_with_fill(
     });
 
     ui.painter().text(
-        rect.center(),
+        rect.center() - egui::vec2(0.0, icon_size * ICON_BUTTON_TEXT_Y_NUDGE),
         egui::Align2::CENTER_CENTER,
         icon,
         icon_font_id(icon_size),
@@ -472,4 +484,77 @@ pub fn accent_slider(
     painter.circle_stroke(handle_pos, handle_r, visuals.widgets.inactive.fg_stroke);
 
     changed
+}
+
+#[cfg(test)]
+mod icon_alignment_tests {
+    use super::*;
+
+    /// A context with only the Phosphor "icons" family configured, so the
+    /// measurement does not depend on the global font-configuration OnceLock.
+    fn probe_ctx() -> egui::Context {
+        let ctx = egui::Context::default();
+        let mut defs = egui::FontDefinitions::default();
+        egui_phosphor::add_to_fonts(&mut defs, egui_phosphor::Variant::Regular);
+        // Keep the default proportional fonts as fallback so the replacement
+        // glyph still resolves.
+        let mut icon_family = vec!["phosphor".to_owned()];
+        if let Some(existing) = defs.families.get(&egui::FontFamily::Proportional) {
+            icon_family.extend(existing.iter().cloned());
+        }
+        defs.families
+            .insert(egui::FontFamily::Name("icons".into()), icon_family);
+        ctx.set_fonts(defs);
+        ctx
+    }
+
+    /// Tessellate a single centred icon and return the ink's vertical bounds.
+    fn ink_y_bounds(ctx: &egui::Context, icon: &str, size: f32) -> (f32, f32) {
+        let rect = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(60.0, 60.0));
+        let output = ctx.run(egui::RawInput::default(), |ctx| {
+            // Draw on a bare layer so only the glyph mesh is produced.
+            let painter = ctx.layer_painter(egui::LayerId::new(
+                egui::Order::Background,
+                egui::Id::new("icon_alignment_probe"),
+            ));
+            // Same placement as `icon_button_with_fill`.
+            painter.text(
+                rect.center() - egui::vec2(0.0, size * ICON_BUTTON_TEXT_Y_NUDGE),
+                egui::Align2::CENTER_CENTER,
+                icon,
+                icon_font_id(size),
+                egui::Color32::WHITE,
+            );
+        });
+        let primitives = ctx.tessellate(output.shapes, output.pixels_per_point);
+        let (mut min_y, mut max_y) = (f32::INFINITY, f32::NEG_INFINITY);
+        for primitive in primitives {
+            if let egui::epaint::Primitive::Mesh(mesh) = primitive.primitive {
+                for vertex in &mesh.vertices {
+                    min_y = min_y.min(vertex.pos.y);
+                    max_y = max_y.max(vertex.pos.y);
+                }
+            }
+        }
+        (min_y, max_y)
+    }
+
+    #[test]
+    fn phosphor_icons_are_vertically_centred() {
+        let ctx = probe_ctx();
+        for (name, icon) in [
+            ("GEAR", egui_phosphor::regular::GEAR),
+            ("FILE_AUDIO", egui_phosphor::regular::FILE_AUDIO),
+            ("REWIND", egui_phosphor::regular::REWIND),
+            ("PLAY", egui_phosphor::regular::PLAY),
+            ("SPEAKER_HIGH", egui_phosphor::regular::SPEAKER_HIGH),
+        ] {
+            let (min_y, max_y) = ink_y_bounds(&ctx, icon, 20.0);
+            let offset = (min_y + max_y) * 0.5 - 30.0;
+            assert!(
+                offset.abs() <= 1.0,
+                "{name} icon is off-centre by {offset:.2}px (expected |offset| <= 1)"
+            );
+        }
+    }
 }

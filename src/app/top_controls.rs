@@ -1,4 +1,6 @@
 use super::*;
+#[cfg(not(feature = "desktop-ui"))]
+use egui_phosphor::regular::{CLOCK_COUNTER_CLOCKWISE, FILE_AUDIO};
 use crate::theme::{
     MEDIA_PANEL_BG_DARK, MEDIA_PANEL_BG_LIGHT, SLIDER_RAIL_BG_ACTIVE_DARK,
     SLIDER_RAIL_BG_ACTIVE_LIGHT, SLIDER_RAIL_BG_DARK, SLIDER_RAIL_BG_HOVER_DARK,
@@ -443,7 +445,8 @@ impl KeyScribeApp {
         ui.label(egui::RichText::new("Separation Model").strong());
         let dropdown_icon = if self.show_separation_model_dropdown { "⏶" } else { "⏷" };
         let btn_text = format!("{current_display}  {dropdown_icon}");
-        let btn = egui::Button::new(btn_text).min_size(egui::vec2(280.0, 0.0));
+        let model_btn_w = if self.is_touch_platform() { 200.0 } else { 280.0 };
+        let btn = egui::Button::new(btn_text).min_size(egui::vec2(model_btn_w, 0.0));
         if ui.add(btn).clicked() {
             self.show_separation_model_dropdown = !self.show_separation_model_dropdown;
         }
@@ -462,7 +465,7 @@ impl KeyScribeApp {
         if current_model.starts_with("mvsep") {
             ui.add_space(4.0);
             ui.label(egui::RichText::new("MVSep API Key").strong());
-            ui.horizontal(|ui| {
+            ui.horizontal_wrapped(|ui| {
                 let response = ui.add(
                     egui::TextEdit::singleline(&mut self.mvsep_api_key)
                         .password(!self.mvsep_api_key_visible)
@@ -477,6 +480,18 @@ impl KeyScribeApp {
                 let toggle_icon = if self.mvsep_api_key_visible { "Hide" } else { "Show" };
                 if ui.small_button(toggle_icon).clicked() {
                     self.mvsep_api_key_visible = !self.mvsep_api_key_visible;
+                }
+
+                #[cfg(target_os = "android")]
+                if ui.small_button("Paste").clicked() {
+                    if let Some(text) = crate::android::get_clipboard() {
+                        let text = text.trim().to_string();
+                        if !text.is_empty() {
+                            self.mvsep_api_key = text;
+                            self.mvsep_verify_message = None;
+                            self.save_state_to_disk();
+                        }
+                    }
                 }
 
                 if ui.small_button("Verify").clicked() {
@@ -811,33 +826,182 @@ impl KeyScribeApp {
         };
 
         if ui.button(format!("Clean cache{}", size_text)).clicked() {
-            let cache_dir = crate::app::analysis_cache_dir();
-            let legacy_dir = crate::app::app_cache_base_dir().join(".transcriber_cache");
-            let stems_dir = crate::app::app_cache_base_dir().join("stems");
-            let _ = std::fs::remove_dir_all(&cache_dir);
-            let _ = std::fs::create_dir_all(&cache_dir);
-            let _ = std::fs::remove_dir_all(&legacy_dir);
-            let _ = std::fs::remove_dir_all(&stems_dir);
-            let _ = std::fs::create_dir_all(&stems_dir);
-            self.cache_size_bytes = Some(Some(0));
-            // Drop any in-flight background size scan so its stale result
-            // can't overwrite the just-cleaned value.
-            self.cache_size_rx = None;
-            self.cache_size_pending = false;
+            self.clean_analysis_cache();
         }
+    }
+
+    /// Delete the analysis/stem caches. Defensive: only removes directories
+    /// that live strictly inside the app cache base, never follows symlinks,
+    /// and logs every path it touches. This guarantees it cannot delete OS or
+    /// personal files even if the cache base were misconfigured.
+    pub(super) fn clean_analysis_cache(&mut self) {
+        let base = crate::app::app_cache_base_dir();
+        let targets = [
+            crate::app::analysis_cache_dir(),
+            base.join(".transcriber_cache"),
+            base.join("stems"),
+        ];
+
+        #[cfg(target_os = "android")]
+        crate::android::log_info(&format!("[cache] clean base={}", base.display()));
+
+        for target in targets {
+            let inside_base =
+                target.is_absolute() && target != base && target.starts_with(&base);
+            let is_symlink = std::fs::symlink_metadata(&target)
+                .map(|meta| meta.file_type().is_symlink())
+                .unwrap_or(false);
+
+            if !inside_base || is_symlink {
+                #[cfg(target_os = "android")]
+                crate::android::log_info(&format!(
+                    "[cache] skip {} (inside_base={inside_base} symlink={is_symlink})",
+                    target.display()
+                ));
+                continue;
+            }
+
+            #[cfg(target_os = "android")]
+            let existed = target.exists();
+            let _ = std::fs::remove_dir_all(&target);
+            #[cfg(target_os = "android")]
+            crate::android::log_info(&format!(
+                "[cache] removed {} (existed={existed}, gone={})",
+                target.display(),
+                !target.exists()
+            ));
+        }
+
+        let _ = std::fs::create_dir_all(crate::app::analysis_cache_dir());
+        let _ = std::fs::create_dir_all(base.join("stems"));
+        self.cache_size_bytes = Some(Some(0));
+        // Drop any in-flight background size scan so its stale result can't
+        // overwrite the just-cleaned value.
+        self.cache_size_rx = None;
+        self.cache_size_pending = false;
     }
 
     #[cfg(not(feature = "desktop-ui"))]
     pub(super) fn draw_settings_menu(&mut self, ui: &mut egui::Ui) {
         let menu_min_w = Self::responsive_menu_min_width(ui);
-        ui.set_min_width(if self.is_touch_platform() {
-            menu_min_w.max(240.0)
-        } else {
-            menu_min_w
-        });
-        self.draw_audio_settings_menu(ui);
-        Self::draw_toolbar_separator(ui);
-        self.draw_preferences_menu(ui);
+        if !self.is_touch_platform() {
+            ui.set_min_width(menu_min_w);
+            self.draw_audio_settings_menu(ui);
+            Self::draw_toolbar_separator(ui);
+            self.draw_preferences_menu(ui);
+            return;
+        }
+
+        // Mobile: the combined settings menu easily exceeds the viewport, so
+        // bound its width and make it scroll vertically.
+        let screen = ui.ctx().screen_rect();
+        let max_w = (screen.width() * 0.86).clamp(240.0, 420.0);
+        ui.set_min_width(max_w.max(240.0));
+        ui.set_max_width(max_w);
+        egui::ScrollArea::vertical()
+            .max_height((screen.height() * 0.56).max(200.0))
+            .auto_shrink([false, true])
+            .show(ui, |ui| {
+                ui.set_max_width(max_w);
+                self.draw_audio_settings_menu(ui);
+                Self::draw_toolbar_separator(ui);
+                self.draw_preferences_menu(ui);
+            });
+    }
+
+    /// Mobile settings surface: a scrollable, width-bounded window that
+    /// replaces the popup menu, which cannot fit a phone viewport.
+    pub(super) fn draw_mobile_settings_window(&mut self, ctx: &egui::Context) {
+        if !self.show_mobile_settings {
+            return;
+        }
+        let screen = ctx.screen_rect();
+        let width = (screen.width() * 0.92).clamp(280.0, 460.0);
+        let mut open = true;
+        egui::Window::new("Settings")
+            .id(egui::Id::new("mobile_settings_window"))
+            .open(&mut open)
+            .collapsible(false)
+            .resizable(false)
+            .default_width(width)
+            .min_width(width)
+            .max_width(width)
+            .anchor(egui::Align2::CENTER_TOP, egui::vec2(0.0, 0.0))
+            .show(ctx, |ui| {
+                egui::ScrollArea::vertical()
+                    .max_height((screen.height() * 0.7).max(200.0))
+                    .auto_shrink([false, true])
+                    .show(ui, |ui| {
+                        ui.set_max_width(width);
+                        self.draw_audio_settings_menu(ui);
+                        Self::draw_toolbar_separator(ui);
+                        self.draw_preferences_menu(ui);
+                    });
+            });
+        self.show_mobile_settings = open;
+    }
+
+    /// Mobile "Recent" surface: a scrollable list of recently opened files.
+    pub(super) fn draw_mobile_recent_window(&mut self, ctx: &egui::Context) {
+        if !self.show_mobile_recent {
+            return;
+        }
+        let screen = ctx.screen_rect();
+        let width = (screen.width() * 0.92).clamp(280.0, 460.0);
+        let mut open = true;
+        let mut chosen: Option<PathBuf> = None;
+        let mut clear = false;
+
+        egui::Window::new("Recent")
+            .id(egui::Id::new("mobile_recent_window"))
+            .open(&mut open)
+            .collapsible(false)
+            .resizable(false)
+            .default_width(width)
+            .min_width(width)
+            .max_width(width)
+            .anchor(egui::Align2::CENTER_TOP, egui::vec2(0.0, 0.0))
+            .show(ctx, |ui| {
+                egui::ScrollArea::vertical()
+                    .max_height((screen.height() * 0.6).max(200.0))
+                    .auto_shrink([false, true])
+                    .show(ui, |ui| {
+                        ui.set_max_width(width);
+                        if self.recent_file_paths.is_empty() {
+                            ui.label("No recent files yet.");
+                        }
+                        for path in self.recent_file_paths.clone() {
+                            let name = path
+                                .file_name()
+                                .and_then(|n| n.to_str())
+                                .unwrap_or("(unknown)")
+                                .to_string();
+                            if ui
+                                .button(name)
+                                .on_hover_text(path.display().to_string())
+                                .clicked()
+                            {
+                                chosen = Some(path);
+                            }
+                        }
+                    });
+                ui.separator();
+                if ui.button("Clear Recent").clicked() {
+                    clear = true;
+                }
+            });
+
+        self.show_mobile_recent = open;
+        if clear {
+            self.recent_file_paths.clear();
+        }
+        if let Some(path) = chosen {
+            self.show_mobile_recent = false;
+            match self.start_audio_loading_from_path(path, ctx) {
+                Ok(()) => self.last_error = None,
+                Err(err) => self.last_error = Some(err),
+            }
+        }
     }
 
     #[cfg(feature = "desktop-ui")]
@@ -1067,14 +1231,27 @@ impl KeyScribeApp {
         let mut close_requested = false;
         let mut run_separation_requested = false;
 
+        let screen = ctx.screen_rect();
+        let modal_w = if self.is_touch_platform() {
+            (screen.width() * 0.92).clamp(260.0, 520.0)
+        } else {
+            520.0
+        };
+
         egui::Window::new("MVSep Cloud Stem Separation — API Key")
             .id(egui::Id::new("mvsep_api_key_modal"))
             .open(&mut keep_open)
-            .default_width(520.0)
+            .default_width(modal_w)
+            .min_width(modal_w)
+            .max_width(modal_w)
             .collapsible(false)
             .resizable(false)
             .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
             .show(ctx, |ui| {
+                egui::ScrollArea::vertical()
+                    .max_height((screen.height() * 0.7).max(220.0))
+                    .auto_shrink([false, true])
+                    .show(ui, |ui| {
                 ui.label(
                     egui::RichText::new("What is MVSep?")
                         .strong()
@@ -1125,7 +1302,7 @@ impl KeyScribeApp {
                         egui::TextEdit::singleline(&mut input)
                             .password(!self.mvsep_api_key_visible)
                             .hint_text("Paste your MVSep API token here...")
-                            .desired_width(320.0),
+                            .desired_width((modal_w - 150.0).clamp(140.0, 320.0)),
                     );
                     if resp.changed() || resp.lost_focus() {
                         self.mvsep_api_key = input;
@@ -1136,6 +1313,18 @@ impl KeyScribeApp {
                     let toggle_icon = if self.mvsep_api_key_visible { "Hide" } else { "Show" };
                     if ui.small_button(toggle_icon).clicked() {
                         self.mvsep_api_key_visible = !self.mvsep_api_key_visible;
+                    }
+
+                    #[cfg(target_os = "android")]
+                    if ui.small_button("Paste").clicked() {
+                        if let Some(text) = crate::android::get_clipboard() {
+                            let text = text.trim().to_string();
+                            if !text.is_empty() {
+                                self.mvsep_api_key = text;
+                                self.mvsep_verify_message = None;
+                                self.save_state_to_disk();
+                            }
+                        }
                     }
                 });
 
@@ -1186,6 +1375,7 @@ impl KeyScribeApp {
                         close_requested = true;
                     }
                 });
+                    });
             });
 
         if close_requested {
@@ -1585,10 +1775,18 @@ impl KeyScribeApp {
         egui::TopBottomPanel::top("controls")
             .show_separator_line(true)
             .show(ctx, |ui| {
+            if self.safe_top_points > 0.0 {
+                ui.add_space(self.safe_top_points);
+            }
+            let controls_vpad = if self.is_touch_platform() {
+                2.0
+            } else {
+                CONTROLS_PANEL_VERTICAL_PADDING
+            };
             egui::Frame::none()
                 .inner_margin(egui::Margin::symmetric(
                     CONTROLS_PANEL_HORIZONTAL_PADDING,
-                    CONTROLS_PANEL_VERTICAL_PADDING,
+                    controls_vpad,
                 ))
                 .show(ui, |ui| {
                     #[cfg(feature = "desktop-ui")]
@@ -1599,49 +1797,45 @@ impl KeyScribeApp {
                     #[cfg(not(feature = "desktop-ui"))]
                     ui.horizontal_wrapped(|ui| {
                         ui.spacing_mut().item_spacing.x = 12.0;
-                        if ui.button("Open Audio").clicked() {
-                            self.import_audio_with_ctx(ctx);
-                        }
+                        if self.is_touch_platform() {
+                            // Mobile toolbar: import, recent, settings.
+                            if icon_button(ui, FILE_AUDIO, "Open Audio", true).clicked() {
+                                self.import_audio_with_ctx(ctx);
+                            }
+                            if icon_button(ui, CLOCK_COUNTER_CLOCKWISE, "Recent", true).clicked() {
+                                self.show_mobile_recent = true;
+                            }
+                            if icon_button(ui, GEAR, "Settings", true).clicked() {
+                                self.show_mobile_settings = !self.show_mobile_settings;
+                            }
+                        } else {
+                            if ui.button("Open Audio").clicked() {
+                                self.import_audio_with_ctx(ctx);
+                            }
 
-                        let settings_popup_id = ui.make_persistent_id("settings_popup_menu");
-                        let settings_response = icon_button(ui, GEAR, "Settings", true);
-                        if settings_response.clicked() {
-                            ui.memory_mut(|mem| mem.toggle_popup(settings_popup_id));
-                        }
-                        egui::popup::popup_below_widget(
-                            ui,
-                            settings_popup_id,
-                            &settings_response,
-                            |ui| {
-                                self.draw_settings_menu(ui);
-                            },
-                        );
+                            let settings_popup_id = ui.make_persistent_id("settings_popup_menu");
+                            let settings_response = icon_button(ui, GEAR, "Settings", true);
+                            if settings_response.clicked() {
+                                ui.memory_mut(|mem| mem.toggle_popup(settings_popup_id));
+                            }
+                            egui::popup::popup_below_widget(
+                                ui,
+                                settings_popup_id,
+                                &settings_response,
+                                |ui| {
+                                    self.draw_settings_menu(ui);
+                                },
+                            );
 
-                        if ui.button("Help").clicked() {
-                            self.show_shortcuts_help_modal = true;
+                            if ui.button("Help").clicked() {
+                                self.show_shortcuts_help_modal = true;
+                            }
                         }
                     });
 
-                    if self.is_touch_platform() {
-                        ui.horizontal_wrapped(|ui| {
-                            ui.label("Touch Navigation");
-                            if ui
-                                .selectable_label(!self.touch_loop_select_mode, "Pan")
-                                .clicked()
-                            {
-                                self.touch_loop_select_mode = false;
-                            }
-                            if ui
-                                .selectable_label(self.touch_loop_select_mode, "Loop Select")
-                                .clicked()
-                            {
-                                self.touch_loop_select_mode = true;
-                            }
-                            ui.label("Tap to seek, drag to pan, pinch to zoom.");
-                        });
-                    }
-
-                    #[cfg(not(feature = "desktop-ui"))]
+                    // Manual path entry is a desktop/Linux fallback; mobile
+                    // imports through the in-app audio browser instead.
+                    #[cfg(all(not(feature = "desktop-ui"), not(target_os = "android")))]
                     ui.horizontal_wrapped(|ui| {
                         ui.label("Audio Path");
                         let open_button_width = 56.0;
@@ -1760,9 +1954,10 @@ impl KeyScribeApp {
                                         ui.add(
                                             egui::ProgressBar::new(ratio)
                                                 .desired_width(ui.available_width().max(140.0))
+                                                .desired_height(10.0)
                                                 .animate(animate),
                                         );
-                                        ui.label(detail);
+                                        ui.label(egui::RichText::new(detail).small());
                                     });
                                 } else {
                                     ui.horizontal(|ui| {
@@ -1780,6 +1975,7 @@ impl KeyScribeApp {
                                         ui.add(
                                             egui::ProgressBar::new(ratio)
                                                 .desired_width(progress_width)
+                                                .desired_height(10.0)
                                                 .animate(animate),
                                         );
                                         ui.add_sized(

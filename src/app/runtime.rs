@@ -1,5 +1,41 @@
 use super::*;
 
+/// One compact touch settings cell: a label, a small accent slider, and the
+/// numeric value. The slider rail fills with the user's accent color up to the
+/// current value, and the handle is small (like the seek bar).
+fn compact_setting_slider(
+    ui: &mut egui::Ui,
+    id: impl std::hash::Hash,
+    label: &str,
+    value: &mut f32,
+    min: f32,
+    max: f32,
+    default: f32,
+    bipolar: bool,
+    decimals: usize,
+    accent: egui::Color32,
+) -> bool {
+    ui.vertical_centered(|ui| {
+        ui.label(egui::RichText::new(label).size(12.0));
+        // Fill the column width so the two columns are evenly distributed.
+        let width = (ui.available_width() - 12.0).clamp(90.0, 240.0);
+        let changed = crate::ui::widgets::accent_slider(
+            ui,
+            id,
+            value,
+            min,
+            max,
+            default,
+            bipolar,
+            egui::vec2(width, 16.0),
+            accent,
+        );
+        ui.label(egui::RichText::new(format!("{:.*}", decimals, *value)).size(11.0));
+        changed
+    })
+    .inner
+}
+
 impl KeyScribeApp {
     pub(super) fn lock_startup_min_window_size_once(&mut self, _ctx: &egui::Context) {
         if self.startup_min_window_size_locked {
@@ -12,7 +48,7 @@ impl KeyScribeApp {
     }
 
     pub(super) fn is_touch_platform(&self) -> bool {
-        false
+        cfg!(any(target_os = "android", target_os = "ios"))
     }
 
     pub(super) fn apply_mobile_ui_tweaks_once(&mut self, ctx: &egui::Context) {
@@ -21,21 +57,106 @@ impl KeyScribeApp {
         }
 
         let mut style = (*ctx.style()).clone();
-        style.spacing.interact_size.x = style.spacing.interact_size.x.max(42.0);
-        style.spacing.interact_size.y = style.spacing.interact_size.y.max(42.0);
-        style.spacing.slider_width = style.spacing.slider_width.max(176.0);
-        style.spacing.item_spacing.x = style.spacing.item_spacing.x.max(10.0);
-        style.spacing.item_spacing.y = style.spacing.item_spacing.y.max(UI_VSPACE_MEDIUM);
+        // Touch-friendly hit targets, kept compact: the top controls and
+        // progress rows otherwise eat a lot of vertical space, and the slider
+        // handle radius is derived from the widget height.
+        style.spacing.interact_size.x = style.spacing.interact_size.x.max(34.0);
+        style.spacing.interact_size.y = style.spacing.interact_size.y.max(26.0);
+        style.spacing.slider_width = style.spacing.slider_width.max(140.0);
+        style.spacing.item_spacing.x = style.spacing.item_spacing.x.max(6.0);
+        style.spacing.item_spacing.y = style.spacing.item_spacing.y.max(UI_VSPACE_TIGHT);
 
         style
             .text_styles
-            .insert(egui::TextStyle::Button, egui::FontId::proportional(18.0));
+            .insert(egui::TextStyle::Button, egui::FontId::proportional(13.0));
         style
             .text_styles
-            .insert(egui::TextStyle::Body, egui::FontId::proportional(17.0));
+            .insert(egui::TextStyle::Body, egui::FontId::proportional(12.0));
+        style
+            .text_styles
+            .insert(egui::TextStyle::Small, egui::FontId::proportional(10.5));
+
+        // Touch has no hover, so tooltips only pop up accidentally on taps.
+        // A huge delay makes egui never consider them ready to show.
+        style.interaction.tooltip_delay = 1.0e9;
 
         ctx.set_style(style);
         self.mobile_ui_tweaks_applied = true;
+    }
+
+    /// Compact keyboard-settings panel for touch layouts: a 2x2 grid of small
+    /// sliders inside a bounded scroll area, so opening the cog never pushes
+    /// the piano or media controls off-screen.
+    pub(super) fn draw_keyboard_settings_compact(&mut self, ui: &mut egui::Ui) {
+        let max_h = (ui.ctx().screen_rect().height() * 0.30).max(104.0);
+        let mut visuals_changed = false;
+        let accent = self.highlight_color;
+
+        egui::ScrollArea::vertical()
+            .max_height(max_h)
+            .auto_shrink([false, true])
+            .show(ui, |ui| {
+                ui.spacing_mut().item_spacing = egui::vec2(10.0, 8.0);
+
+                // Two even columns (via `columns`) so the sliders spread across
+                // the full width instead of packing to the left.
+                ui.columns(2, |cols| {
+                    // Narrower, precise ranges tuned for touch, with the
+                    // accent-colored fill showing how far each has moved.
+                    visuals_changed |= compact_setting_slider(
+                        &mut cols[0],
+                        ("kb_key_sens", 0),
+                        "Key Sensitivity",
+                        &mut self.key_color_sensitivity,
+                        0.0,
+                        0.55,
+                        default_key_color_sensitivity(),
+                        false,
+                        2,
+                        accent,
+                    );
+                    visuals_changed |= compact_setting_slider(
+                        &mut cols[1],
+                        ("kb_highlight", 1),
+                        "Highlight Time (s)",
+                        &mut self.key_highlight_max_sec,
+                        0.0,
+                        0.3,
+                        default_key_highlight_max_sec(),
+                        false,
+                        2,
+                        accent,
+                    );
+                    visuals_changed |= compact_setting_slider(
+                        &mut cols[0],
+                        ("kb_vis_offset", 2),
+                        "Vis Offset (ms)",
+                        &mut self.visualization_timing_offset_ms,
+                        -100.0,
+                        100.0,
+                        default_visualization_timing_offset_ms(),
+                        true,
+                        0,
+                        accent,
+                    );
+                    visuals_changed |= compact_setting_slider(
+                        &mut cols[1],
+                        ("kb_piano_zoom", 3),
+                        "Piano Zoom",
+                        &mut self.piano_zoom,
+                        PIANO_ZOOM_MIN,
+                        PIANO_ZOOM_MAX,
+                        1.0,
+                        false,
+                        2,
+                        accent,
+                    );
+                });
+            });
+
+        if visuals_changed {
+            self.update_note_probabilities(true);
+        }
     }
 
     pub(super) fn is_playing(&self) -> bool {
@@ -595,6 +716,7 @@ impl KeyScribeApp {
     }
 
     #[cfg(not(feature = "desktop-ui"))]
+    #[allow(dead_code)] // Android uses the native picker instead.
     pub(super) fn import_audio_from_manual_path(&mut self, ctx: &egui::Context) {
         let path = self.manual_import_path.trim();
         if path.is_empty() {
@@ -617,7 +739,15 @@ impl KeyScribeApp {
         self.spawn_file_dialog(ctx, FileDialogRequest::OpenAudio);
     }
 
-    #[cfg(not(feature = "desktop-ui"))]
+    #[cfg(all(not(feature = "desktop-ui"), target_os = "android"))]
+    pub(super) fn import_audio_with_ctx(&mut self, ctx: &egui::Context) {
+        let _ = ctx;
+        // Native Storage Access Framework picker; the result arrives via the
+        // `MainActivity` JNI callback and is polled in `update`.
+        crate::android::pick_audio_file();
+    }
+
+    #[cfg(all(not(feature = "desktop-ui"), not(target_os = "android")))]
     pub(super) fn import_audio_with_ctx(&mut self, ctx: &egui::Context) {
         self.import_audio_from_manual_path(ctx);
     }

@@ -43,8 +43,16 @@ vendor/ort-gpu/*.dll
 vendor/ort-gpu/*.whl
 vendor/onnxruntime/*.dll
 
+# ONNX Runtime Android AAR (downloaded by scripts/fetch-onnxruntime-android.ps1);
+# the extracted android/libs/<abi>/libonnxruntime.so is kept in-tree.
+vendor/onnxruntime-android/
+
 # Flatpak build cache (downloaded sources, build trees, ccache) — generated
 # by flatpak-builder in the repo root, not committed
 .flatpak-builder/
 # Flatpak bundle outputs
 *.flatpak
+
+# Built Android artifacts (shareable APKs)
+dist/
+*.apk

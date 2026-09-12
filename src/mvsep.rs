@@ -162,7 +162,7 @@ pub fn detect_output_format(file_path: &Path) -> (&'static str, &'static str) {
 /// 3. `.env` in the current working directory (dev convenience).
 /// 4. `.env` next to the executable (portable installs).
 pub fn find_mvsep_api_key() -> Option<String> {
-    // 1. Process environment variable
+    // 1. Process environment variable (explicit override).
     if let Ok(key) = std::env::var("MVSEP_API_KEY") {
         let trimmed = key.trim().to_string();
         if !trimmed.is_empty() {
@@ -170,14 +170,18 @@ pub fn find_mvsep_api_key() -> Option<String> {
         }
     }
 
-    // 2-4. Local .env files (user store first, then CWD, then exe dir).
+    // 2. OS/device keystore (Android Keystore / Windows DPAPI).
+    if let Some(key) = crate::secrets::load() {
+        return Some(key);
+    }
+
+    // 3-5. Legacy plaintext `.env` files. Migrate into the keystore on hit.
     let mut search_dirs: Vec<PathBuf> = Vec::new();
     if let Some(user_env) = user_dotenv_path() {
         if let Some(parent) = user_env.parent() {
             search_dirs.push(parent.to_path_buf());
         }
     }
-    // 2. Search for a local .env file in current working directory and exe parent directory
     search_dirs.push(std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
     if let Some(exe_parent) = std::env::current_exe()
         .ok()
@@ -190,12 +194,46 @@ pub fn find_mvsep_api_key() -> Option<String> {
         let env_path = dir.join(".env");
         if env_path.is_file() {
             if let Some(key) = parse_dotenv_api_key(&env_path) {
+                // One-time migration away from plaintext, when a keystore exists.
+                if crate::secrets::store(&key).is_ok() {
+                    remove_legacy_dotenv_key();
+                }
                 return Some(key);
             }
         }
     }
 
     None
+}
+
+/// Persist the API key using the platform keystore, falling back to the
+/// legacy user `.env` file only when no OS keystore is available. An empty
+/// key clears both stores.
+pub fn save_mvsep_api_key(key: &str) -> Result<()> {
+    let key = key.trim();
+    if key.is_empty() {
+        let _ = crate::secrets::clear();
+        remove_legacy_dotenv_key();
+        return Ok(());
+    }
+    match crate::secrets::store(key) {
+        Ok(()) => {
+            // Remove any legacy plaintext copy.
+            remove_legacy_dotenv_key();
+            Ok(())
+        }
+        Err(_) => save_mvsep_api_key_to_dotenv(key),
+    }
+}
+
+/// Delete a legacy plaintext `.env` entry, but only if the file exists (so we
+/// never create an empty `.env`).
+fn remove_legacy_dotenv_key() {
+    if let Some(path) = user_dotenv_path() {
+        if path.is_file() {
+            let _ = save_mvsep_api_key_to_dotenv("");
+        }
+    }
 }
 
 /// Parse `MVSEP_API_KEY` out of a dotenv file. Returns `None` when absent.
@@ -228,6 +266,11 @@ fn parse_dotenv_api_key(env_path: &Path) -> Option<String> {
 /// Linux), never next to the executable (read-only in AppImage/Flatpak) and
 /// never inside the repo, so keys cannot be committed by accident.
 pub fn user_dotenv_path() -> Option<PathBuf> {
+    // Android has no home/XDG dirs, so `directories` either returns None or an
+    // unusable path; use the app-private files dir instead.
+    if let Some(dir) = crate::platform::data_dir() {
+        return Some(dir.join(".env"));
+    }
     directories::ProjectDirs::from("com", "Frantzes", "KeyScribe")
         .map(|d| d.data_local_dir().join(".env"))
 }

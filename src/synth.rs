@@ -625,6 +625,10 @@ pub fn write_wav(path: &Path, samples: &[f32], sample_rate: u32) -> Result<()> {
 
 /// Write interleaved stereo f32 samples to an MP3 via LAME (compiled from
 /// source by `mp3lame-encoder`, no external encoder binary needed).
+///
+/// Disabled on builds without the `mp3-encode` feature (e.g. Android), where
+/// the bundled LAME C sources cannot be cross-compiled.
+#[cfg(feature = "mp3-encode")]
 pub fn write_mp3(path: &Path, samples: &[f32], sample_rate: u32) -> Result<()> {
     if let Some(parent) = path.parent() {
         if !parent.as_os_str().is_empty() {
@@ -662,6 +666,11 @@ pub fn write_mp3(path: &Path, samples: &[f32], sample_rate: u32) -> Result<()> {
 
     std::fs::write(path, &out)?;
     Ok(())
+}
+
+#[cfg(not(feature = "mp3-encode"))]
+pub fn write_mp3(_path: &Path, _samples: &[f32], _sample_rate: u32) -> Result<()> {
+    anyhow::bail!("MP3 export is not available in this build")
 }
 
 #[cfg(test)]

@@ -732,28 +732,7 @@ fn preload_cuda_dylibs() {
 /// deciding whether the stem-first melody default is available (falling back to
 /// full-mix melody when it isn't).
 pub(crate) fn resolve_model_path(filename: &str) -> Option<PathBuf> {
-    if let Ok(exe) = std::env::current_exe() {
-        if let Some(parent) = exe.parent() {
-            let p = parent.join("models").join(filename);
-            if p.exists() {
-                return Some(p);
-            }
-            // Some dev layouts keep models at the repo root next to the target dir.
-            let p2 = parent.join(filename);
-            if p2.exists() {
-                return Some(p2);
-            }
-        }
-    }
-    let cwd = PathBuf::from("models").join(filename);
-    if cwd.exists() {
-        return Some(cwd);
-    }
-    let cwd2 = PathBuf::from(filename);
-    if cwd2.exists() {
-        return Some(cwd2);
-    }
-    None
+    crate::platform::resolve_model_path(filename)
 }
 
 #[cfg(test)]

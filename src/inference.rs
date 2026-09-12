@@ -54,19 +54,19 @@ pub(crate) fn ensure_onnxruntime_loadable() -> Result<()> {
             tried.push(PathBuf::from(s.trim()));
         }
     }
-    let lib_name = if cfg!(target_os = "windows") {
-        "onnxruntime.dll"
-    } else if cfg!(target_os = "linux") {
-        "libonnxruntime.so"
-    } else {
-        "libonnxruntime.dylib"
-    };
+    let lib_name = crate::platform::onnxruntime_lib_name();
     if let Ok(exe) = std::env::current_exe() {
         if let Some(parent) = exe.parent() {
             tried.push(parent.join(lib_name));
         }
     }
     tried.push(PathBuf::from(lib_name));
+    // Android: the APK's native libraries (including libonnxruntime.so) are
+    // extracted to the app's native lib dir, which the dynamic linker already
+    // searches for bare names. Also probe it explicitly when known.
+    if let Some(lib_dir) = crate::platform::android_native_lib_dir() {
+        tried.push(lib_dir.join(lib_name));
+    }
 
     if tried.iter().any(|p| probe(p)) {
         return Ok(());
@@ -100,16 +100,10 @@ pub(crate) fn init_ort_environment() {
     static INIT: Once = Once::new();
 
     INIT.call_once(|| {
-        let lib_name = if cfg!(target_os = "windows") {
-            "onnxruntime.dll"
-        } else if cfg!(target_os = "linux") {
-            "libonnxruntime.so"
-        } else {
-            "libonnxruntime.dylib"
-        };
+        let lib_name = crate::platform::onnxruntime_lib_name();
 
         // Search for the library next to the executable, then in the
-        // working directory.
+        // working directory, then in the Android APK native lib dir.
         let mut lib_path: Option<PathBuf> = None;
         if let Ok(exe) = std::env::current_exe() {
             if let Some(parent) = exe.parent() {
@@ -123,6 +117,14 @@ pub(crate) fn init_ort_environment() {
             let p = PathBuf::from(lib_name);
             if p.exists() {
                 lib_path = Some(p);
+            }
+        }
+        if lib_path.is_none() {
+            if let Some(dir) = crate::platform::android_native_lib_dir() {
+                let p = dir.join(lib_name);
+                if p.exists() {
+                    lib_path = Some(p);
+                }
             }
         }
 

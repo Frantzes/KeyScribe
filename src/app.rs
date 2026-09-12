@@ -37,6 +37,8 @@ use crate::ui::utils::{accent_soft, color_to_hex, parse_hex_color, push_recent_c
 #[cfg(not(feature = "desktop-ui"))]
 use crate::ui::widgets::icon_button;
 
+#[cfg(target_os = "android")]
+mod android_ui;
 mod cache;
 mod export;
 mod loading;
@@ -476,6 +478,11 @@ fn is_running_from_macos_app_bundle() -> bool {
 }
 
 fn app_data_dir() -> PathBuf {
+    // Android hands us the app-private files dir at startup; there is no
+    // meaningful executable/CWD layout in the sandbox.
+    if let Some(dir) = crate::platform::data_dir() {
+        return dir;
+    }
     if is_running_from_macos_app_bundle() {
         if let Some(project_dirs) = app_project_dirs() {
             return project_dirs.data_local_dir().to_path_buf();
@@ -500,6 +507,10 @@ fn app_data_dir() -> PathBuf {
 }
 
 pub(crate) fn app_cache_base_dir() -> PathBuf {
+    // Android: use the app-private cache dir (evictable, but always writable).
+    if let Some(dir) = crate::platform::cache_dir() {
+        return dir;
+    }
     if is_running_from_macos_app_bundle() {
         if let Some(project_dirs) = app_project_dirs() {
             return project_dirs.cache_dir().to_path_buf();
@@ -1177,6 +1188,9 @@ pub struct KeyScribeApp {
     probability_panel_height: f32,
     piano_panel_height: f32,
     video_panel_height: f32,
+    /// Measured height of the drawn media-controls card, so the reserved
+    /// footer space can shrink to the real content (no dead gap below it).
+    media_controls_content_h: f32,
     piano_panel_height_needs_init: bool,
     piano_scroll_px: f32,
     piano_has_focus: bool,
@@ -1264,7 +1278,20 @@ pub struct KeyScribeApp {
     touch_loop_select_mode: bool,
     manual_import_path: String,
     mobile_ui_tweaks_applied: bool,
+    /// System-bar insets (logical points) applied on mobile; 0 elsewhere.
+    safe_top_points: f32,
+    safe_bottom_points: f32,
+    #[cfg(target_os = "android")]
+    android_picker_open: bool,
+    #[cfg(target_os = "android")]
+    android_picker_entries: Vec<(String, String)>,
+    #[cfg(target_os = "android")]
+    android_picker_status: Option<String>,
+    #[cfg(target_os = "android")]
+    android_media_permission: bool,
     show_shortcuts_help_modal: bool,
+    show_mobile_settings: bool,
+    show_mobile_recent: bool,
     auto_separate: bool,
     // Sheet music mode and stem source selectors
     sheet_music_mode: SheetMusicMode,
@@ -1531,7 +1558,14 @@ enum RebuildMode {
 impl KeyScribeApp {
     pub fn new(_cc: &eframe::CreationContext<'_>) -> Self {
         let (persisted, had_saved_state) = load_persisted_state();
-        let startup_path = persisted.last_file.clone();
+        #[allow(unused_mut)]
+        let mut startup_path = persisted.last_file.clone();
+        // Android: allow an external `_keyscribe_autoload.txt` to request an
+        // import when no last file is remembered (used by device tests).
+        #[cfg(target_os = "android")]
+        if startup_path.is_none() {
+            startup_path = crate::platform::android_autoload_path();
+        }
         let mut recent_file_paths = persisted.recent_files.clone();
         if recent_file_paths.is_empty() {
             if let Some(path) = startup_path.as_ref() {
@@ -1633,6 +1667,7 @@ impl KeyScribeApp {
             probability_panel_height: persisted.probability_panel_height.clamp(0.0, 5000.0),
             piano_panel_height: persisted.piano_panel_height.clamp(80.0, 5000.0),
             video_panel_height: persisted.video_panel_height.clamp(100.0, 5000.0),
+            media_controls_content_h: 0.0,
             piano_panel_height_needs_init: true,
             piano_scroll_px: 0.0,
             piano_has_focus: false,
@@ -1719,7 +1754,19 @@ impl KeyScribeApp {
             touch_loop_select_mode: false,
             manual_import_path: String::new(),
             mobile_ui_tweaks_applied: false,
+            safe_top_points: 0.0,
+            safe_bottom_points: 0.0,
+            #[cfg(target_os = "android")]
+            android_picker_open: false,
+            #[cfg(target_os = "android")]
+            android_picker_entries: Vec::new(),
+            #[cfg(target_os = "android")]
+            android_picker_status: None,
+            #[cfg(target_os = "android")]
+            android_media_permission: false,
             show_shortcuts_help_modal: false,
+            show_mobile_settings: false,
+            show_mobile_recent: false,
             auto_separate: persisted.auto_separate,
             sheet_music_mode: SheetMusicMode::LeadSheet,
             melody_stem_indices: std::collections::BTreeSet::new(),
@@ -1769,6 +1816,61 @@ impl KeyScribeApp {
             marker_edit_str: String::new(),
             streaming_stretch: None,
         };
+
+        #[cfg(target_os = "android")]
+        crate::android::log_info(&format!(
+            "[mvsep] loaded key len={} (from state/env)",
+            app.mvsep_api_key.len()
+        ));
+
+        // Android automation hooks for device tests (inert unless a marker
+        // file exists in the app's external files dir).
+        #[cfg(target_os = "android")]
+        {
+            if crate::platform::android_picker_requested() {
+                app.android_open_picker();
+            }
+            match crate::platform::android_automation_marker().as_deref() {
+                Some(marker) if marker.starts_with("clipboard:") => {
+                    crate::android::set_clipboard(&marker["clipboard:".len()..]);
+                }
+                Some("picker") => app.android_open_picker(),
+                Some("pick") => crate::android::pick_audio_file(),
+                Some("settings") => app.show_mobile_settings = true,
+                Some("recent") => app.show_mobile_recent = true,
+                Some("cleancache") => app.clean_analysis_cache(),
+                Some("pianocog") => {
+                    app.show_piano_settings = true;
+                    #[cfg(target_os = "android")]
+                    crate::android::log_info("[automation] pianocog -> show_piano_settings=true");
+                }
+                Some(marker) if marker.starts_with("zoom:") => {
+                    if let Ok(z) = marker["zoom:".len()..].parse::<f32>() {
+                        app.piano_zoom = z.clamp(
+                            crate::ui::keyboard::PIANO_ZOOM_MIN,
+                            crate::ui::keyboard::PIANO_ZOOM_MAX,
+                        );
+                    }
+                }
+                Some(marker) if marker.starts_with("mvsepkey:") => {
+                    let key = marker["mvsepkey:".len()..].trim().to_string();
+                    let _ = crate::mvsep::save_mvsep_api_key(&key);
+                    app.mvsep_key_last_persisted = key.clone();
+                    app.mvsep_api_key = key;
+                }
+                Some("paste") => {
+                    if let Some(text) = crate::android::get_clipboard() {
+                        let text = text.trim().to_string();
+                        if !text.is_empty() {
+                            app.mvsep_api_key = text;
+                        }
+                    }
+                    app.show_mobile_settings = true;
+                }
+                Some("mvsep") => app.show_mvsep_api_key_modal = true,
+                _ => {}
+            }
+        }
 
         // Apply tuned pipeline parameters (written by `keyscribe-cli tune`)
         // ONLY on first run (no saved state found), so the GUI matches the

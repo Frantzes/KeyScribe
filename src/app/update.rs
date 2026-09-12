@@ -23,6 +23,24 @@ impl eframe::App for KeyScribeApp {
         self.lock_startup_min_window_size_once(ctx);
         self.apply_mobile_ui_tweaks_once(ctx);
 
+        // Mobile: keep content clear of the status bar / gesture area.
+        #[cfg(target_os = "android")]
+        if self.is_touch_platform() {
+            // Use the real WindowInsets: the native content rect is reported
+            // with an inflated top on some OEM ROMs.
+            let ppp = ctx.pixels_per_point().max(0.01);
+            if let Some((top_px, bottom_px)) = crate::android::system_bar_insets_px() {
+                self.safe_top_points = (top_px as f32 / ppp).max(8.0);
+                self.safe_bottom_points = (bottom_px as f32 / ppp).max(8.0);
+            }
+        }
+
+        if self.is_touch_platform() {
+            // Navigation mode follows the loop state: pan by default, and
+            // switch to loop-select while an A-B loop is active.
+            self.touch_loop_select_mode = self.loop_enabled;
+        }
+
         let wants_keyboard = ctx.wants_keyboard_input();
         let (space_pressed, k_pressed, left_pressed, right_pressed, m_pressed, l_pressed, ctrl_held) = ctx.input(|i| {
             if wants_keyboard {
@@ -113,6 +131,15 @@ impl eframe::App for KeyScribeApp {
 
         self.poll_audio_loading(ctx);
 
+        // Android: import a file chosen in the native document picker.
+        #[cfg(target_os = "android")]
+        if let Some(path) = crate::android::poll_picked_audio() {
+            match self.start_audio_loading_from_path(PathBuf::from(path), ctx) {
+                Ok(()) => self.last_error = None,
+                Err(err) => self.last_error = Some(err),
+            }
+        }
+
         // Auto-run separation once audio is fully loaded (not during streaming).
         // When auto_separate is disabled we still load an existing cache so
         // previously-separated stems are available on reopen; we only skip
@@ -191,6 +218,14 @@ impl eframe::App for KeyScribeApp {
 
         self.draw_top_controls_panel(ctx);
 
+        #[cfg(target_os = "android")]
+        self.draw_android_import(ctx);
+
+        if self.is_touch_platform() {
+            self.draw_mobile_settings_window(ctx);
+            self.draw_mobile_recent_window(ctx);
+        }
+
         self.piano_panel_height_needs_init = false;
         if self.audio_raw.is_some() {
             let piano_panel_builder = egui::TopBottomPanel::bottom("piano_panel")
@@ -242,34 +277,39 @@ impl eframe::App for KeyScribeApp {
                 self.probability_panel_height = prob_strip_height;
 
                 // Drag handle: drag up to shrink keys+probabilities together.
-                let drag_h = 6.0;
-                let drag_w = ui.available_width();
-                let (drag_rect, drag_resp) =
-                    ui.allocate_exact_size(egui::vec2(drag_w, drag_h), egui::Sense::drag());
-                if drag_resp.hovered() || drag_resp.dragged() {
-                    ui.ctx().set_cursor_icon(egui::CursorIcon::ResizeVertical);
+                // Hidden on touch, where the dead strip above the probability
+                // pane is more valuable as waveform space.
+                if !self.is_touch_platform() {
+                    let drag_h = 6.0;
+                    let drag_w = ui.available_width();
+                    let (drag_rect, drag_resp) =
+                        ui.allocate_exact_size(egui::vec2(drag_w, drag_h), egui::Sense::drag());
+                    if drag_resp.hovered() || drag_resp.dragged() {
+                        ui.ctx().set_cursor_icon(egui::CursorIcon::ResizeVertical);
+                    }
+                    if drag_resp.dragged() {
+                        let delta_scale =
+                            (-drag_resp.drag_delta().y) / ideal_total_visual_h.max(40.0);
+                        self.piano_scale =
+                            (self.piano_scale + delta_scale).clamp(0.25, 1.0);
+                    }
+                    let drag_color = if drag_resp.hovered() || drag_resp.dragged() {
+                        self.highlight_color
+                    } else {
+                        egui::Color32::from_gray(64)
+                    };
+                    ui.painter().rect_filled(
+                        egui::Rect::from_center_size(
+                            drag_rect.center(),
+                            egui::vec2(drag_rect.width() * 0.3, drag_h.max(2.0)),
+                        ),
+                        2.0,
+                        drag_color,
+                    );
                 }
-                if drag_resp.dragged() {
-                    let delta_scale =
-                        (-drag_resp.drag_delta().y) / ideal_total_visual_h.max(40.0);
-                    self.piano_scale =
-                        (self.piano_scale + delta_scale).clamp(0.25, 1.0);
-                }
-                let drag_color = if drag_resp.hovered() || drag_resp.dragged() {
-                    self.highlight_color
-                } else {
-                    egui::Color32::from_gray(64)
-                };
-                ui.painter().rect_filled(
-                    egui::Rect::from_center_size(
-                        drag_rect.center(),
-                        egui::vec2(drag_rect.width() * 0.3, drag_h.max(2.0)),
-                    ),
-                    2.0,
-                    drag_color,
-                );
 
                 let mut max_scroll_px: f32 = 0.0;
+                let mut prob_rect: Option<egui::Rect> = None;
                 if self.show_note_hist_window && note_visuals_ready {
                     let prob_draw = draw_probability_pane(
                         ui,
@@ -282,25 +322,43 @@ impl eframe::App for KeyScribeApp {
                         self.highlight_color,
                     );
                     max_scroll_px = max_scroll_px.max(prob_draw.max_scroll_px);
+                    prob_rect = Some(prob_draw.rect);
                     if self.show_chord_suggestions {
                         if let Some(chord) = &self.current_chord {
                             let pane = prob_draw.rect;
-                            let overlay_w = pane.width().min(280.0);
+                            let font = egui::FontId::proportional(26.0);
+                            let pad = egui::vec2(14.0, 8.0);
+                            // Size the backing plate to the text itself (not a
+                            // fixed 280 px) so it never covers more of the pane
+                            // than needed. It is pinned to the visible pane, so
+                            // it stays put while zooming/panning.
+                            let wrap_w = (pane.width() - 12.0 - pad.x * 2.0).max(40.0);
+                            let galley = ui.painter().layout(
+                                chord.clone(),
+                                font,
+                                egui::Color32::WHITE,
+                                wrap_w,
+                            );
+                            let size = egui::vec2(
+                                (galley.size().x + pad.x * 2.0).min(pane.width() - 12.0),
+                                (galley.size().y + pad.y * 2.0).min(pane.height() - 12.0),
+                            );
                             let overlay_rect = egui::Rect::from_min_size(
                                 egui::pos2(pane.left() + 6.0, pane.top() + 6.0),
-                                egui::vec2(overlay_w, pane.height() - 12.0),
+                                size,
                             );
                             let painter = ui.painter();
                             painter.rect_filled(
                                 overlay_rect,
                                 8.0,
-                                egui::Color32::from_rgba_unmultiplied(0, 0, 0, 153),
+                                egui::Color32::from_rgba_unmultiplied(0, 0, 0, 170),
                             );
-                            painter.text(
-                                egui::pos2(overlay_rect.left() + 10.0, overlay_rect.center().y),
-                                egui::Align2::LEFT_CENTER,
-                                chord,
-                                egui::FontId::proportional(26.0),
+                            painter.galley(
+                                egui::pos2(
+                                    overlay_rect.left() + pad.x,
+                                    overlay_rect.top() + pad.y,
+                                ),
+                                galley,
                                 egui::Color32::WHITE,
                             );
                         }
@@ -320,6 +378,8 @@ impl eframe::App for KeyScribeApp {
                     key_h_for_frame,
                     self.piano_scroll_px,
                     self.highlight_color,
+                    // The C4 marker is a reference dot; keep it small on touch.
+                    if self.is_touch_platform() { 2.25 } else { 4.0 },
                 );
                 max_scroll_px = max_scroll_px.max(piano_draw.max_scroll_px);
 
@@ -345,7 +405,23 @@ impl eframe::App for KeyScribeApp {
                     smooth.y
                 };
 
-                if self.piano_has_focus && pane_hovered {
+                // Pan/zoom only while the pointer is actually over the piano
+                // or probability pane — not the whole bottom panel, which also
+                // contains the settings sliders (dragging those must not pan).
+                let pointer_over_piano = pointer_pos
+                    .map(|pos| {
+                        piano_draw.rect.contains(pos)
+                            || prob_rect.map(|r| r.contains(pos)).unwrap_or(false)
+                    })
+                    .unwrap_or(false);
+
+                // Touching the piano/pane focuses it, so a drag pans
+                // immediately without needing a separate tap first.
+                if pointer_down && pointer_over_piano {
+                    self.piano_has_focus = true;
+                }
+
+                if self.piano_has_focus && pointer_over_piano {
                     if self.is_touch_platform() {
                         if pointer_down {
                             if let Some(pos) = pointer_pos {
@@ -385,7 +461,7 @@ impl eframe::App for KeyScribeApp {
                 // the keyboard settings sliders below. Hand-painted in a
                 // fixed-height row: a with_layout child Ui here makes the
                 // bottom panel's auto-height run away.
-                let cog_size = 30.0_f32;
+                let cog_size = if self.is_touch_platform() { 40.0_f32 } else { 34.0_f32 };
                 let row_w = ui.available_width();
                 let (cog_row_rect, _) =
                     ui.allocate_exact_size(egui::vec2(row_w, cog_size), egui::Sense::hover());
@@ -420,7 +496,7 @@ impl eframe::App for KeyScribeApp {
                     cog_rect.center(),
                     egui::Align2::CENTER_CENTER,
                     egui_phosphor::regular::GEAR,
-                    crate::ui::widgets::icon_font_id(16.0),
+                    crate::ui::widgets::icon_font_id(cog_size * 0.52),
                     cog_visuals.text_color(),
                 );
                 if cog.clicked() {
@@ -429,6 +505,9 @@ impl eframe::App for KeyScribeApp {
                 ui.add_space(UI_VSPACE_TIGHT);
                 ui.spacing_mut().item_spacing.y = default_item_spacing_y.min(UI_VSPACE_TIGHT);
                 if self.show_piano_settings {
+                if self.is_touch_platform() {
+                    self.draw_keyboard_settings_compact(ui);
+                } else {
                 egui::Frame::none()
                     .inner_margin(egui::Margin::symmetric(12.0, UI_VSPACE_TIGHT))
                     .show(ui, |ui| {
@@ -674,8 +753,12 @@ impl eframe::App for KeyScribeApp {
 
                     });
                 }
+                }
                 ui.add_space(UI_VSPACE_TIGHT);
                 ui.spacing_mut().item_spacing.y = default_item_spacing_y;
+                if self.safe_bottom_points > 0.0 {
+                    ui.add_space(self.safe_bottom_points);
+                }
             });
             self.piano_panel_height = piano_panel.response.rect.height().max(80.0);
             self.probability_panel_height = if self.show_note_hist_window && self.probability_panel_height > 0.0 {
@@ -703,16 +786,24 @@ impl eframe::App for KeyScribeApp {
                         ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
                     }
 
+                    let (import_title, import_hint) = if self.is_touch_platform() {
+                        ("Tap To Open Audio", "wav, mp3, flac, ogg, m4a, aac")
+                    } else {
+                        (
+                            "Click Or Drag Media File",
+                            "To Start Transcribing (Audio: wav, mp3, flac, ogg, m4a, aac | Video: mp4, mkv, mov, avi, webm)",
+                        )
+                    };
                     paint_audio_import_overlay(
                         ui.painter(),
                         import_surface_rect,
                         self.highlight_color,
                         168,
-                        "Click Or Drag Media File",
-                        "To Start Transcribing (Audio: wav, mp3, flac, ogg, m4a, aac | Video: mp4, mkv, mov, avi, webm)",
+                        import_title,
+                        import_hint,
                     );
 
-                    #[cfg(feature = "desktop-ui")]
+                    #[cfg(any(feature = "desktop-ui", target_os = "android"))]
                     if import_surface.clicked() {
                         self.import_audio_with_ctx(ctx);
                     }
@@ -762,9 +853,20 @@ impl eframe::App for KeyScribeApp {
                 let full_avail_h = ui.available_height().max(0.0);
                 let full_avail_w = ui.available_width();
                 let footer_w = (full_avail_w - gutter * 2.0).max(0.0);
-                let media_h = media_controls_height_for_width(footer_w);
+                let preferred_media_h = media_controls_height_for_width(footer_w);
+                // On touch, use the measured card height so no dead space is
+                // reserved below the media controls — the card then sits flush
+                // against the piano panel and the waveform gets the extra room.
+                let media_h = if self.is_touch_platform() && self.media_controls_content_h > 1.0 {
+                    self.media_controls_content_h
+                        .clamp(80.0, preferred_media_h)
+                } else {
+                    preferred_media_h
+                };
                 let gap = waveform_visual_gap;
-                let footer_total_h = media_h + gap * 2.0;
+                // Only the gap between the waveform and the media card; the
+                // card's bottom is flush with the panel bottom.
+                let footer_total_h = media_h + gap;
                 let content_h = (full_avail_h - footer_total_h).max(0.0);
 
                 let start_pos = ui.cursor().min;

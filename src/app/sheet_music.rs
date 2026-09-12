@@ -26,6 +26,7 @@ fn stem_value_row_job(
     eye_icon: &str,
     eye_color: egui::Color32,
     icon_gap: f32,
+    icon_size: f32,
 ) -> egui::text::LayoutJob {
     use crate::ui::widgets::icon_font_id;
 
@@ -35,7 +36,7 @@ fn stem_value_row_job(
         mute_icon,
         0.0,
         egui::text::TextFormat {
-            font_id: icon_font_id(11.0),
+            font_id: icon_font_id(icon_size),
             color: mute_color,
             ..Default::default()
         },
@@ -53,7 +54,7 @@ fn stem_value_row_job(
         eye_icon,
         icon_gap,
         egui::text::TextFormat {
-            font_id: icon_font_id(11.0),
+            font_id: icon_font_id(icon_size),
             color: eye_color,
             ..Default::default()
         },
@@ -85,6 +86,7 @@ mod stem_row_tests {
                     EYE,
                     egui::Color32::WHITE,
                     4.0,
+                    11.0,
                 )
             })
             .collect();
@@ -257,32 +259,39 @@ impl KeyScribeApp {
         // right_to_left, so the music note is added first to land on the
         // right.
         let active = self.main_content_tab;
-        if icon_toggle_button(
-            ui,
-            MUSIC_NOTE,
-            "Sheet music view (experimental, WIP)",
-            active == MainContentTab::SheetMusic,
-            true,
-            self.highlight_color,
-        )
-        .clicked()
-        {
-            self.main_content_tab = MainContentTab::SheetMusic;
-        }
-        if icon_toggle_button(
-            ui,
-            WAVEFORM,
-            "Waveform view",
-            active == MainContentTab::Waveform,
-            true,
-            self.highlight_color,
-        )
-        .clicked()
-        {
+        if self.is_touch_platform() {
+            // Mobile: sheet-music generation is not supported, so keep the
+            // view fixed on the waveform and hide the view toggles/separator.
             self.main_content_tab = MainContentTab::Waveform;
-        }
+            let _ = active;
+        } else {
+            if icon_toggle_button(
+                ui,
+                MUSIC_NOTE,
+                "Sheet music view (experimental, WIP)",
+                active == MainContentTab::SheetMusic,
+                true,
+                self.highlight_color,
+            )
+            .clicked()
+            {
+                self.main_content_tab = MainContentTab::SheetMusic;
+            }
+            if icon_toggle_button(
+                ui,
+                WAVEFORM,
+                "Waveform view",
+                active == MainContentTab::Waveform,
+                true,
+                self.highlight_color,
+            )
+            .clicked()
+            {
+                self.main_content_tab = MainContentTab::Waveform;
+            }
 
-        draw_vertical_separator(ui, row_h);
+            draw_vertical_separator(ui, row_h);
+        }
 
         if self.separated_stems.is_some() {
             // Stems loaded: the button toggles the stem mixer popup.
@@ -492,7 +501,12 @@ impl KeyScribeApp {
                             // knob above (nested child Uis paint left-aligned
                             // and would break the centering).
                             let db_color = if audible { text_color } else { dim_color };
-                            let icon_w = 18.0_f32;
+                            // Slightly larger tap targets/icons on touch.
+                            let (icon_size, icon_w) = if self.is_touch_platform() {
+                                (15.0_f32, 28.0_f32)
+                            } else {
+                                (11.0_f32, 18.0_f32)
+                            };
                             let gap = 4.0_f32;
                             let mute_str =
                                 if audible { SPEAKER_HIGH } else { SPEAKER_LOW };
@@ -509,6 +523,7 @@ impl KeyScribeApp {
                                 eye_str,
                                 eye_color,
                                 gap,
+                                icon_size,
                             );
                             let row_galley =
                                 ui.ctx().fonts(|fonts| fonts.layout_job(job));
@@ -1537,6 +1552,7 @@ impl KeyScribeApp {
     }
 
     /// Runs in a background thread: MusicXML → verovioxide → raw RGBA pages + note positions
+    #[cfg(feature = "sheet-render")]
     fn run_render_background(
         job: &SheetRenderJob,
         dpi_scale: f32,
@@ -1605,6 +1621,17 @@ impl KeyScribeApp {
         match render_result {
             Ok(pages) => SheetRenderResult { key, pages, error: None },
             Err(err) => SheetRenderResult { key, pages: Vec::new(), error: Some(err) },
+        }
+    }
+
+    /// Engraving is unavailable when the Verovio backend is compiled out
+    /// (e.g. Android). Callers surface the error in the sheet view.
+    #[cfg(not(feature = "sheet-render"))]
+    fn run_render_background(job: &SheetRenderJob, _dpi_scale: f32) -> SheetRenderResult {
+        SheetRenderResult {
+            key: job.key,
+            pages: Vec::new(),
+            error: Some("Sheet engraving is not available in this build.".to_string()),
         }
     }
 

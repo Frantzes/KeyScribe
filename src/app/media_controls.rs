@@ -539,11 +539,15 @@ fn draw_play_button(
         ui.painter().circle_filled(rect.center(), radius, fill);
         let icon = if is_playing { PAUSE } else { PLAY };
         let icon_color = ui.visuals().panel_fill;
+        let icon_size = (button_size * 0.42).round();
+        // Same optical-centering nudge as the icon buttons: the Phosphor
+        // glyph sits slightly low in the disc otherwise.
         ui.painter().text(
-            rect.center(),
+            rect.center()
+                - egui::vec2(0.0, icon_size * crate::ui::widgets::ICON_BUTTON_TEXT_Y_NUDGE),
             egui::Align2::CENTER_CENTER,
             icon,
-            icon_font_id((button_size * 0.42).round()),
+            icon_font_id(icon_size),
             icon_color,
         );
         resp.on_hover_text("Play / Pause")
@@ -651,7 +655,7 @@ pub(super) fn draw_media_controls(
         egui::Layout::top_down(egui::Align::Center),
         |ui| {
             ui.set_min_height(target_h);
-            egui::Frame::none()
+            let frame_resp = egui::Frame::none()
                 .fill(panel_fill)
                 .rounding(egui::Rounding::same(8.0))
                 .inner_margin(if compact_layout {
@@ -1044,6 +1048,7 @@ pub(super) fn draw_media_controls(
                             }
                         });
                 });
+            app.media_controls_content_h = frame_resp.response.rect.height();
         },
     );
 }

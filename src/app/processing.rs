@@ -1026,29 +1026,50 @@ impl KeyScribeApp {
             file_markers: self.file_markers.clone(),
             file_positions,
             file_stem_volumes,
-            // The API key lives in the user-local `.env` file (see
-            // `mvsep::save_mvsep_api_key_to_dotenv`), not in the JSON state:
-            // the state file is portable/shared, the key must stay local.
-            // A successful `.env` write clears the JSON field (one-way
-            // migration for keys saved by older versions); clearing the
-            // settings field removes the `.env` entry too.
+            // The API key is stored encrypted at rest via the platform
+            // keystore (`secrets`: Android Keystore / Windows DPAPI), never in
+            // the portable JSON state. A successful secure write clears the
+            // JSON field (one-way migration for keys saved by older versions);
+            // clearing the settings field removes it from both stores.
             //
-            // The autosave runs every 2 s, so the `.env` file is only
-            // touched when the key actually changed — never rewritten
-            // unconditionally on the event loop.
+            // The autosave runs every 2 s, so the keystore is only touched
+            // when the key actually changed — never unconditionally on the
+            // event loop.
             mvsep_api_key: {
                 let trimmed = self.mvsep_api_key.trim().to_string();
                 if trimmed == self.mvsep_key_last_persisted {
                     None
                 } else if trimmed.is_empty() {
-                    let _ = crate::mvsep::save_mvsep_api_key_to_dotenv("");
+                    let result = crate::mvsep::save_mvsep_api_key("");
+                    #[cfg(not(target_os = "android"))]
+                    let _ = &result;
+                    #[cfg(target_os = "android")]
+                    crate::android::log_info(&format!(
+                        "[mvsep] cleared secure store ok={}",
+                        result.is_ok()
+                    ));
                     self.mvsep_key_last_persisted = String::new();
                     None
-                } else if crate::mvsep::save_mvsep_api_key_to_dotenv(&trimmed).is_ok() {
-                    self.mvsep_key_last_persisted = trimmed;
-                    None
                 } else {
-                    Some(trimmed)
+                    match crate::mvsep::save_mvsep_api_key(&trimmed) {
+                        Ok(()) => {
+                            #[cfg(target_os = "android")]
+                            crate::android::log_info(
+                                "[mvsep] key stored in Android Keystore",
+                            );
+                            self.mvsep_key_last_persisted = trimmed;
+                            None
+                        }
+                        Err(err) => {
+                            #[cfg(not(target_os = "android"))]
+                            let _ = &err;
+                            #[cfg(target_os = "android")]
+                            crate::android::log_info(&format!(
+                                "[mvsep] secure store failed ({err}); storing key in JSON state"
+                            ));
+                            Some(trimmed)
+                        }
+                    }
                 }
             },
             selected_separation_model_name: self.selected_separation_model_name.clone(),
