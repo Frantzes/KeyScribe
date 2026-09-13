@@ -96,24 +96,36 @@ fn init_paths_and_assets(app: &android_activity::AndroidApp) {
     let _ = std::fs::create_dir_all(files_dir.join("models"));
 
     let asset_manager = app.asset_manager();
+    let mut present = 0usize;
+    let mut extracted = 0usize;
     for relative in BUNDLED_ASSETS {
         let Ok(name) = CString::new(*relative) else {
+            log_info(&format!("[assets] invalid asset name {relative}"));
             continue;
         };
         let Some(mut asset) = asset_manager.open(name.as_c_str()) else {
+            log_info(&format!("[assets] MISSING asset {relative}"));
             continue;
         };
         let Ok(bytes) = asset.buffer() else {
+            log_info(&format!("[assets] unreadable asset {relative}"));
             continue;
         };
         let dest = files_dir.join(relative);
         if let Ok(meta) = std::fs::metadata(&dest) {
             if meta.len() as usize == bytes.len() {
+                present += 1;
                 continue;
             }
         }
-        let _ = write_asset(&dest, bytes);
+        if write_asset(&dest, bytes).is_ok() {
+            extracted += 1;
+        }
     }
+    log_info(&format!(
+        "[assets] models ready: {present} present, {extracted} extracted, {} expected",
+        BUNDLED_ASSETS.len()
+    ));
 }
 
 fn write_asset(dest: &Path, bytes: &[u8]) -> std::io::Result<()> {

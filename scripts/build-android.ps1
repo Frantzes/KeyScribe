@@ -77,7 +77,6 @@ Remove-Item $unsigned -Force -ErrorAction SilentlyContinue
     -o $unsigned `
     --manifest "$repo\android\AndroidManifest.xml" `
     -I $androidJar `
-    -A "$repo\android\assets" `
     -R $compiledRes `
     --min-sdk-version $MinSdk `
     --target-sdk-version $TargetSdk
@@ -102,6 +101,13 @@ Add-Entry $zip "$dexDir\classes.dex" "classes.dex" $false
 Add-Entry $zip $rustSo "lib/$Abi/libkeyscribe_lib.so" $false
 Add-Entry $zip "$repo\android\libs\$Abi\libonnxruntime.so" "lib/$Abi/libonnxruntime.so" $false
 Add-Entry $zip "$toolchain\sysroot\usr\lib\$RustTarget\libc++_shared.so" "lib/$Abi/libc++_shared.so" $false
+# Assets must use forward-slash ZIP paths: aapt2's -A emits backslashes on
+# Windows, which Android's AssetManager cannot resolve at runtime. They are
+# stored uncompressed so AAsset_getBuffer (used by `Asset::buffer`) always
+# succeeds, even for the 10 MB beat model.
+Get-ChildItem "$repo\android\assets\models" -File | ForEach-Object {
+    Add-Entry $zip $_.FullName ("assets/models/" + $_.Name) $true
+}
 $zip.Dispose()
 
 $aligned = "$work\keyscribe-aligned.apk"
