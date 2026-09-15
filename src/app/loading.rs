@@ -201,6 +201,10 @@ impl KeyScribeApp {
         self.loaded_stems_model_name = None;
         self.stem_analyses.clear();
         self.stem_colors.clear();
+        if let Some(flag) = &self.stem_analysis_cancel {
+            flag.store(true, Ordering::Release);
+        }
+        self.stem_analysis_cancel = None;
         self.stem_analysis_rx = None;
         self.is_separating = false;
         self.separation_attempted = false;

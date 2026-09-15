@@ -17,7 +17,8 @@ use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 
 use crate::analysis::{
-    analyze_with_full_pipeline, PIANO_HIGH_MIDI, PIANO_KEY_COUNT, PIANO_LOW_MIDI,
+    analyze_with_full_pipeline, analyze_with_full_pipeline_cancellable, PIANO_HIGH_MIDI,
+    PIANO_KEY_COUNT, PIANO_LOW_MIDI,
 };
 use crate::audio_io::{
     load_audio_file_streaming, load_audio_preview_chunk, AudioData, AudioPreviewChunk,
@@ -1282,6 +1283,7 @@ pub struct KeyScribeApp {
     stem_colors: Vec<egui::Color32>,
     note_stem_colors: Vec<egui::Color32>,
     stem_analysis_rx: Option<Receiver<StemAnalysisResult>>,
+    stem_analysis_cancel: Option<Arc<AtomicBool>>,
     saved_visualize_stem_indices: Option<Vec<usize>>,
     saved_listen_stem_indices: Option<Vec<usize>>,
     manual_bpm: Option<f32>,
@@ -1332,6 +1334,9 @@ pub struct KeyScribeApp {
     marker_edit_index: Option<usize>,
     marker_edit_str: String,
     streaming_stretch: Option<StreamingStretchState>,
+    /// Set once a window-close request is seen, so the shutdown watchdog is
+    /// armed exactly once.
+    shutdown_watchdog_armed: bool,
 }
 
 struct StreamingStretchState {
@@ -1736,6 +1741,7 @@ impl KeyScribeApp {
             stem_colors: Vec::new(),
             note_stem_colors: vec![egui::Color32::from_rgb(148, 106, 255); PIANO_KEY_COUNT],
             stem_analysis_rx: None,
+            stem_analysis_cancel: None,
             saved_visualize_stem_indices: persisted.saved_visualize_stem_indices.clone(),
             saved_listen_stem_indices: persisted.saved_listen_stem_indices.clone(),
             manual_bpm: None,
@@ -1768,6 +1774,7 @@ impl KeyScribeApp {
             marker_edit_index: None,
             marker_edit_str: String::new(),
             streaming_stretch: None,
+            shutdown_watchdog_armed: false,
         };
 
         // Apply tuned pipeline parameters (written by `keyscribe-cli tune`)

@@ -106,6 +106,14 @@ impl KeyScribeApp {
             self.loaded_path.clone()
         };
         let processing_epoch = Arc::clone(&self.processing_epoch);
+        // Cancel the previous job's flag before replacing it: a new rebuild
+        // supersedes the old one, and the old worker should stop at the next
+        // cancellation point instead of running an entire analysis to
+        // completion (which piled up CPU-bound jobs and made the app appear
+        // stuck / unresponsive).
+        if let Some(previous) = &self.processing_cancel_flag {
+            previous.store(true, Ordering::Release);
+        }
         let cancel_flag = Arc::new(AtomicBool::new(false));
         self.processing_cancel_flag = Some(Arc::clone(&cancel_flag));
 
@@ -549,6 +557,7 @@ impl KeyScribeApp {
                         use_cqt,
                         preprocess_audio,
                         Some(expected_duration_sec),
+                        Some(cancel_flag.as_ref()),
                     );
                     (Arc::new(timeline), step, err)
                 }
@@ -683,6 +692,12 @@ impl KeyScribeApp {
         // Always sync export selection to include all stems of the active model
         self.export_selected_stems = stems.iter().map(|s| s.stem_type.clone()).collect();
 
+        // Stems are ready: reveal the mixer, then analyze every stem and
+        // transcribe it automatically. The mixer shows "Analyzing stems..."
+        // until the per-stem timelines arrive, and the keyboard upgrades to
+        // the per-stem transcription as soon as they do — no user action
+        // required after separation completes.
+        self.show_stem_mixer = true;
         self.cache_status_message = Some("Analyzing individual stems...".to_string());
         self.cache_status_message_at = Some(Instant::now());
         self.refresh_note_timeline_from_selected_stems();
@@ -816,72 +831,114 @@ impl KeyScribeApp {
 
         let (tx, rx) = mpsc::channel::<StemAnalysisResult>();
         self.stem_analysis_rx = Some(rx);
+
+        // Cancel any previous stem-analysis pass before starting a new one.
+        if let Some(previous) = &self.stem_analysis_cancel {
+            previous.store(true, Ordering::Release);
+        }
+        let cancel = Arc::new(AtomicBool::new(false));
+        let worker_cancel = Arc::clone(&cancel);
+        self.stem_analysis_cancel = Some(cancel);
         let song_hash = song_hash.clone();
 
         thread::spawn(move || {
-            let cache_dir = analysis_cache_library_dir();
-            let mut analyses = Vec::new();
+            // A panic in ONNX/decode must surface as an error, not silently
+            // disconnect the channel and leave the UI with no transcription
+            // and no explanation.
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let cache_dir = analysis_cache_library_dir();
+                let mut analyses = Vec::new();
 
-            for (i, stem) in stems.iter().enumerate() {
-                let samples = &stem.samples_mono;
-                if samples.is_empty() {
-                    continue;
-                }
-
-                // Try loading from cache first
-                let cache_path = cache_dir
-                    .join(&song_hash)
-                    .join(format!("stem_{}_{}.bin.zst", i, model_id));
-                let cached = Self::load_stem_analysis_from_cache(&cache_path);
-
-                if let Some((cached_timeline, cached_step)) = cached {
-                    analyses.push(StemAnalysis {
-                        stem_index: i,
-                        timeline: Arc::new(cached_timeline),
-                        step_sec: cached_step,
-                    });
-                    continue;
-                }
-
-                match analyze_with_full_pipeline(samples, stem.sample_rate) {
-                    Ok((_smoothed, probs)) => {
-                        let duration_sec = samples.len() as f32 / stem.sample_rate.max(1) as f32;
-                        let step_sec = if probs.is_empty() {
-                            0.0
-                        } else {
-                            (duration_sec / probs.len() as f32).max(1e-3)
+                for (i, stem) in stems.iter().enumerate() {
+                    if worker_cancel.load(Ordering::Acquire) {
+                        return StemAnalysisResult {
+                            analyses: Vec::new(),
+                            error: None,
                         };
-                        // Save to cache
-                        Self::save_stem_analysis_to_cache(
-                            &cache_path,
-                            stem.sample_rate,
-                            &probs,
-                            step_sec,
-                        );
+                    }
 
+                    let samples = &stem.samples_mono;
+                    if samples.is_empty() {
+                        continue;
+                    }
+
+                    // Try loading from cache first
+                    let cache_path = cache_dir
+                        .join(&song_hash)
+                        .join(format!("stem_{}_{}.bin.zst", i, model_id));
+                    let cached = Self::load_stem_analysis_from_cache(&cache_path);
+
+                    if let Some((cached_timeline, cached_step)) = cached {
                         analyses.push(StemAnalysis {
                             stem_index: i,
-                            timeline: Arc::new(probs),
-                            step_sec,
+                            timeline: Arc::new(cached_timeline),
+                            step_sec: cached_step,
                         });
+                        continue;
                     }
-                    Err(err) => {
-                        let _ = tx.send(StemAnalysisResult {
-                            analyses: Vec::new(),
-                            error: Some(format!(
-                                "Stem {} analysis failed: {}",
-                                stem.stem_type.display_name(),
-                                err
-                            )),
-                        });
-                        return;
+
+                    match analyze_with_full_pipeline_cancellable(
+                        samples,
+                        stem.sample_rate,
+                        &worker_cancel,
+                    ) {
+                        Ok((_smoothed, probs)) => {
+                            if worker_cancel.load(Ordering::Acquire) {
+                                return StemAnalysisResult {
+                                    analyses: Vec::new(),
+                                    error: None,
+                                };
+                            }
+                            let duration_sec =
+                                samples.len() as f32 / stem.sample_rate.max(1) as f32;
+                            let step_sec = if probs.is_empty() {
+                                0.0
+                            } else {
+                                (duration_sec / probs.len() as f32).max(1e-3)
+                            };
+                            // Save to cache
+                            Self::save_stem_analysis_to_cache(
+                                &cache_path,
+                                stem.sample_rate,
+                                &probs,
+                                step_sec,
+                            );
+
+                            analyses.push(StemAnalysis {
+                                stem_index: i,
+                                timeline: Arc::new(probs),
+                                step_sec,
+                            });
+                        }
+                        Err(err) => {
+                            return StemAnalysisResult {
+                                analyses: Vec::new(),
+                                error: Some(format!(
+                                    "Stem {} analysis failed: {}",
+                                    stem.stem_type.display_name(),
+                                    err
+                                )),
+                            };
+                        }
                     }
                 }
-            }
-            let _ = tx.send(StemAnalysisResult {
-                analyses,
-                error: None,
-            });
+
+                StemAnalysisResult {
+                    analyses,
+                    error: None,
+                }
+            }));
+
+            let _ = match result {
+                Ok(res) => tx.send(res),
+                Err(_) => tx.send(StemAnalysisResult {
+                    analyses: Vec::new(),
+                    error: Some(
+                        "Stem analysis stopped unexpectedly; showing the mixed transcription instead."
+                            .to_string(),
+                    ),
+                }),
+            };
         });
     }
 
@@ -932,6 +989,7 @@ impl KeyScribeApp {
         match rx.try_recv() {
             Ok(result) => {
                 self.stem_analysis_rx = None;
+                self.stem_analysis_cancel = None;
                 if let Some(err) = result.error {
                     self.last_error = Some(err);
                 } else {
@@ -941,7 +999,19 @@ impl KeyScribeApp {
             }
             Err(TryRecvError::Empty) => {}
             Err(TryRecvError::Disconnected) => {
+                // The worker thread died without sending a result (e.g. a
+                // hard abort). Surface it and fall back to the blended
+                // timeline so the keyboard is never permanently blank.
                 self.stem_analysis_rx = None;
+                self.stem_analysis_cancel = None;
+                if !self.stem_analyses.is_empty() {
+                    self.update_note_probabilities(true);
+                } else {
+                    self.last_error = Some(
+                        "Stem analysis stopped unexpectedly; showing the mixed transcription instead."
+                            .to_string(),
+                    );
+                }
             }
         }
     }
@@ -1196,8 +1266,14 @@ impl KeyScribeApp {
             self.note_probs = combined;
             self.note_stem_colors = colors;
         }
-        // 2. Pre-computed blended timeline (original audio or blended stems when per-stem not ready)
-        else if self.enabled_stem_indices.is_empty() && !self.base_note_timeline.is_empty() && self.base_note_timeline_step_sec > 0.0 {
+        // 2. Pre-computed blended timeline (original audio or blended stems when per-stem not ready).
+        //
+        // This is the fallback whenever per-stem analyses are unavailable
+        // (still running, failed, or panicked). It must NOT be gated on the
+        // visible-stem selection being empty: after separation `enabled_stem_indices`
+        // is non-empty while `stem_analyses` is still empty, and gating here left
+        // the keyboard permanently blank ("stuck at 100%, no transcription").
+        else if !self.base_note_timeline.is_empty() && self.base_note_timeline_step_sec > 0.0 {
             let idx = nearest_timeline_frame(current_time, self.base_note_timeline_step_sec, self.base_note_timeline.len());
             self.note_probs = self.base_note_timeline[idx].clone();
             self.note_stem_colors = vec![self.highlight_color; note_count];
@@ -1293,13 +1369,19 @@ impl KeyScribeApp {
         use_cqt: bool,
         preprocess_audio: bool,
         expected_duration_sec: Option<f32>,
+        cancel: Option<&std::sync::atomic::AtomicBool>,
     ) -> (Vec<Vec<f32>>, f32, Option<String>) {
         let _ = (fft_window_size, use_cqt);
         if !preprocess_audio {
             return (Vec::new(), 0.0, None);
         }
 
-        match analyze_with_full_pipeline(source_samples, sample_rate) {
+        let analysis = match cancel {
+            Some(flag) => analyze_with_full_pipeline_cancellable(source_samples, sample_rate, flag),
+            None => analyze_with_full_pipeline(source_samples, sample_rate),
+        };
+
+        match analysis {
             Ok((_smoothed, probs)) => {
                 let duration_sec = expected_duration_sec
                     .unwrap_or_else(|| source_samples.len() as f32 / sample_rate.max(1) as f32);

@@ -471,3 +471,26 @@ pub fn analyze_with_full_pipeline(
 
     Ok((result.smoothed_notes, result.note_probs_sequence))
 }
+
+/// Cancellable variant of [`analyze_with_full_pipeline`]. When `cancel` is set
+/// mid-analysis the returned probability sequence is empty; callers must check
+/// the flag (or the empty result) before persisting/using it.
+pub fn analyze_with_full_pipeline_cancellable(
+    samples: &[f32],
+    sample_rate: u32,
+    cancel: &std::sync::atomic::AtomicBool,
+) -> anyhow::Result<(Vec<Vec<bool>>, Vec<Vec<f32>>)> {
+    use crate::pipeline::{AudioPipeline, PipelineConfig};
+
+    let config = PipelineConfig {
+        sample_rate,
+        chunk_size: (sample_rate as usize / 10), // 100ms chunks
+        lookahead_frames: 5,
+        ..Default::default()
+    };
+
+    let pipeline = AudioPipeline::new(config)?;
+    let result = pipeline.process_audio_cancellable(samples, cancel)?;
+
+    Ok((result.smoothed_notes, result.note_probs_sequence))
+}

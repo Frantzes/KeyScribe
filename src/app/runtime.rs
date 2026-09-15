@@ -161,6 +161,10 @@ impl KeyScribeApp {
         if let Some(flag) = &self.processing_cancel_flag {
             flag.store(true, Ordering::Release);
         }
+        if let Some(flag) = &self.stem_analysis_cancel {
+            flag.store(true, Ordering::Release);
+        }
+        self.stem_analysis_cancel = None;
         self.clear_processing_job();
         self.pending_param_change = false;
         self.last_param_change_at = None;

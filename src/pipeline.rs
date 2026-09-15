@@ -4,6 +4,7 @@ use crate::inference::{BasicPitchInference, InferenceConfig};
 use crate::preprocessing::PreprocessingConfig;
 use crate::viterbi::{ViterbiConfig, ViterbiDecoder};
 use anyhow::Result;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 /// Result from inference - note probabilities for a frame
 #[derive(Debug, Clone)]
@@ -59,8 +60,18 @@ impl AudioPipeline {
         Ok(Self { config })
     }
 
-    /// Process audio file with full CQT + HPSS + Viterbi pipeline
-    pub fn process_audio(&self, samples: &[f32]) -> Result<PipelineResult> {
+    /// Process audio file with full CQT + HPSS + Viterbi pipeline.
+    ///
+    /// Cancellable variant: the caller's `cancel` flag is polled between model
+    /// windows so a superseded job (e.g. the user loaded another file or a new
+    /// rebuild replaced this one) stops promptly instead of running to
+    /// completion. On cancellation an empty result is returned; callers must
+    /// treat that as "cancelled", not as a real analysis.
+    pub fn process_audio_cancellable(
+        &self,
+        samples: &[f32],
+        cancel: &AtomicBool,
+    ) -> Result<PipelineResult> {
         if samples.is_empty() {
             return Ok(PipelineResult {
                 note_probs_sequence: vec![],
@@ -98,6 +109,14 @@ impl AudioPipeline {
         let mut first = true;
 
         loop {
+            if cancel.load(Ordering::Acquire) {
+                return Ok(PipelineResult {
+                    note_probs_sequence: vec![],
+                    onset_probs_sequence: None,
+                    smoothed_notes: vec![],
+                });
+            }
+
             let end = (start + model_input_samples).min(model_samples.len());
             let window = &model_samples[start..end];
             let (mut window_probs, window_onsets) = inference.infer_audio_window(window)?;
@@ -131,9 +150,9 @@ impl AudioPipeline {
             }
         }
 
-        if note_probs_sequence.is_empty() {
+        if note_probs_sequence.is_empty() || cancel.load(Ordering::Acquire) {
             return Ok(PipelineResult {
-                note_probs_sequence,
+                note_probs_sequence: Vec::new(),
                 onset_probs_sequence: None,
                 smoothed_notes: vec![],
             });
@@ -150,6 +169,12 @@ impl AudioPipeline {
             onset_probs_sequence,
             smoothed_notes: smoothed,
         })
+    }
+
+    /// Non-cancellable convenience wrapper (CLI, tests).
+    pub fn process_audio(&self, samples: &[f32]) -> Result<PipelineResult> {
+        static NEVER_CANCELLED: AtomicBool = AtomicBool::new(false);
+        self.process_audio_cancellable(samples, &NEVER_CANCELLED)
     }
 
     /// Get pipeline config

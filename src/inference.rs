@@ -192,10 +192,12 @@ impl BasicPitchInference {
         // is initialized first — the transcription path previously skipped
         // init entirely, so exe-bundled libonnxruntime was never found here.
         let _ort_guard = ort_session_guard();
-        init_ort_environment();
-        // Fail fast when unloadable: entering ort without a loadable runtime
-        // deadlocks inside its global init (see ensure_onnxruntime_loadable).
+        // Probe with the OS loader FIRST: entering ort without a loadable
+        // runtime deadlocks inside its global init (see
+        // ensure_onnxruntime_loadable). Probing after init was too late — a
+        // present-but-unloadable DLL would already have entered ort.
         ensure_onnxruntime_loadable()?;
+        init_ort_environment();
 
         let given = Path::new(&config.model_path);
         let model_path: PathBuf = if given.exists() {
@@ -482,8 +484,8 @@ impl MelodyQuantizerInference {
     pub fn new(model_path: &Path) -> Result<Self> {
         // Same ORT construction discipline as BasicPitchInference::new.
         let _ort_guard = ort_session_guard();
-        init_ort_environment();
         ensure_onnxruntime_loadable()?;
+        init_ort_environment();
 
         if !model_path.exists() {
             return Err(anyhow!(

@@ -1851,22 +1851,29 @@ impl KeyScribeApp {
                                         .processing_started_at
                                         .map(|t| t.elapsed().as_secs_f32())
                                         .unwrap_or(0.0);
-                                    let estimate = self
-                                        .processing_estimated_total_sec
-                                        .max(0.5)
-                                        .max(elapsed + 1.0e-3);
+                                    let estimate = self.processing_estimated_total_sec.max(0.5);
                                     let stage_ratio = (elapsed / estimate).clamp(0.0, 1.0);
-                                    let remaining = (estimate - elapsed).max(0.0);
 
                                     let ratio = (TRANSCRIBE_PROGRESS_LOADING_WEIGHT
                                         + stage_ratio
                                             * (1.0 - TRANSCRIBE_PROGRESS_LOADING_WEIGHT))
                                         .min(TRANSCRIBE_PROGRESS_MAX_BEFORE_DONE);
-                                    let detail = format!(
-                                        "{:.0}% estimated ({:.0}s left)",
-                                        stage_ratio * 100.0,
-                                        remaining
-                                    );
+                                    // Once past the estimate, don't claim "0s left"
+                                    // (which reads as "stuck at 100%"): say it is
+                                    // still running so the user knows it hasn't hung.
+                                    let detail = if elapsed > estimate {
+                                        format!(
+                                            "{:.0}% — still working ({:.0}s elapsed)",
+                                            stage_ratio * 100.0,
+                                            elapsed
+                                        )
+                                    } else {
+                                        format!(
+                                            "{:.0}% estimated ({:.0}s left)",
+                                            stage_ratio * 100.0,
+                                            (estimate - elapsed).max(0.0)
+                                        )
+                                    };
 
                                     (ratio, detail, true)
                                 };

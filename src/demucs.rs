@@ -75,7 +75,10 @@ impl DemucsSeparator {
         if !model_path.exists() {
             return Err(anyhow!("Demucs ONNX model not found at {}", model_path.display()));
         }
-        // Initialize the ONNX Runtime environment from our bundled library.
+        // Fail fast before touching ort internals (see
+        // inference::ensure_onnxruntime_loadable), then initialize the ONNX
+        // Runtime environment from our bundled library.
+        crate::inference::ensure_onnxruntime_loadable()?;
         crate::inference::init_ort_environment();
 
         // Preload CUDA/cuDNN DLLs so the CUDA EP can find them at runtime.
@@ -585,8 +588,8 @@ fn to_stereo_44100(audio: &crate::audio_io::AudioData) -> Vec<f32> {
 fn build_gpu_session(model_path: &Path) -> Result<Session> {
     // Shared ORT construction discipline (see inference::ORT_SESSION_LOCK).
     let _ort_guard = crate::inference::ort_session_guard();
-    crate::inference::init_ort_environment();
     crate::inference::ensure_onnxruntime_loadable()?;
+    crate::inference::init_ort_environment();
 
     let cuda = CUDA::default()
         .with_conv_algorithm_search(ort::ep::cuda::ConvAlgorithmSearch::Heuristic)
@@ -612,8 +615,8 @@ const MIN_FREE_CORES: usize = 1;
 fn build_cpu_session(model_path: &Path) -> Result<Session> {
     // Shared ORT construction discipline (see inference::ORT_SESSION_LOCK).
     let _ort_guard = crate::inference::ort_session_guard();
-    crate::inference::init_ort_environment();
     crate::inference::ensure_onnxruntime_loadable()?;
+    crate::inference::init_ort_environment();
 
     // Use all available cores minus one for system responsiveness.
     // The previous code capped this at 4, leaving most cores idle on modern

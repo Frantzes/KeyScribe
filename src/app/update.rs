@@ -12,6 +12,28 @@ use super::*;
 /// covered by defaulting vsync off there (see `main.rs`).
 const MINIMIZED_REPAINT_INTERVAL: Duration = Duration::from_millis(500);
 
+/// Terminate the process immediately, bypassing the normal shutdown path.
+///
+/// On Windows, `exit`/`ExitProcess` runs DLL detach under the loader lock; if
+/// a background thread is parked inside `LoadLibrary`/`FreeLibrary` (e.g. the
+/// ONNX Runtime/CUDA preload path) the whole process can deadlock there and
+/// become un-closable. `TerminateProcess` does not wait for that and always
+/// succeeds. Used only by the close watchdog as a last resort.
+fn force_process_exit() -> ! {
+    #[cfg(windows)]
+    {
+        use std::ffi::c_void;
+        extern "system" {
+            fn GetCurrentProcess() -> *mut c_void;
+            fn TerminateProcess(h_process: *mut c_void, u_exit_code: u32) -> i32;
+        }
+        unsafe {
+            TerminateProcess(GetCurrentProcess(), 0);
+        }
+    }
+    std::process::exit(0);
+}
+
 impl eframe::App for KeyScribeApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         // Visibility first: the minimized branch below depends on this.
@@ -19,6 +41,21 @@ impl eframe::App for KeyScribeApp {
         // reports minimized on Windows/macOS only — so workspace-hidden
         // windows are handled via the vsync default in `main.rs` instead.)
         let minimized = ctx.input(|i| i.viewport().minimized.unwrap_or(false));
+
+        // Closing can wedge on Windows if a background ORT/NVML thread is
+        // parked inside a loader lock while `ExitProcess` runs DLL detach.
+        // Rather than trapping the user with an un-closable window, arm a
+        // one-shot watchdog that hard-terminates the process if normal
+        // shutdown hasn't completed a few seconds after the close request.
+        if !self.shutdown_watchdog_armed && ctx.input(|i| i.viewport().close_requested()) {
+            self.shutdown_watchdog_armed = true;
+            std::thread::spawn(|| {
+                std::thread::sleep(Duration::from_secs(3));
+                eprintln!("[keyscribe] shutdown watchdog: forcing process exit");
+                force_process_exit();
+            });
+        }
+
         apply_brand_theme(ctx, self.dark_mode, self.highlight_color);
         self.lock_startup_min_window_size_once(ctx);
         self.apply_mobile_ui_tweaks_once(ctx);
@@ -132,11 +169,11 @@ impl eframe::App for KeyScribeApp {
             } else if !self.stem_cache_miss {
                 // Kick off the background cache load (idempotent); the result
                 // applies in poll_stem_cache_result without blocking the UI.
-                // Auto-separation waits for a confirmed miss (no double work,
-                // and no re-request loop after a miss).
+                // Keep waiting for the confirmed miss — do NOT mark the attempt
+                // done yet: that previously cancelled auto-separation before
+                // the cache check ever resolved.
                 self.request_cached_stems(&current_model);
-            }
-            if self.separated_stems.is_none() && self.stem_cache_miss && self.auto_separate {
+            } else if self.auto_separate {
                 let duration = self.source_duration() as f64;
                 if duration > super::AUTO_SEPARATE_MAX_DURATION_SEC {
                     self.separation_attempted = true;
@@ -146,8 +183,9 @@ impl eframe::App for KeyScribeApp {
                     self.run_instrument_separation();
                 }
             } else {
-                // No cache and auto-separate is off — skip fresh separation.
-                // The user can still run it manually via the toolbar button.
+                // Confirmed cache miss and auto-separate is off — skip fresh
+                // separation. The user can still run it manually via the
+                // toolbar button.
                 self.separation_attempted = true;
             }
         }
