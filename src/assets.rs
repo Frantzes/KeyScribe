@@ -45,30 +45,41 @@ const HTDEMUCS_SIZE: u64 = 284_749_531;
 /// Mirrored BtbN FFmpeg-Builds `ffmpeg-n9.0-latest-win64-gpl-9.0` (GPLv3),
 /// repacked to `bin/ffmpeg.exe` + `bin/ffprobe.exe`. Upstream zip verified
 /// against BtbN's own `checksums.sha256` before mirroring.
+#[cfg(target_os = "windows")]
 const FFMPEG_WIN_URL: &str = "https://github.com/Frantzes/KeyScribe/releases/download/assets-v1/keyscribe-ffmpeg-win64-v1.zip";
+#[cfg(target_os = "windows")]
 const FFMPEG_WIN_SHA256: &str =
     "502c913aca7e637314088b5d6c5d92359a65ac8ee5e8b91daa9b2fe4c1edc520";
+#[cfg(target_os = "windows")]
 const FFMPEG_WIN_SIZE: u64 = 126_991_730;
 
 /// Microsoft ONNX Runtime GPU 1.24.4 (MIT), Windows x64 wheel from PyPI.
 /// Wheel path pinned for cp313; the native DLLs are the same across the
 /// cp311/cp312/cp313 builds, but the file itself is pinned to one hash.
+#[cfg(target_os = "windows")]
 const ORT_WHEEL_URL: &str = "https://files.pythonhosted.org/packages/fa/bc/35f3a37226d7a28c84b8b456f52237ccd39eb7111114bcf9ac340178e1ec/onnxruntime_gpu-1.24.4-cp313-cp313-win_amd64.whl";
+#[cfg(target_os = "windows")]
 const ORT_WHEEL_SHA256: &str =
     "6be8bf2048777c517fca33eb61e114969fa326619feaa789d8c75f24337ea762";
+#[cfg(target_os = "windows")]
 const ORT_WHEEL_SIZE: u64 = 207_198_775;
 
 /// NVIDIA cuDNN 9.3.0.75 for CUDA 12, Windows x86_64 official redist archive.
 /// NVIDIA does not publish a checksum for this archive; the hash below was
 /// computed once from the official HTTPS URL and is pinned here.
+#[cfg(target_os = "windows")]
 const CUDNN_WIN_URL: &str = "https://developer.download.nvidia.com/compute/cudnn/redist/cudnn/windows-x86_64/cudnn-windows-x86_64-9.3.0.75_cuda12-archive.zip";
+#[cfg(target_os = "windows")]
 const CUDNN_WIN_SHA256: &str =
     "864a85dc67c7f92b9a8639f323acb4af63ad65de2ca82dccdf2c0b6a701c27c0";
+#[cfg(target_os = "windows")]
 const CUDNN_WIN_SIZE: u64 = 566_118_754;
 
 /// CUDA 12.4 runtime components (NVIDIA official redist). Hashes are the ones
 /// NVIDIA publishes in `redistrib_12.4.1.json`.
+#[cfg(target_os = "windows")]
 const CUDA_REDIST_BASE: &str = "https://developer.download.nvidia.com/compute/cuda/redist";
+#[cfg(target_os = "windows")]
 const CUDA_COMPONENTS: &[(&str, &str, u64)] = &[
     (
         "cuda_cudart/windows-x86_64/cuda_cudart-windows-x86_64-12.4.127-archive.zip",
@@ -214,6 +225,7 @@ pub(crate) fn gpu_dir() -> PathBuf {
     }
 }
 
+#[cfg(target_os = "windows")]
 fn temp_download_dir() -> Result<PathBuf> {
     let dir = std::env::temp_dir().join("keyscribe-downloads");
     fs::create_dir_all(&dir)
@@ -336,6 +348,7 @@ fn download_verified(
 // ZIP extraction
 // ---------------------------------------------------------------------------
 
+#[cfg(target_os = "windows")]
 fn extract_selected<F: Fn(&str) -> bool>(
     zip_path: &Path,
     dest_dir: &Path,
@@ -379,6 +392,7 @@ fn extract_selected<F: Fn(&str) -> bool>(
     Ok(extracted)
 }
 
+#[cfg(target_os = "windows")]
 fn extract_named(zip_path: &Path, dest_dir: &Path, names: &[&str], label: &str) -> Result<usize> {
     extract_selected(
         zip_path,
@@ -388,6 +402,7 @@ fn extract_named(zip_path: &Path, dest_dir: &Path, names: &[&str], label: &str) 
     )
 }
 
+#[cfg(target_os = "windows")]
 fn extract_dlls(zip_path: &Path, dest_dir: &Path, label: &str) -> Result<usize> {
     extract_selected(
         zip_path,
