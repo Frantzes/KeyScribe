@@ -172,7 +172,8 @@ MODEL_SOURCE_DIR="$REPO_ROOT/models"
 mkdir -p "$MODEL_SOURCE_DIR"
 
 ASSET_BASE="https://github.com/Frantzes/KeyScribe/releases/download/assets-v1"
-REQUIRED_MODELS=("htdemucs_6s.onnx" "beat_this_small.onnx" "mel_spectrogram.onnx" "basic-pitch.onnx")
+# htdemucs_6s.onnx is downloaded on first local Demucs use (see src/assets.rs).
+REQUIRED_MODELS=("beat_this_small.onnx" "mel_spectrogram.onnx" "basic-pitch.onnx")
 
 for MODEL_NAME in "${REQUIRED_MODELS[@]}"; do
     if [[ ! -f "$MODEL_SOURCE_DIR/$MODEL_NAME" ]]; then
@@ -188,8 +189,20 @@ for MODEL_NAME in "${REQUIRED_MODELS[@]}"; do
     fi
 done
 
+BUNDLED_MODELS=(
+    "basic-pitch.onnx"
+    "beat_this_small.onnx"
+    "mel_spectrogram.onnx"
+    "melody_quantizer.onnx"
+    "melody_quantizer.onnx.data"
+    "melody_quantizer_v2_seq.onnx"
+)
 MODEL_FILES=()
-while IFS= read -r; do MODEL_FILES+=("$REPLY"); done < <(find "$MODEL_SOURCE_DIR" -maxdepth 1 -type f -name '*.onnx' | sort)
+for MODEL_NAME in "${BUNDLED_MODELS[@]}"; do
+    if [[ -f "$MODEL_SOURCE_DIR/$MODEL_NAME" ]]; then
+        MODEL_FILES+=("$MODEL_SOURCE_DIR/$MODEL_NAME")
+    fi
+done
 if [[ ${#MODEL_FILES[@]} -eq 0 ]]; then
     echo "Missing model files in models/" >&2
     exit 1

@@ -1,4 +1,5 @@
 pub mod analysis;
+pub mod assets;
 pub mod audio_io;
 pub mod beat_this;
 pub mod core;

@@ -189,6 +189,17 @@ impl KeyScribeApp {
             }
         }
 
+        // The built-in htdemucs_6s model is not bundled (it is downloaded on
+        // first local Demucs use, see src/assets.rs), so list it even when the
+        // file is absent — otherwise the local option would be undiscoverable
+        // until the user placed a model manually.
+        if !seen_names.contains("htdemucs_6s") {
+            options.push(SeparationModelOption {
+                label: "Htdemucs 6s (downloads 272 MB on first use)".to_string(),
+                path: crate::assets::models_dir().join("htdemucs_6s.onnx"),
+            });
+        }
+
         options.sort_by(|a, b| a.label.cmp(&b.label));
         options
     }
@@ -1689,6 +1700,10 @@ impl KeyScribeApp {
                         }
                     }
 
+                    if let Some((download_label, _)) = crate::assets::download_status() {
+                        ui.label(format!("Downloading {download_label}..."));
+                    }
+
                     if let Some(cache_msg) = self.cache_status_message.as_deref() {
                         // A stale message (e.g. "Stem analysis complete.")
                         // must not resurface just because a silent
@@ -1746,7 +1761,10 @@ impl KeyScribeApp {
                             && !transcription_ready_from_cache
                     };
 
-                    if show_rendered_row || show_transcribed_row || show_separation_row {
+                    let download_status = crate::assets::download_status();
+                    let show_download_row = download_status.is_some();
+
+                    if show_rendered_row || show_transcribed_row || show_separation_row || show_download_row {
                         let draw_progress_row =
                             |ui: &mut egui::Ui,
                              label: &str,
@@ -1815,6 +1833,11 @@ impl KeyScribeApp {
                                 true,
                                 &format!("{:.0}% complete", progress * 100.0),
                             );
+                        }
+
+                        if let Some((label, ratio)) = &download_status {
+                            draw_progress_row(ui, "Downloading", *ratio, true, label);
+                            ctx.request_repaint();
                         }
 
                         if show_transcribed_row {

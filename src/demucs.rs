@@ -662,6 +662,11 @@ fn preload_cuda_dylibs() {
     let mut cuda_dirs: Vec<PathBuf> = Vec::new();
     let mut cudnn_dirs: Vec<PathBuf> = Vec::new();
 
+    // Downloaded GPU pack (CUDA/cuDNN next to the exe or in the user data dir).
+    let downloaded_gpu_dir = crate::assets::gpu_dir();
+    cuda_dirs.push(downloaded_gpu_dir.clone());
+    cudnn_dirs.push(downloaded_gpu_dir);
+
     if let Ok(exe) = std::env::current_exe() {
         if let Some(parent) = exe.parent() {
             cuda_dirs.push(parent.join("cuda"));
@@ -747,6 +752,11 @@ pub(crate) fn resolve_model_path(filename: &str) -> Option<PathBuf> {
                 return Some(p2);
             }
         }
+    }
+    // Downloaded models (writable exe-adjacent models/ or user data dir).
+    let downloaded = crate::assets::models_dir().join(filename);
+    if downloaded.exists() {
+        return Some(downloaded);
     }
     let cwd = PathBuf::from("models").join(filename);
     if cwd.exists() {

@@ -7,6 +7,62 @@ KeyScribe is a desktop application for polyphonic note detection, sheet music ge
 > **Status: Beta (active development).**
 > The app is evolving quickly; behavior, UI, and outputs may change between releases.
 
+## Downloads
+
+Latest release: [Releases page](https://github.com/Frantzes/KeyScribe/releases/latest)
+
+| Platform | Portable bundle |
+| --- | --- |
+| Windows x64 | [keyscribe-windows-x64.zip](https://github.com/Frantzes/KeyScribe/releases/latest/download/keyscribe-windows-x64.zip) |
+| Linux x64 | [keyscribe-linux-x64.zip](https://github.com/Frantzes/KeyScribe/releases/latest/download/keyscribe-linux-x64.zip) (CPU) or `keyscribe-linux-x86_64.flatpak` from the same release (includes GPU) |
+| macOS Apple Silicon | [keyscribe-macos-arm64.dmg](https://github.com/Frantzes/KeyScribe/releases/latest/download/keyscribe-macos-arm64.dmg) |
+
+### Runtime downloads
+
+The bundles ship only the small core. The optional assets below are fetched
+on first use, always over HTTPS, verified against the pinned byte size and
+SHA-256, and discarded if either check fails. The exact constants live in
+[`src/assets.rs`](src/assets.rs).
+
+**1. Demucs stem-separation model** — only when stem separation runs with a
+local Demucs model; the default MVSep separation is cloud-based and never
+downloads this (272 MB).
+
+- URL: https://github.com/Frantzes/KeyScribe/releases/download/assets-v1/htdemucs_6s.onnx
+- SHA-256: `b268327119b709141d43ba4103e7bb5f54bbf33311d6f1af5054ef663bf83322`
+- Source/license: Demucs v4 `htdemucs_6s` (MIT); ONNX conversion hosted on this repository's `assets-v1` release.
+
+**2. FFmpeg (Windows)** — first time a file needs it: an audio format
+Symphonia cannot decode (mkv, webm, wma, ...) or any video (121 MB).
+
+- URL: https://github.com/Frantzes/KeyScribe/releases/download/assets-v1/keyscribe-ffmpeg-win64-v1.zip
+- SHA-256: `502c913aca7e637314088b5d6c5d92359a65ac8ee5e8b91daa9b2fe4c1edc520`
+- Source/license: [BtbN FFmpeg-Builds](https://github.com/BtbN/FFmpeg-Builds) build `ffmpeg-n9.0-latest-win64-gpl-9.0` (GPLv3), mirrored here. FFmpeg source: https://ffmpeg.org/download.html
+
+**3. Windows GPU pack** — first local Demucs run on a machine with an NVIDIA
+GPU (`nvidia-smi` present). Skipped entirely on other machines. ~1.5 GB total:
+
+- ONNX Runtime GPU 1.24.4 CUDA provider — Microsoft (MIT), PyPI wheel:
+  https://files.pythonhosted.org/packages/fa/bc/35f3a37226d7a28c84b8b456f52237ccd39eb7111114bcf9ac340178e1ec/onnxruntime_gpu-1.24.4-cp313-cp313-win_amd64.whl
+  SHA-256 `6be8bf2048777c517fca33eb61e114969fa326619feaa789d8c75f24337ea762`
+- NVIDIA cuDNN 9.3.0.75 for CUDA 12:
+  https://developer.download.nvidia.com/compute/cudnn/redist/cudnn/windows-x86_64/cudnn-windows-x86_64-9.3.0.75_cuda12-archive.zip
+  SHA-256 `864a85dc67c7f92b9a8639f323acb4af63ad65de2ca82dccdf2c0b6a701c27c0`
+- CUDA 12.4 runtime components (`cuda_cudart`, `cuda_nvrtc`, `libcublas`, `libcufft`, `libcurand`) from
+  https://developer.download.nvidia.com/compute/cuda/redist, using NVIDIA's
+  published SHA-256 values from `redistrib_12.4.1.json`.
+
+Downloaded files land next to the executable (`models/`, `cuda/`, `ffmpeg.exe`);
+if that location is read-only (Program Files, AppImage, Flatpak), the per-user
+data directory is used instead.
+
+### Offline installation
+
+Place the files next to `keyscribe` before first launch and no downloader
+runs: `models/htdemucs_6s.onnx` for local Demucs separation; `ffmpeg.exe` and
+`ffprobe.exe` on Windows (or install FFmpeg on `PATH`); GPU pack DLLs in the
+`cuda/` folder next to the executable.
+
 ## Features
 
 - **Audio & Video Import:** Drag-and-drop or open via file dialog. Supports wav, mp3, flac, ogg, m4a, aac, mp4, mkv, avi, mov, webm.
@@ -24,7 +80,7 @@ KeyScribe is a desktop application for polyphonic note detection, sheet music ge
 
 ## How It Works: The Pipeline
 
-KeyScribe is a pure Rust application — all AI inference runs locally via ONNX Runtime (Demucs, Basic Pitch) and the `beat-this` Rust crate, with no Python dependency. Stem separation GPU acceleration requires an NVIDIA GPU with CUDA 12 and cuDNN 9 (bundled in the Windows release); on other GPUs or CPUs it falls back to multi-threaded CPU inference.
+KeyScribe is a pure Rust application — all AI inference runs locally via ONNX Runtime (Demucs, Basic Pitch) and the `beat-this` Rust crate, with no Python dependency. Stem separation GPU acceleration requires an NVIDIA GPU with CUDA 12 and cuDNN 9 (downloaded automatically on first local separation on Windows, included in the Linux Flatpak); on other GPUs or CPUs it falls back to multi-threaded CPU inference.
 
 ### 1. Importing an Audio or Video File
 
@@ -67,7 +123,7 @@ KeyScribe uses a VLC-style audio-master clock for drift-free playback:
 ### Prerequisites
 
 - **Rust 1.70+**
-- **FFmpeg (bundled)** (for video playback)
+- **FFmpeg** for audio fallback decoding and video playback (bundled on Linux, downloaded on first use on Windows, system install on macOS)
 
 ### Build & Run
 

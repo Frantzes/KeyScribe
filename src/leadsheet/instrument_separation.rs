@@ -205,7 +205,11 @@ impl InstrumentSeparator {
             return Ok(stems);
         }
 
-        // Run Demucs entirely in Rust via the precompiled ONNX model.
+        // Run Demucs entirely in Rust via the precompiled ONNX model. The
+        // model (and, on Windows with an NVIDIA GPU, the GPU pack) is fetched
+        // on first use — see `assets::ensure_local_demucs_assets`.
+        crate::assets::ensure_local_demucs_assets(&self.config.model_name)
+            .context("Failed to prepare local Demucs assets")?;
         let mut separator = crate::demucs::DemucsSeparator::new(&self.config.model_name)
             .context("Failed to initialize Demucs ONNX separator")?;
 
@@ -213,7 +217,7 @@ impl InstrumentSeparator {
         println!("[DEMUCS] Model '{}' initialized — running on {mode}", self.config.model_name);
         if separator.using_cpu() {
             println!("[DEMUCS] Running on CPU — inference will be slow (~4s per 7.8s chunk).");
-            println!("[DEMUCS] For GPU acceleration: ensure CUDA 12 runtime + cuDNN 9 DLLs are bundled next to keyscribe.exe, or install the CUDA toolkit and cuDNN system-wide.");
+            println!("[DEMUCS] GPU acceleration needs an NVIDIA GPU and the GPU pack; it is downloaded automatically on first local separation when available.");
         }
 
         if let Some(cb) = progress_cb {

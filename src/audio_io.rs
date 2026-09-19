@@ -306,7 +306,12 @@ fn open_audio_with_fallback(path: &Path) -> Result<OpenedAudio> {
                 }
             }
 
-            let mut cmd = crate::dsp::get_ffmpeg_command();
+            let mut cmd = match crate::dsp::get_ffmpeg_command() {
+                Ok(cmd) => cmd,
+                Err(ffmpeg_err) => {
+                    anyhow::bail!("Symphonia failed: {}. {}", err, ffmpeg_err);
+                }
+            };
             cmd.args([
                 "-y",
                 "-ignore_editlist", "1",

@@ -343,56 +343,72 @@ pub fn stretch_streaming_interleaved(
     Some(())
 }
 
-pub fn get_ffmpeg_command() -> std::process::Command {
-    let ffmpeg_exe = if cfg!(windows) {
-        "ffmpeg.exe"
-    } else {
-        "ffmpeg"
-    };
+fn media_exe_name(probe: bool) -> &'static str {
+    match (cfg!(windows), probe) {
+        (true, false) => "ffmpeg.exe",
+        (false, false) => "ffmpeg",
+        (true, true) => "ffprobe.exe",
+        (false, true) => "ffprobe",
+    }
+}
 
-    // 1. Try next to the executable
+/// Locate a media tool next to the executable, in the working directory, or
+/// in the writable per-user download dir (`assets::bin_dir()`).
+fn find_local_media_exe(name: &str) -> Option<std::path::PathBuf> {
     if let Ok(exe_path) = std::env::current_exe() {
         if let Some(parent) = exe_path.parent() {
-            let local_ffmpeg = parent.join(ffmpeg_exe);
-            if local_ffmpeg.exists() {
-                return std::process::Command::new(local_ffmpeg);
+            let local = parent.join(name);
+            if local.exists() {
+                return Some(local);
             }
         }
     }
-
-    // 2. Try current working directory
-    let local_ffmpeg = std::path::PathBuf::from(ffmpeg_exe);
-    if local_ffmpeg.exists() {
-        return std::process::Command::new(local_ffmpeg);
+    let cwd = std::path::PathBuf::from(name);
+    if cwd.exists() {
+        return Some(cwd);
     }
+    let downloaded = crate::assets::bin_dir().join(name);
+    if downloaded.exists() {
+        return Some(downloaded);
+    }
+    None
+}
 
-    // 3. Fallback to system PATH
-    std::process::Command::new(ffmpeg_exe)
+fn media_exe_on_path(name: &str) -> bool {
+    let mut cmd = std::process::Command::new(name);
+    cmd.arg("-version")
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        cmd.creation_flags(0x08000000);
+    }
+    matches!(cmd.status(), Ok(status) if status.success())
+}
+
+/// Resolve the FFmpeg binary, downloading the mirrored build on first use if
+/// it is not bundled, next to the exe, in the cwd, or on PATH.
+pub fn get_ffmpeg_command() -> anyhow::Result<std::process::Command> {
+    let ffmpeg_exe = media_exe_name(false);
+    if let Some(path) = find_local_media_exe(ffmpeg_exe) {
+        return Ok(std::process::Command::new(path));
+    }
+    if media_exe_on_path(ffmpeg_exe) {
+        return Ok(std::process::Command::new(ffmpeg_exe));
+    }
+    let downloaded = crate::assets::ensure_ffmpeg()?;
+    Ok(std::process::Command::new(downloaded))
 }
 
 /// Locate the `ffprobe` executable using the same resolution order as
-/// `get_ffmpeg_command` (next to exe → cwd → PATH).
+/// `get_ffmpeg_command` (next to exe → cwd → downloaded dir → PATH).
+/// Never downloads on its own; `ffprobe` ships in the same FFmpeg pack.
 pub fn get_ffprobe_command() -> std::process::Command {
-    let ffprobe_exe = if cfg!(windows) {
-        "ffprobe.exe"
-    } else {
-        "ffprobe"
-    };
-
-    if let Ok(exe_path) = std::env::current_exe() {
-        if let Some(parent) = exe_path.parent() {
-            let local = parent.join(ffprobe_exe);
-            if local.exists() {
-                return std::process::Command::new(local);
-            }
-        }
+    let ffprobe_exe = media_exe_name(true);
+    if let Some(path) = find_local_media_exe(ffprobe_exe) {
+        return std::process::Command::new(path);
     }
-
-    let local = std::path::PathBuf::from(ffprobe_exe);
-    if local.exists() {
-        return std::process::Command::new(local);
-    }
-
     std::process::Command::new(ffprobe_exe)
 }
 

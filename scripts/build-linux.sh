@@ -122,12 +122,16 @@ if [[ -z "$BINARY_PATH" ]]; then
     exit 1
 fi
 
-# --- Download ONNX models if missing ---
+# --- Core ONNX models (small, required for transcription) ---
+# htdemucs_6s.onnx is NOT bundled: it is downloaded on first local Demucs use
+# (default separation is MVSep cloud). The GPU pack (CUDA/cuDNN/ORT CUDA
+# provider) is not bundled either - GPU acceleration on Linux is available
+# via the Flatpak build or a system CUDA/cuDNN install. See src/assets.rs.
 MODEL_SOURCE_DIR="$REPO_ROOT/models"
 mkdir -p "$MODEL_SOURCE_DIR"
 
 ASSET_BASE="https://github.com/Frantzes/KeyScribe/releases/download/assets-v1"
-REQUIRED_MODELS=("htdemucs_6s.onnx" "beat_this_small.onnx" "mel_spectrogram.onnx" "basic-pitch.onnx")
+REQUIRED_MODELS=("beat_this_small.onnx" "mel_spectrogram.onnx" "basic-pitch.onnx")
 
 for MODEL_NAME in "${REQUIRED_MODELS[@]}"; do
     if [ ! -f "$MODEL_SOURCE_DIR/$MODEL_NAME" ]; then
@@ -143,11 +147,25 @@ for MODEL_NAME in "${REQUIRED_MODELS[@]}"; do
     fi
 done
 
-mapfile -t MODEL_FILES < <(find "$MODEL_SOURCE_DIR" -maxdepth 1 -type f -name '*.onnx' | sort)
-if [ ${#MODEL_FILES[@]} -eq 0 ]; then
+BUNDLED_MODELS=(
+    "basic-pitch.onnx"
+    "beat_this_small.onnx"
+    "mel_spectrogram.onnx"
+    "melody_quantizer.onnx"
+    "melody_quantizer.onnx.data"
+    "melody_quantizer_v2_seq.onnx"
+)
+MODEL_FILES=()
+for MODEL_NAME in "${BUNDLED_MODELS[@]}"; do
+    if [[ -f "$MODEL_SOURCE_DIR/$MODEL_NAME" ]]; then
+        MODEL_FILES+=("$MODEL_SOURCE_DIR/$MODEL_NAME")
+    fi
+done
+if [[ ${#MODEL_FILES[@]} -eq 0 ]]; then
     echo "Missing model files in models/" >&2
     exit 1
 fi
+
 ARCH_LABEL="$(target_to_arch_label "$TARGET")"
 BUNDLE_NAME="keyscribe-linux-$ARCH_LABEL"
 BUNDLE_DIR="$REPO_ROOT/$OUTPUT_ROOT/$BUNDLE_NAME"
@@ -171,11 +189,11 @@ FFMPEG_BIN_ALT="$FFMPEG_VENDOR_DIR/bin/ffmpeg"
 if [[ ! -f "$FFMPEG_BIN_PATH" ]]; then
     echo "FFmpeg not found in vendor/ffmpeg. Downloading static build..."
     mkdir -p "$FFMPEG_VENDOR_DIR"
-    
+
     FFMPEG_TAR="$FFMPEG_VENDOR_DIR/ffmpeg.tar.xz"
     # Using the BtbN GPL static build for Linux x64
     FFMPEG_URL="https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-master-latest-linux64-gpl.tar.xz"
-    
+
     if command -v curl >/dev/null 2>&1; then
         curl -L -o "$FFMPEG_TAR" "$FFMPEG_URL"
     elif command -v wget >/dev/null 2>&1; then
@@ -184,7 +202,7 @@ if [[ ! -f "$FFMPEG_BIN_PATH" ]]; then
         echo "Error: curl or wget is required to download FFmpeg." >&2
         exit 1
     fi
-    
+
     echo "Extracting FFmpeg..."
     # Extract just the ffmpeg binary from the tarball
     # The tarball has a top-level directory like ffmpeg-7.1-amd64-static/
@@ -210,330 +228,68 @@ else
     echo "Warning: Failed to prepare ffmpeg. Video features may not work." >&2
 fi
 
-# --- CUDA / cuDNN / ONNX Runtime GPU Bundling ---
-# The CUDA execution provider (libonnxruntime_providers_cuda.so) is loaded
-# by ort at runtime. It needs CUDA 12 runtime .so files and cuDNN 9 .so
-# files on the library search path. We bundle them next to the executable
-# and preload them at startup (see src/demucs.rs preload_cuda_dylibs).
+# --- ONNX Runtime core (pinned Microsoft PyPI wheel) ---
+# Provides libonnxruntime.so (CPU inference + host for the CUDA provider).
+# GPU acceleration on Linux comes from the Flatpak build or a system
+# CUDA 12 + cuDNN 9 install; the portable zip is CPU-only.
+ORT_VENDOR_DIR="$REPO_ROOT/vendor/ort-core"
+ORT_PINNED_WHEEL="onnxruntime_gpu-1.24.4-cp312-cp312-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl"
+ORT_WHEEL_URL="https://files.pythonhosted.org/packages/d0/2c/5b3fd4748cf7ed291eae541a37e426efc20ea04cb6e6a05768304ab0aa41/$ORT_PINNED_WHEEL"
+ORT_WHEEL_SHA="eb0e38f0c1ef3b76ae0081c8e51eed20dd8925aa916f0fc6f9b8b17d05610e99"
 
-CUDA_SO_NAMES=(
-    "libcudart.so.12"
-    "libcublas.so.12"
-    "libcublasLt.so.12"
-    "libcufft.so.11"
-    "libcurand.so.10"
-    "libnvrtc.so.12"
-)
-CUDNN_SO_NAMES=(
-    "libcudnn.so.9"
-    "libcudnn_graph.so.9"
-    "libcudnn_ops.so.9"
-    "libcudnn_heuristic.so.9"
-    "libcudnn_adv.so.9"
-    "libcudnn_cnn.so.9"
-    "libcudnn_engines_precompiled.so.9"
-    "libcudnn_engines_runtime_compiled.so.9"
-)
-ORT_SO_PATTERNS=(
-    "libonnxruntime.so*"
-    "libonnxruntime_providers_cuda.so*"
-    "libonnxruntime_providers_shared.so*"
-)
-
-# 1) CUDA runtime .so files: copy from local CUDA toolkit install if present.
-CUDA_TOOLKIT_DIRS=(
-    "/usr/local/cuda-12.6/lib64"
-    "/usr/local/cuda-12.5/lib64"
-    "/usr/local/cuda-12.4/lib64"
-    "/usr/local/cuda-12.3/lib64"
-    "/usr/local/cuda-12.2/lib64"
-    "/usr/local/cuda-12.1/lib64"
-    "/usr/local/cuda/lib64"
-)
-CUDA_TOOLKIT_LIB=""
-for dir in "${CUDA_TOOLKIT_DIRS[@]}"; do
-    if [[ -f "$dir/libcudart.so.12" ]]; then
-        CUDA_TOOLKIT_LIB="$dir"
-        break
-    fi
-done
-if [[ -n "$CUDA_TOOLKIT_LIB" ]]; then
-    echo "CUDA runtime found in: $CUDA_TOOLKIT_LIB"
-    for so in "${CUDA_SO_NAMES[@]}"; do
-        for src in "$CUDA_TOOLKIT_LIB/$so"*; do
-            if [[ -f "$src" || -L "$src" ]]; then
-                cp -P "$src" "$BUNDLE_DIR/"
-            fi
-        done
-    done
-    echo "Bundled CUDA runtime .so files"
-else
-    # Fallback: fetch CUDA 12 runtime libs from NVIDIA's cu12 pip wheels
-    # (nvidia-cuda-runtime-cu12, nvidia-cublas-cu12, nvidia-cufft-cu12,
-    #  nvidia-curand-cu12, nvidia-nvrtc-cu12). The wheels ship versioned
-    #  .so files under nvidia/<pkg>/lib/.
-    echo "Local CUDA 12 toolkit not found; trying NVIDIA cu12 pip wheels..."
-    CUDA_VENDOR_DIR="$REPO_ROOT/vendor/cuda"
-    mkdir -p "$CUDA_VENDOR_DIR"
-    CUDA_WHEEL_PKGS=(
-        "nvidia-cuda-runtime-cu12"
-        "nvidia-cublas-cu12"
-        "nvidia-cufft-cu12"
-        "nvidia-curand-cu12"
-    )
-    # nvidia-nvrtc-cu12 does not exist on PyPI; NVRTC ships in the large
-    # nvidia-cuda-nvcc-cu12 wheel. Try it best-effort (optional).
-    CUDA_OPTIONAL_PKGS=(
-        "nvidia-cuda-nvcc-cu12"
-    )
-    CUDA_DL_OK=true
-    for pkg in "${CUDA_WHEEL_PKGS[@]}"; do
-        if ! ls "$CUDA_VENDOR_DIR"/${pkg}-*.whl >/dev/null 2>&1; then
-            if ! python3 -m pip download "$pkg" --no-deps -d "$CUDA_VENDOR_DIR" 2>/dev/null; then
-                echo "  Warning: failed to download $pkg" >&2
-                CUDA_DL_OK=false
-            fi
-        fi
-    done
-    for pkg in "${CUDA_OPTIONAL_PKGS[@]}"; do
-        if ! ls "$CUDA_VENDOR_DIR"/${pkg}-*.whl >/dev/null 2>&1; then
-            python3 -m pip download "$pkg" --no-deps -d "$CUDA_VENDOR_DIR" 2>/dev/null || \
-                echo "  Note: optional $pkg unavailable, continuing without it"
-        fi
-    done
-    # libnvrtc.so.12 is required by ort's CUDA EP preload list but ships in
-    # neither the cu12 pip wheels nor the nvcc wheel. Fetch it from NVIDIA's
-    # public CUDA .deb repo and unpack the .so files (needs `ar` + `tar`).
-    if ! ls "$CUDA_VENDOR_DIR"/libnvrtc.so.12* >/dev/null 2>&1; then
-        echo "  Fetching libnvrtc from NVIDIA CUDA .deb repo..."
-        NVRTC_DEB="$CUDA_VENDOR_DIR/cuda-nvrtc.deb"
-        # Match the .deb minor to the nvcc wheel if present, else default 12.9.
-        NVRTC_VER="12.9.86"
-        NVCC_WHL=$(ls "$CUDA_VENDOR_DIR"/nvidia_cuda_nvcc_cu12-*.whl 2>/dev/null | head -1)
-        if [[ -n "$NVCC_WHL" && "$NVCC_WHL" =~ -([0-9]+\.[0-9]+\.[0-9]+)- ]]; then
-            NVRTC_VER="${BASH_REMATCH[1]}"
-        fi
-        NVRTC_MINOR="${NVRTC_VER%.*}"
-        NVRTC_MAJOR="${NVRTC_MINOR%.*}"
-        NVRTC_PATCH="${NVRTC_MINOR#*.}"
-        NVRTC_URL="https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2204/x86_64/cuda-nvrtc-${NVRTC_MAJOR}-${NVRTC_PATCH}_${NVRTC_VER}-1_amd64.deb"
-        if curl -fL -o "$NVRTC_DEB" "$NVRTC_URL" 2>/dev/null; then
-            NVRTC_DATA="$CUDA_VENDOR_DIR/nvrtc-data"
-            rm -rf "$NVRTC_DATA"
-            mkdir -p "$NVRTC_DATA"
-            if ar p "$NVRTC_DEB" data.tar.xz 2>/dev/null | tar -xJ -C "$NVRTC_DATA" 2>/dev/null; then
-                while IFS= read -r src; do
-                    cp -P "$src" "$CUDA_VENDOR_DIR/"
-                done < <(find "$NVRTC_DATA" -name "libnvrtc*.so*" \( -type f -o -type l \) | sort)
-                echo "  Cached libnvrtc from .deb"
-            else
-                echo "  Warning: failed to unpack $NVRTC_DEB" >&2
-            fi
-            rm -rf "$NVRTC_DATA"
-            rm -f "$NVRTC_DEB"
-        else
-            echo "  Warning: failed to download $NVRTC_URL" >&2
-        fi
-    fi
-    if $CUDA_DL_OK; then
-        CUDA_EXTRACT_TMP="$CUDA_VENDOR_DIR/extract"
-        rm -rf "$CUDA_EXTRACT_TMP"
-        mkdir -p "$CUDA_EXTRACT_TMP"
-        for whl in "$CUDA_VENDOR_DIR"/*.whl; do
-            python3 -m zipfile -e "$whl" "$CUDA_EXTRACT_TMP"
-        done
-        for so in "${CUDA_SO_NAMES[@]}"; do
-            while IFS= read -r src; do
-                cp -P "$src" "$CUDA_VENDOR_DIR/"
-            done < <(find "$CUDA_EXTRACT_TMP" -name "$so*" \( -type f -o -type l \) | sort)
-        done
-        rm -rf "$CUDA_EXTRACT_TMP"
-        echo "Cached CUDA 12 runtime .so files in vendor/cuda"
-    fi
-    CUDA_BUNDLED=false
-    for so in "${CUDA_SO_NAMES[@]}"; do
-        for src in "$CUDA_VENDOR_DIR/$so"*; do
-            if [[ -f "$src" || -L "$src" ]]; then
-                cp -P "$src" "$BUNDLE_DIR/"
-                CUDA_BUNDLED=true
-            fi
-        done
-    done
-    if ! $CUDA_BUNDLED; then
-        echo "Warning: CUDA 12 runtime .so files unavailable. GPU acceleration unavailable; CPU fallback will be used." >&2
-    else
-        echo "Bundled CUDA runtime .so files from pip wheels"
-    fi
-fi
-
-# 2) cuDNN 9 .so files: download from NVIDIA if not already cached in vendor/cudnn.
-CUDNN_VENDOR_DIR="$REPO_ROOT/vendor/cudnn"
-CUDNN_READY=false
-for so in "${CUDNN_SO_NAMES[@]}"; do
-    if [[ -f "$CUDNN_VENDOR_DIR/$so" ]]; then
-        CUDNN_READY=true
-        break
-    fi
-done
-if ! $CUDNN_READY; then
-    echo "cuDNN 9 .so files not found in vendor/cudnn. Downloading..."
-    mkdir -p "$CUDNN_VENDOR_DIR"
-    CUDNN_URL="https://developer.download.nvidia.com/compute/cudnn/redist/cudnn/linux-x86_64/cudnn-linux-x86_64-9.3.0.75_cuda12-archive.tar.xz"
-    CUDNN_TAR="$CUDNN_VENDOR_DIR/cudnn.tar.xz"
-    if command -v curl >/dev/null 2>&1; then
-        curl -L -o "$CUDNN_TAR" "$CUDNN_URL"
-    elif command -v wget >/dev/null 2>&1; then
-        wget -O "$CUDNN_TAR" "$CUDNN_URL"
-    else
-        echo "Error: curl or wget required to download cuDNN." >&2
-    fi
-    if [[ -f "$CUDNN_TAR" ]]; then
-        echo "Extracting cuDNN..."
-        EXTRACT_TMP="$CUDNN_VENDOR_DIR/extract"
-        mkdir -p "$EXTRACT_TMP"
-        tar -xJf "$CUDNN_TAR" -C "$EXTRACT_TMP"
-        CUDNN_LIB_DIR=$(find "$EXTRACT_TMP" -type d -name "lib" | head -1)
-        if [[ -n "$CUDNN_LIB_DIR" ]]; then
-            # Copy each .so.9 symlink AND its versioned target(s) so the
-            # links in the cache/bundle are not left dangling.
-            for so in "${CUDNN_SO_NAMES[@]}"; do
-                for src in "$CUDNN_LIB_DIR/$so"*; do
-                    if [[ -f "$src" || -L "$src" ]]; then
-                        cp -P "$src" "$CUDNN_VENDOR_DIR/"
-                    fi
-                done
-            done
-            echo "Cached cuDNN 9 .so files in vendor/cudnn"
-        else
-            echo "Warning: Could not locate cuDNN lib directory in archive." >&2
-        fi
-        rm -rf "$EXTRACT_TMP"
-        rm -f "$CUDNN_TAR"
-    fi
-else
-    echo "cuDNN 9 .so files already cached in vendor/cudnn"
-fi
-
-# Copy cuDNN .so files (links + versioned targets) into the bundle.
-for so in "${CUDNN_SO_NAMES[@]}"; do
-    for src in "$CUDNN_VENDOR_DIR/$so"*; do
-        if [[ -f "$src" || -L "$src" ]]; then
-            cp -P "$src" "$BUNDLE_DIR/"
-        fi
-    done
-done
-
-# 3) Download ONNX Runtime GPU build (libonnxruntime.so etc.) from the pip wheel.
-ORT_VENDOR_DIR="$REPO_ROOT/vendor/ort-gpu"
 if ! ls "$ORT_VENDOR_DIR"/libonnxruntime.so* >/dev/null 2>&1; then
-    echo "ONNX Runtime GPU .so files not found in vendor/ort-gpu. Downloading..."
+    echo "ONNX Runtime core not found in vendor/ort-core. Downloading pinned 1.24.4 wheel..."
     mkdir -p "$ORT_VENDOR_DIR"
-    DOWNLOAD_SUCCESS=false
-
-    # Method 1: pip download from system Python.
-    PYTHON_CMD=""
-    if command -v python3 >/dev/null 2>&1; then
-        PYTHON_CMD="python3"
-    elif command -v python >/dev/null 2>&1; then
-        PYTHON_CMD="python"
-    fi
-    if [[ -n "$PYTHON_CMD" ]]; then
-        echo "  Trying pip download via $PYTHON_CMD..."
-        if $PYTHON_CMD -m pip download onnxruntime-gpu==1.24.4 --no-deps -d "$ORT_VENDOR_DIR" 2>/dev/null; then
-            WHL_FILE=$(find "$ORT_VENDOR_DIR" -maxdepth 1 -name "*.whl" | head -1)
-            if [[ -n "$WHL_FILE" ]]; then
-                DOWNLOAD_SUCCESS=true
-            fi
-        fi
-    fi
-
-    # Method 2: Direct download from PyPI JSON API.
-    if ! $DOWNLOAD_SUCCESS; then
-        echo "  Trying direct download from PyPI (via JSON API)..."
-        PYPI_JSON=""
+    ORT_WHEEL_PATH="$ORT_VENDOR_DIR/$ORT_PINNED_WHEEL"
+    if [[ ! -f "$ORT_WHEEL_PATH" ]]; then
         if command -v curl >/dev/null 2>&1; then
-            PYPI_JSON=$(curl -sL "https://pypi.org/pypi/onnxruntime-gpu/1.24.4/json")
+            curl -fL -o "$ORT_WHEEL_PATH" "$ORT_WHEEL_URL"
         elif command -v wget >/dev/null 2>&1; then
-            PYPI_JSON=$(wget -qO- "https://pypi.org/pypi/onnxruntime-gpu/1.24.4/json")
+            wget -qO "$ORT_WHEEL_PATH" "$ORT_WHEEL_URL"
+        else
+            echo "Error: curl or wget required to download ONNX Runtime." >&2
+            exit 1
         fi
-        if [[ -n "$PYPI_JSON" ]] && [[ -n "$PYTHON_CMD" ]]; then
-            DL_URL=$(echo "$PYPI_JSON" | $PYTHON_CMD -c "
-import sys, json
-data = json.load(sys.stdin)
-for u in data.get('urls', []):
-    url = u['url']
-    if ('linux_x86_64' in url or 'manylinux' in url) and 'x86_64' in url and u['packagetype'] == 'bdist_wheel':
-        print(url)
-        break
-" 2>/dev/null)
-            if [[ -n "$DL_URL" ]]; then
-                WHL_FILE="$ORT_VENDOR_DIR/onnxruntime_gpu.linux.whl"
-                if command -v curl >/dev/null 2>&1; then
-                    curl -sL -o "$WHL_FILE" "$DL_URL"
-                elif command -v wget >/dev/null 2>&1; then
-                    wget -qO "$WHL_FILE" "$DL_URL"
-                fi
-                if [[ -f "$WHL_FILE" ]]; then
-                    DOWNLOAD_SUCCESS=true
-                fi
-            fi
-        fi
+    fi
+    if ! echo "$ORT_WHEEL_SHA  $ORT_WHEEL_PATH" | sha256sum -c - >/dev/null 2>&1; then
+        rm -f "$ORT_WHEEL_PATH"
+        echo "Error: ONNX Runtime wheel checksum mismatch; download discarded." >&2
+        exit 1
     fi
 
-    if $DOWNLOAD_SUCCESS; then
-        echo "  Extracting .so files from wheel..."
-        ZIP_FILE="$WHL_FILE.zip"
-        mv "$WHL_FILE" "$ZIP_FILE"
-        EXTRACT_DIR="$ORT_VENDOR_DIR/extract"
-        mkdir -p "$EXTRACT_DIR"
-        unzip -q -o "$ZIP_FILE" -d "$EXTRACT_DIR" 2>/dev/null || \
-            $PYTHON_CMD -m zipfile -e "$ZIP_FILE" "$EXTRACT_DIR" 2>/dev/null
-        CAPI_DIR="$EXTRACT_DIR/onnxruntime/capi"
-        if [[ -d "$CAPI_DIR" ]]; then
-            for pattern in "${ORT_SO_PATTERNS[@]}"; do
-                for src in "$CAPI_DIR"/$pattern; do
-                    if [[ -f "$src" ]] || [[ -L "$src" ]]; then
-                        cp -P "$src" "$ORT_VENDOR_DIR/"
-                    fi
-                done
-            done
-            echo "  Cached ORT 1.24.4 GPU .so files in vendor/ort-gpu"
-        else
-            echo "  Warning: Could not find onnxruntime/capi in wheel." >&2
-        fi
-        rm -rf "$EXTRACT_DIR"
-        rm -f "$ZIP_FILE"
-        # The app loads the exact name `libonnxruntime.so` via ort::init_from
-        # (see src/demucs.rs), but the wheel only ships a versioned file.
-        # Provide the unversioned symlink so init_from finds it.
-        ORT_VERSIONED=$(ls "$ORT_VENDOR_DIR"/libonnxruntime.so.* 2>/dev/null | grep -v '\.so$' | head -1)
-        if [[ -n "$ORT_VERSIONED" && ! -e "$ORT_VENDOR_DIR/libonnxruntime.so" ]]; then
-            ln -sf "$(basename "$ORT_VERSIONED")" "$ORT_VENDOR_DIR/libonnxruntime.so"
-            echo "  Created libonnxruntime.so symlink -> $(basename "$ORT_VERSIONED")"
-        fi
+    EXTRACT_DIR="$ORT_VENDOR_DIR/extract"
+    rm -rf "$EXTRACT_DIR"
+    mkdir -p "$EXTRACT_DIR"
+    python3 -m zipfile -e "$ORT_WHEEL_PATH" "$EXTRACT_DIR"
+    CAPI_DIR="$EXTRACT_DIR/onnxruntime/capi"
+    if [[ -d "$CAPI_DIR" ]]; then
+        for src in "$CAPI_DIR"/libonnxruntime.so*; do
+            if [[ -f "$src" || -L "$src" ]]; then
+                cp -P "$src" "$ORT_VENDOR_DIR/"
+            fi
+        done
+        echo "Cached ONNX Runtime core in vendor/ort-core"
     else
-        echo "  Warning: All download methods failed. GPU acceleration unavailable." >&2
+        echo "Error: onnxruntime/capi missing from wheel." >&2
+        exit 1
     fi
+    rm -rf "$EXTRACT_DIR"
+    rm -f "$ORT_WHEEL_PATH"
 else
-    echo "ORT GPU .so files already cached in vendor/ort-gpu"
+    echo "ONNX Runtime core already cached in vendor/ort-core"
 fi
 
-# Ensure the unversioned libonnxruntime.so symlink exists (the app loads
-# that exact name via ort::init_from; wheels only ship versioned files).
-# Done unconditionally so pre-existing caches get fixed too.
+# The app loads the exact name `libonnxruntime.so` via ort::init_from.
 ORT_VERSIONED=$(ls "$ORT_VENDOR_DIR"/libonnxruntime.so.* 2>/dev/null | grep -v '\.so$' | head -1)
 if [[ -n "$ORT_VERSIONED" && ! -e "$ORT_VENDOR_DIR/libonnxruntime.so" ]]; then
     ln -sf "$(basename "$ORT_VERSIONED")" "$ORT_VENDOR_DIR/libonnxruntime.so"
     echo "Created libonnxruntime.so symlink -> $(basename "$ORT_VERSIONED")"
 fi
 
-# Copy ORT .so files into the bundle (including versioned symlinks).
-for pattern in "${ORT_SO_PATTERNS[@]}"; do
-    for src in "$ORT_VENDOR_DIR"/$pattern; do
-        if [[ -f "$src" ]] || [[ -L "$src" ]]; then
-            cp -P "$src" "$BUNDLE_DIR/"
-        fi
-    done
+for src in "$ORT_VENDOR_DIR"/libonnxruntime.so*; do
+    if [[ -f "$src" || -L "$src" ]]; then
+        cp -P "$src" "$BUNDLE_DIR/"
+    fi
 done
 
 cat > "$BUNDLE_DIR/README-portable.txt" <<'EOF'
@@ -543,14 +299,20 @@ Contents:
 - keyscribe
 - ffmpeg
 - models/*.onnx
-- CUDA 12 runtime + cuDNN 9 .so files + libonnxruntime_providers_cuda.so (GPU accel)
+- libonnxruntime.so (ONNX Runtime core)
+
+Downloaded automatically on first use (no action needed):
+- Demucs htdemucs_6s model - only when you run stem separation with a local
+  Demucs model (the default MVSep separation runs in the cloud)
+
+GPU acceleration is not bundled in the portable zip: use the Flatpak build
+(includes CUDA/cuDNN) or install CUDA 12 + cuDNN 9 system-wide.
 
 All AI inference (note detection, stem separation, beat tracking) runs
-in-process via ONNX Runtime — no Python or external runtime required.
-GPU acceleration requires an NVIDIA GPU with CUDA-capable drivers.
+in-process via ONNX Runtime - no Python or external runtime required.
 
-Run ./keyscribe from this folder so the relative model, ffmpeg, and
-CUDA/cuDNN .so paths work.
+Run ./keyscribe from this folder so the relative model, ffmpeg, and ONNX
+Runtime paths work.
 EOF
 
 mkdir -p "$REPO_ROOT/$OUTPUT_ROOT"

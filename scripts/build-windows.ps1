@@ -80,12 +80,16 @@ exit /b 0
         Write-Warning "Close Keyscribe, then run apply-update.cmd in $bundleDir to finish replacing the executable."
     }
 
-    # --- Download ONNX models if missing ---
+    # --- Core ONNX models (small, required for transcription) ---
+    # htdemucs_6s.onnx is NOT bundled: it is downloaded on first local Demucs
+    # use (default separation is MVSep cloud). FFmpeg and the GPU pack
+    # (CUDA/cuDNN/ORT CUDA provider) are downloaded on demand too. See
+    # src/assets.rs and README.md ("Runtime downloads").
     $modelSourceDir = Join-Path $repoRoot "models"
     New-Item -ItemType Directory -Path $modelSourceDir -Force | Out-Null
 
     $assetBase = "https://github.com/Frantzes/KeyScribe/releases/download/assets-v1"
-    $requiredModels = @("htdemucs_6s.onnx", "beat_this_small.onnx", "mel_spectrogram.onnx", "basic-pitch.onnx")
+    $requiredModels = @("beat_this_small.onnx", "mel_spectrogram.onnx", "basic-pitch.onnx")
 
     foreach ($modelName in $requiredModels) {
         $modelPath = Join-Path $modelSourceDir $modelName
@@ -95,280 +99,68 @@ exit /b 0
         }
     }
 
-    $modelFiles = @(Get-ChildItem -Path $modelSourceDir -Filter "*.onnx" -File -ErrorAction Stop)
-    if ($modelFiles.Count -eq 0) {
-        throw "Missing model files in models/"
-    }
-    foreach ($modelFile in $modelFiles) {
-        Copy-Item -Path $modelFile.FullName -Destination (Join-Path $modelsDir $modelFile.Name) -Force
-    }
-
-    # --- ONNX Runtime CPU DLLs (for development / CPU fallback) ---
-    $ortCpuVendorDir = Join-Path $repoRoot "vendor\onnxruntime"
-    $ortCpuBase = "https://github.com/Frantzes/KeyScribe/releases/download/assets-v1"
-    $ortCpuDlls = @("onnxruntime.dll", "DirectML.dll")
-
-    foreach ($dll in $ortCpuDlls) {
-        $dllPath = Join-Path $ortCpuVendorDir $dll
-        if (-not (Test-Path $dllPath)) {
-            Write-Host "Downloading $dll from GitHub Releases..."
-            New-Item -ItemType Directory -Path $ortCpuVendorDir -Force | Out-Null
-            Invoke-WebRequest -Uri "$ortCpuBase/$dll" -OutFile $dllPath -UseBasicParsing
-        }
-    }
-
-    # --- CUDA / cuDNN Bundling ---
-    # The CUDA execution provider (onnxruntime_providers_cuda.dll) is downloaded
-    # by ort-sys as part of the cu12 prebuilt archive and linked statically into
-    # keyscribe.exe. At runtime it needs the CUDA 12 runtime DLLs and cuDNN 9
-    # DLLs on the search path. We bundle them next to the executable and preload
-    # them at startup (see src/demucs.rs preload_cuda_dylibs) so users get GPU
-    # acceleration without installing the CUDA toolkit themselves.
-    $cudaDllNames = @(
-        "cudart64_12.dll",
-        "cublas64_12.dll",
-        "cublasLt64_12.dll",
-        "cufft64_11.dll",
-        "curand64_10.dll",
-        "nvrtc64_120_0.dll"
+    $bundledModels = @(
+        "basic-pitch.onnx",
+        "beat_this_small.onnx",
+        "mel_spectrogram.onnx",
+        "melody_quantizer.onnx",
+        "melody_quantizer.onnx.data",
+        "melody_quantizer_v2_seq.onnx"
     )
-    $cudnnDllNames = @(
-        "cudnn64_9.dll",
-        "cudnn_graph64_9.dll",
-        "cudnn_ops64_9.dll",
-        "cudnn_heuristic64_9.dll",
-        "cudnn_adv64_9.dll",
-        "cudnn_cnn64_9.dll",
-        "cudnn_engines_precompiled64_9.dll",
-        "cudnn_engines_runtime_compiled64_9.dll"
-    )
-
-    # 1) CUDA runtime DLLs: copy from a local CUDA toolkit install if present.
-    $cudaToolkitDirs = @(
-        "C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.6\bin",
-        "C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.5\bin",
-        "C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.4\bin",
-        "C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.3\bin",
-        "C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.2\bin",
-        "C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.1\bin"
-    )
-    $cudaToolkitBin = $null
-    foreach ($dir in $cudaToolkitDirs) {
-        if (Test-Path (Join-Path $dir "cudart64_12.dll")) {
-            $cudaToolkitBin = $dir
-            break
-        }
-    }
-    if ($cudaToolkitBin) {
-        Write-Host "CUDA runtime found in: $cudaToolkitBin"
-        foreach ($dll in $cudaDllNames) {
-            $src = Join-Path $cudaToolkitBin $dll
-            if (Test-Path $src) {
-                Copy-Item -Path $src -Destination (Join-Path $bundleDir $dll) -Force
-            }
-        }
-        Write-Host "Bundled CUDA runtime DLLs"
-    } else {
-        Write-Warning "CUDA 12 toolkit not found in default install paths. CUDA GPU acceleration will be unavailable; ensure cudart64_12.dll etc. are on PATH at runtime."
-    }
-
-    # 2) cuDNN 9 DLLs: download from NVIDIA if not already cached in vendor/cudnn.
-    $cudnnVendorDir = Join-Path $repoRoot "vendor\cudnn"
-    $cudnnReady = $false
-    foreach ($dll in $cudnnDllNames) {
-        if (Test-Path (Join-Path $cudnnVendorDir $dll)) { $cudnnReady = $true; break }
-    }
-    if (-not $cudnnReady) {
-        Write-Host "cuDNN 9 DLLs not found in vendor/cudnn. Downloading..."
-        New-Item -ItemType Directory -Path $cudnnVendorDir -Force | Out-Null
-        # NVIDIA cuDNN 9.3 for CUDA 12 (Windows x86_64) local installer.
-        # This is the public redist mirror; the archive is a self-extracting zip.
-        $cudnnUrl = "https://developer.download.nvidia.com/compute/cudnn/redist/cudnn/windows-x86_64/cudnn-windows-x86_64-9.3.0.75_cuda12-archive.zip"
-        $cudnnZip = Join-Path $cudnnVendorDir "cudnn.zip"
-        try {
-            Invoke-WebRequest -Uri $cudnnUrl -OutFile $cudnnZip -UseBasicParsing
-            Write-Host "Extracting cuDNN..."
-            $extractTmp = Join-Path $cudnnVendorDir "extract"
-            Expand-Archive -Path $cudnnZip -DestinationPath $extractTmp -Force
-            # The archive layout is cudnn-windows-x86_64-9.x.x_cuda12-archive\bin\*.dll
-            $cudnnFiles = Get-ChildItem -Path $extractTmp -Recurse -Directory -Filter "bin"
-            $cudnnBin = $cudnnFiles | Where-Object {
-                Test-Path (Join-Path $_.FullName "cudnn64_9.dll")
-            } | Select-Object -First 1
-            if ($cudnnBin) {
-                foreach ($dll in $cudnnDllNames) {
-                    $src = Join-Path $cudnnBin.FullName $dll
-                    if (Test-Path $src) {
-                        Copy-Item -Path $src -Destination (Join-Path $cudnnVendorDir $dll) -Force
-                    }
-                }
-                Write-Host "Cached cuDNN 9 DLLs in vendor/cudnn"
-            } else {
-                Write-Warning "Could not locate cuDNN bin directory in archive. GPU acceleration may be unavailable."
-            }
-            Remove-Item -Path $extractTmp -Recurse -Force -ErrorAction SilentlyContinue
-        } catch {
-            Write-Warning "Failed to download cuDNN: $_. GPU acceleration will be unavailable unless cuDNN 9 DLLs are on PATH."
-        } finally {
-            Remove-Item -Path $cudnnZip -Force -ErrorAction SilentlyContinue
-        }
-    } else {
-        Write-Host "cuDNN 9 DLLs already cached in vendor/cudnn"
-    }
-
-    # Copy cuDNN DLLs into the bundle.
-    foreach ($dll in $cudnnDllNames) {
-        $src = Join-Path $cudnnVendorDir $dll
+    foreach ($modelName in $bundledModels) {
+        $src = Join-Path $modelSourceDir $modelName
         if (Test-Path $src) {
-            Copy-Item -Path $src -Destination (Join-Path $bundleDir $dll) -Force
+            Copy-Item -Path $src -Destination (Join-Path $modelsDir $modelName) -Force
+        } elseif ($modelName -in $requiredModels) {
+            throw "Missing required model $modelName in models/"
         }
     }
 
-    # 3) Download the official ONNX Runtime GPU build (onnxruntime.dll +
-    #    onnxruntime_providers_cuda.dll) from the onnxruntime-gpu pip wheel.
-    #    We use ORT 1.24.2 which requires CUDA 12 + cuDNN 9 (matching our
-    #    bundled DLLs). The ort crate loads these dynamically at runtime via
-    #    the `load-dynamic` feature.
-    $ortVendorDir = Join-Path $repoRoot "vendor\ort-gpu"
-    $ortDllNames = @(
-        "onnxruntime.dll",
-        "onnxruntime_providers_cuda.dll",
-        "onnxruntime_providers_shared.dll"
-    )
-    $ortReady = $true
-    foreach ($dll in $ortDllNames) {
-        if (-not (Test-Path (Join-Path $ortVendorDir $dll))) { $ortReady = $false; break }
-    }
-    if (-not $ortReady) {
-        Write-Host "ONNX Runtime GPU DLLs not found in vendor/ort-gpu. Downloading ORT 1.24.2 GPU wheel..."
+    # --- ONNX Runtime core (pinned Microsoft PyPI wheel) ---
+    # Provides onnxruntime.dll (CPU inference + host for the CUDA provider) and
+    # the shared provider loader. The CUDA provider itself ships in the
+    # on-demand GPU pack, pinned to the same 1.24.4 wheel in src/assets.rs.
+    $ortWheelUrl = "https://files.pythonhosted.org/packages/fa/bc/35f3a37226d7a28c84b8b456f52237ccd39eb7111114bcf9ac340178e1ec/onnxruntime_gpu-1.24.4-cp313-cp313-win_amd64.whl"
+    $ortWheelSha = "6be8bf2048777c517fca33eb61e114969fa326619feaa789d8c75f24337ea762"
+    $ortVendorDir = Join-Path $repoRoot "vendor\ort-core"
+    $ortWheelPath = Join-Path $ortVendorDir "onnxruntime_gpu-1.24.4-cp313-cp313-win_amd64.whl"
+    $ortCapiDir = Join-Path $ortVendorDir "capi"
+
+    if (-not (Test-Path (Join-Path $ortCapiDir "onnxruntime.dll"))) {
         New-Item -ItemType Directory -Path $ortVendorDir -Force | Out-Null
-        $downloadSuccess = $false
-
-        # Method 1: Try pip download from the repo's venv (has correct Python version).
-        $venvPip = Join-Path $repoRoot ".venv\Scripts\python.exe"
-        if (Test-Path $venvPip) {
-            Write-Host "  Trying pip download via venv..."
-            try {
-                & { $ErrorActionPreference = "Continue"; & $venvPip -m pip download onnxruntime-gpu==1.24.2 --no-deps -d $ortVendorDir 2>&1 | Out-Null }
-                $whlFile = Get-ChildItem -Path $ortVendorDir -Filter "*.whl" -File | Select-Object -First 1
-                if ($whlFile) {
-                    $downloadSuccess = $true
-                }
-            } catch {
-                Write-Warning "  pip download via venv failed: $_"
+        if (-not (Test-Path $ortWheelPath)) {
+            Write-Host "Downloading ONNX Runtime 1.24.4 wheel (pinned, verified)..."
+            Invoke-WebRequest -Uri $ortWheelUrl -OutFile $ortWheelPath -UseBasicParsing
+        }
+        $actualSha = (Get-FileHash $ortWheelPath -Algorithm SHA256).Hash.ToLowerInvariant()
+        if ($actualSha -ne $ortWheelSha) {
+            Remove-Item $ortWheelPath -Force -ErrorAction SilentlyContinue
+            throw "ONNX Runtime wheel checksum mismatch: expected $ortWheelSha, got $actualSha"
+        }
+        $zipCopy = "$ortWheelPath.zip"
+        Copy-Item $ortWheelPath $zipCopy -Force
+        $extractDir = Join-Path $ortVendorDir "extract"
+        Remove-Item $extractDir -Recurse -Force -ErrorAction SilentlyContinue
+        Expand-Archive -Path $zipCopy -DestinationPath $extractDir -Force
+        New-Item -ItemType Directory -Path $ortCapiDir -Force | Out-Null
+        foreach ($dll in @("onnxruntime.dll", "onnxruntime_providers_shared.dll")) {
+            $src = Join-Path $extractDir "onnxruntime\capi\$dll"
+            if (Test-Path $src) {
+                Copy-Item -Path $src -Destination (Join-Path $ortCapiDir $dll) -Force
             }
         }
-
-        # Method 2: Try system pip/python.
-        if (-not $downloadSuccess) {
-            $sysPip = (Get-Command pip -ErrorAction SilentlyContinue).Source
-            if (-not $sysPip) { $sysPip = (Get-Command python -ErrorAction SilentlyContinue).Source }
-            if ($sysPip) {
-                Write-Host "  Trying pip download via system Python..."
-                try {
-                    & { $ErrorActionPreference = "Continue"; & $sysPip -m pip download onnxruntime-gpu==1.24.2 --no-deps -d $ortVendorDir 2>&1 | Out-Null }
-                    $whlFile = Get-ChildItem -Path $ortVendorDir -Filter "*.whl" -File | Select-Object -First 1
-                    if ($whlFile) {
-                        $downloadSuccess = $true
-                    }
-                } catch {
-                    Write-Warning "  pip download via system Python failed: $_"
-                }
-            }
-        }
-
-        # Method 3: Direct download from PyPI file URLs.
-        if (-not $downloadSuccess) {
-            Write-Host "  Trying direct download from PyPI (via JSON API)..."
-            try {
-                $pypiApi = "https://pypi.org/pypi/onnxruntime-gpu/1.24.2/json"
-                $pkg = Invoke-RestMethod -Uri $pypiApi -UseBasicParsing
-                $wheels = $pkg.urls | Where-Object {
-                    $_.url -like "*win_amd64*" -and $_.packagetype -eq "bdist_wheel"
-                }
-                if ($wheels) {
-                    $dl = $wheels[0]
-                    $whlPath = Join-Path $ortVendorDir $dl.filename
-                    Invoke-WebRequest -Uri $dl.url -OutFile $whlPath -UseBasicParsing
-                    $whlFile = Get-Item $whlPath
-                    $downloadSuccess = $true
-                    Write-Host "  Downloaded $($dl.filename)"
-                }
-            } catch {
-                Write-Warning "  PyPI JSON API failed: $_"
-            }
-        }
-
-        if ($downloadSuccess -and $whlFile) {
-            # .whl is a zip — copy to .zip and extract
-            $zipFile = $whlFile.FullName + ".zip"
-            Copy-Item -Path $whlFile.FullName -Destination $zipFile
-            $extractDir = Join-Path $ortVendorDir "extract"
-            Expand-Archive -Path $zipFile -DestinationPath $extractDir -Force
-            $capiDir = Join-Path $extractDir "onnxruntime\capi"
-            if (Test-Path $capiDir) {
-                foreach ($dll in $ortDllNames) {
-                    $src = Join-Path $capiDir $dll
-                    if (Test-Path $src) {
-                        Copy-Item -Path $src -Destination (Join-Path $ortVendorDir $dll) -Force
-                    }
-                }
-                Write-Host "  Cached ORT 1.24.2 GPU DLLs in vendor/ort-gpu"
-            } else {
-                Write-Warning "  Could not find onnxruntime/capi in wheel. GPU acceleration will be unavailable."
-            }
-            Remove-Item -Path $extractDir -Recurse -Force -ErrorAction SilentlyContinue
-            Remove-Item -Path $zipFile -Force -ErrorAction SilentlyContinue
-            Remove-Item -Path $whlFile.FullName -Force -ErrorAction SilentlyContinue
-        } else {
-            Write-Warning "  All download methods failed. GPU acceleration will be unavailable."
-            Write-Warning "  To fix manually: pip download onnxruntime-gpu==1.24.2 --no-deps, extract the .whl, and copy the DLLs from onnxruntime/capi/ to vendor/ort-gpu/"
-        }
+        Remove-Item $extractDir -Recurse -Force -ErrorAction SilentlyContinue
+        Remove-Item $zipCopy -Force -ErrorAction SilentlyContinue
     } else {
-        Write-Host "ORT GPU DLLs already cached in vendor/ort-gpu"
+        Write-Host "ONNX Runtime core already cached in vendor/ort-core"
     }
 
-    # Copy ORT DLLs into the bundle.
-    foreach ($dll in $ortDllNames) {
-        $src = Join-Path $ortVendorDir $dll
-        if (Test-Path $src) {
-            Copy-Item -Path $src -Destination (Join-Path $bundleDir $dll) -Force
+    foreach ($dll in @("onnxruntime.dll", "onnxruntime_providers_shared.dll")) {
+        $src = Join-Path $ortCapiDir $dll
+        if (-not (Test-Path $src)) {
+            throw "Missing $dll in vendor/ort-core (delete the folder and rebuild)"
         }
-    }
-
-    # --- FFmpeg Bundling ---
-    $ffmpegDir = Join-Path $repoRoot "vendor/ffmpeg"
-    $ffmpegExePath = Join-Path $ffmpegDir "ffmpeg.exe"
-    
-    if (-not (Test-Path $ffmpegExePath)) {
-        Write-Host "FFmpeg not found in vendor/ffmpeg. Downloading static build..."
-        New-Item -ItemType Directory -Path $ffmpegDir -Force | Out-Null
-        
-        $ffmpegZip = Join-Path $ffmpegDir "ffmpeg.zip"
-        # Using the BtbN GPL static build from the aggregator site (points to github releases)
-        $ffmpegUrl = "https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-master-latest-win64-gpl.zip"
-        
-        Invoke-WebRequest -Uri $ffmpegUrl -OutFile $ffmpegZip
-        
-        Write-Host "Extracting FFmpeg..."
-        Expand-Archive -Path $ffmpegZip -DestinationPath $ffmpegDir -Force
-        
-        # The zip contains a subfolder like ffmpeg-7.1-essentials_build/bin/ffmpeg.exe
-        $extractedExe = Get-ChildItem -Path $ffmpegDir -Filter "ffmpeg.exe" -Recurse | Select-Object -First 1
-        if ($extractedExe) {
-            Move-Item -Path $extractedExe.FullName -Destination $ffmpegExePath -Force
-        }
-        
-        Remove-Item -Path $ffmpegZip -Force
-        # Clean up the extra folders from the zip
-        Get-ChildItem -Path $ffmpegDir -Directory | Remove-Item -Recurse -Force
-    }
-
-    if (Test-Path $ffmpegExePath) {
-        Copy-Item -Path $ffmpegExePath -Destination (Join-Path $bundleDir "ffmpeg.exe") -Force
-        Write-Host "Included ffmpeg.exe from: $ffmpegExePath"
-    } else {
-        Write-Warning "Failed to prepare ffmpeg.exe. Video features may not work."
+        Copy-Item -Path $src -Destination (Join-Path $bundleDir $dll) -Force
     }
 
     $bundleReadmePath = Join-Path $bundleDir "README-portable.txt"
@@ -377,16 +169,22 @@ KeyScribe portable Windows bundle
 
 Contents:
 - keyscribe.exe
-- ffmpeg.exe
-- models/*.onnx (basic-pitch, htdemucs_6s, mel_spectrogram, beat_this_small)
-- CUDA 12 runtime + cuDNN 9 DLLs + onnxruntime_providers_cuda.dll (GPU accel)
+- onnxruntime.dll + onnxruntime_providers_shared.dll (ONNX Runtime core)
+- models/*.onnx (basic-pitch, beat_this_small, mel_spectrogram)
+
+Downloaded automatically on first use (no action needed):
+- Demucs htdemucs_6s model - only when you run stem separation with a local
+  Demucs model (the default MVSep separation runs in the cloud)
+- FFmpeg - only when a file needs it (unsupported audio format or video)
+- GPU pack (CUDA 12 + cuDNN 9 + ONNX Runtime CUDA provider) - only when you
+  run local Demucs separation on a machine with an NVIDIA GPU
 
 All AI inference (note detection, stem separation, beat tracking) runs
 in-process via ONNX Runtime - no Python or external runtime required.
-GPU acceleration requires an NVIDIA GPU with CUDA-capable drivers.
+GPU acceleration requires an NVIDIA GPU with CUDA-capable drivers; without
+it stem separation falls back to CPU.
 
-Run keyscribe.exe from this folder so the relative model, ffmpeg, and
-CUDA/cuDNN DLL paths work.
+Run keyscribe.exe from this folder so relative model and DLL paths work.
 "@
 
     $shouldZip = -not $SkipZip -and -not $PersonalUpdate

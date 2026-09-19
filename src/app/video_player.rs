@@ -234,7 +234,13 @@ fn video_decoder_thread(
     let frame_duration = (1.0 / fps.max(1.0)) as f32;
 
     let spawn_ffmpeg = |start_time: f32| -> Option<(std::process::Child, ChildStdout)> {
-        let mut cmd = crate::dsp::get_ffmpeg_command();
+        let mut cmd = match crate::dsp::get_ffmpeg_command() {
+            Ok(cmd) => cmd,
+            Err(err) => {
+                eprintln!("[VIDEO] ffmpeg unavailable: {err}");
+                return None;
+            }
+        };
         cmd.args([
             "-ignore_editlist", "1",
             "-ss", &start_time.to_string(),
